@@ -58,6 +58,30 @@ class SEOExtractor:
                 charset_match = re.search(r'charset=([^;]+)', content)
                 result['charset'] = charset_match.group(1) if charset_match else ''
 
+        # Extract DOM Complexity
+        if soup:
+             # Node Count (include all tags)
+            all_tags = soup.find_all(True)
+            result['dom_size'] = len(all_tags)
+            
+            # Max Depth
+            result['dom_depth'] = 0
+            if all_tags:
+                # Calculate depth for each tag. This can be expensive for huge DOMs, 
+                # but BeautifulSoup doesn't expose depth directly.
+                # Optimization: For very large pages, we might want to approximate or limit this.
+                # However, for typical web pages, this is acceptable.
+                max_depth = 0
+                for tag in all_tags:
+                    depth = 0
+                    parent = tag.parent
+                    while parent and parent.name != '[document]':
+                         depth += 1
+                         parent = parent.parent
+                    if depth > max_depth:
+                        max_depth = depth
+                result['dom_depth'] = max_depth
+
     @staticmethod
     def extract_meta_tags(soup, result):
         """Extract all meta tags"""
@@ -298,6 +322,12 @@ class SEOExtractor:
             'og_tags': {},
             'twitter_tags': {},
             'canonical_url': '',
+            'canonical_url': '',
+            'dom_size': 0,
+            'dom_depth': 0,
+            'requires_js': False,
+            'raw_html_hash': None,
+            'rendered_html_hash': None,
             'lang': '',
             'charset': '',
             'viewport': '',

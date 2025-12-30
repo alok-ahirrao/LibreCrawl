@@ -31,117 +31,73 @@ This document outlines **all** missing technical SEO checks. Each item contains 
 
 ## 🚦 Block 2: HTTP Status, Sitemaps & Redirects
 
-### 1. Advanced Sitemap Validation
-*   **Missing Feature:** Validating URLs *inside* sitemaps (Non-200, Noindex, Non-Canonical).
-*   **🐍 Backend Implementation:**
-    *   **Files:** `sitemap_parser.py`, `issue_detector.py`
-    *   **Logic:** Cross-reference crawled URL status with its presence in Sitemap. Flag "Dirty Sitemap" issues.
-*   **🖥️ Frontend Implementation:**
-    *   **New Component:** `SitemapHealth.tsx`
-    *   **Logic:** Visual breakdown: "Total URLs in Sitemap" vs "Valid (200)" vs "Errors (404/Nointo)". Pie chart preferred.
+### 1. Advanced Sitemap Validation ✅
+*   **Status:** ✅ IMPLEMENTED
+*   **🐍 Backend:** `issue_detector.py` has `detect_sitemap_issues()` method that cross-references crawled URL status with sitemap. Flags "Dirty Sitemap" issues (Non-200, Noindex, Non-Canonical, Redirects).
+*   **🖥️ Frontend:** `SitemapHealth.tsx` displays pie chart breakdown: Valid (200) vs Errors (4xx/5xx) vs Noindex vs Non-Canonical vs Redirects.
 
-### 2. Soft 404 Detection
-*   **Missing Feature:** detecting pages that return `200 OK` but are actually errors ("Page Not Found" text).
-*   **🐍 Backend Implementation:**
-    *   **Files:** `issue_detector.py`
-    *   **Logic:** Check if `status==200` AND (Title/H1 matches "Not Found|Error 404" OR Content < 500 bytes).
-*   **🖥️ Frontend Implementation:**
-    *   **Update:** `PageTable.tsx`
-    *   **Logic:** Add a specialized "Soft 404" badge (Distinct from "404"). tooltip explaining "Returns 200 OK but appears broken".
+### 2. Soft 404 Detection ✅
+*   **Status:** ✅ IMPLEMENTED
+*   **🐍 Backend:** `issue_detector.py` checks if `status==200` AND Title/H1 contains error patterns (404, not found, etc). Creates "Soft 404" issues.
+*   **🖥️ Frontend:** `PageTable.tsx` shows purple "Soft 404" badge with Ghost icon and tooltip. Filter option added.
 
-### 3. Redirect Insights (Chains & Loops)
-*   **Missing Feature:** Redirect chains >1 hop or loops are not explicitly reported as issues.
-*   **🐍 Backend Implementation:**
-    *   **Files:** `crawler.py`, `issue_detector.py`
-    *   **Logic:** Track redirect history list. Report issue if `len(history) > 1`.
-*   **🖥️ Frontend Implementation:**
-    *   **New Visualizer:** `RedirectChainView.tsx` (inside Issue Details).
-    *   **Logic:** Render a stepper visualization: `Url A (301) --> Url B (301) --> Url C (200)`.
+### 3. Redirect Insights (Chains & Loops) ✅
+*   **Status:** ✅ IMPLEMENTED
+*   **🐍 Backend:** `crawler.py` tracks `redirect_chain` from `response.history`. `issue_detector.py` flags loops (error), long chains >3 hops (warning), and 2-3 hop chains (info).
+*   **🖥️ Frontend:** `RedirectChainView.tsx` displays stepper visualization: `URL (301) → URL (301) → URL (200)`.
 
 ---
 
 ## 🔗 Block 3: Internal Link Hygiene
 
-### 1. Internal Links to Redirects
-*   **Missing Feature:** Linking internally to a URL that 301 redirects (wasting crawl budget).
-*   **🐍 Backend Implementation:**
-    *   **Files:** `issue_detector.py`
-    *   **Logic:** Iterate all link edges. If `Target.status` is 3xx, flag the `Source` page.
-*   **🖥️ Frontend Implementation:**
-    *   **Table Update:** In `PageDetails`, add a tab "Outlinks to Redirects".
-    *   **Logic:** List exactly which links on the page are triggering redirects so the user can fix the `href`.
+### 1. Internal Links to Redirects ✅
+*   **Status:** ✅ IMPLEMENTED
+*   **🐍 Backend:** `issue_detector.py` has `detect_links_to_redirects()` method that cross-references all links with target URL status codes. Flags pages with internal links pointing to redirecting URLs.
+*   **🖥️ Frontend:** Issues appear in Issues tab as "Links: Internal Links to Redirects" with examples of problematic URLs.
 
-### 2. Broken Link Source Reporting
-*   **Missing Feature:** Reporting *which page* contains the broken link (not just that the link is broken).
-*   **🐍 Backend Implementation:**
-    *   **Files:** `issue_detector.py`
-    *   **Logic:** Group 4xx/5xx errors by their `incoming_links` source list.
-*   **🖥️ Frontend Implementation:**
-    *   **New Drawer Feature:** "Broken Link Inspector".
-    *   **Logic:** When clicking a 404 issue, show a table: "Found on these pages: [List of Source URLs]".
+### 2. Broken Link Source Reporting ✅
+*   **Status:** ✅ IMPLEMENTED
+*   **🐍 Backend:** `issue_detector.py` has `detect_broken_link_sources()` that cross-references broken URLs (4xx/5xx) with their incoming links. Creates "Broken Link Sources" issues with source page list.
+*   **🖥️ Frontend:** Issues appear in Issues tab showing "Broken Link Sources: 404 error linked from X pages" with source URLs in details.
 
 ---
 
-## 🛡️ Block 4: Security & Protocols
+## 🛡️ Block 4: Security & Protocols ✅ COMPLETED
 
-### 1. Mixed Content Detection
-*   **Missing Feature:** HTTPS pages loading HTTP assets.
-*   **🐍 Backend Implementation:**
-    *   **Files:** `issue_detector.py`
-    *   **Logic:** Scan `images`, `scripts`, `links` for `http://` prefix when page is `https://`.
-*   **🖥️ Frontend Implementation:**
-    *   **Update:** `IssueDetails`
-    *   **Logic:** Highlight the specific insecure asset URL (e.g., `http://unsafe-image.jpg`) in the issue description.
+### 1. Mixed Content Detection ✅
+*   **Status:** ✅ IMPLEMENTED
+*   **🐍 Backend:** `issue_detector.py` checks `images` for `http://` src on `https://` pages. Reports "Security: Mixed Content" with asset list.
+*   **🖥️ Frontend:** `IssueDetails` shows insecure assets. `SecurityScorecard.tsx` reflects mixed content status.
 
-### 2. Security Headers Check
-*   **Missing Feature:** HSTS, X-Frame-Options, CSP checks.
-*   **🐍 Backend Implementation:**
-    *   **Files:** `issue_detector.py`
-    *   **Logic:** Check `response_headers` dictionary for missing security keys.
-*   **🖥️ Frontend Implementation:**
-    *   **New Widget:** `SecurityScorecard.tsx`
-    *   **Logic:** A checklist view: "SSL: ✅, HSTS: ❌, CSP: ⚠️".
+### 2. Security Headers Check ✅
+*   **Status:** ✅ IMPLEMENTED
+*   **🐍 Backend:** `issue_detector.py` checks for missing `Strict-Transport-Security`, `Content-Security-Policy`, and `X-Frame-Options` headers.
+*   **🖥️ Frontend:** `SecurityScorecard.tsx` provides a visual scorecard (0-100) and checklist for SSL, HSTS, CSP, and X-Frame-Options status.
 
 ---
 
-## ⚡ Block 5: DOM, JS & Performance
+## ⚡ Block 5: DOM, JS & Performance ✅ COMPLETED
 
-### 1. DOM Complexity & Size
-*   **Missing Feature:** Counting HTML nodes (>1500) & nesting depth.
-*   **🐍 Backend Implementation:**
-    *   **Files:** `seo_extractor.py`
-    *   **Logic:** Use BeautifulSoup to count tags and max depth.
-*   **🖥️ Frontend Implementation:**
-    *   **New Chart:** `DOMComplexityChart.tsx`
-    *   **Logic:** Bar chart showing "Node Count" vs "Recommended Limit (1500)".
+### 1. DOM Complexity & Size ✅
+*   **Status:** ✅ IMPLEMENTED
+*   **🐍 Backend:** `seo_extractor.py` counts HTML nodes and calculates nesting depth using BeautifulSoup (lines 60-83). Data persisted via `crawl_db.py`.
+*   **🖥️ Frontend:** `DOMComplexityChart.tsx` visualizes DOM Size and Depth distribution with performance thresholds.
 
-### 2. JS Rendering Differences
-*   **Feature:** Detecting content hidden behind JavaScipt.
-*   **🐍 Backend Implementation:**
-    *   **Files:** `crawler.py`
-    *   **Logic:** Store both `raw_html_hash` and `rendered_html_hash`. If different, check for missing content.
-*   **🖥️ Frontend Implementation:**
-    *   **New Badge:** "Requires JS"
-    *   **Logic:** Display this badge on pages where significant content was only found after rendering.
+### 2. JS Rendering Differences ✅
+*   **Status:** ✅ IMPLEMENTED
+*   **🐍 Backend:** `crawler.py` fetches raw HTML alongside JS rendering, computes hashes, and flags `requires_js` if significant content differs (lines 1024-1065).
+*   **🖥️ Frontend:** `url-analysis-sheet.tsx` displays "Requires JS" badge and warning when dynamic content is detected.
 
 ---
 
-## 🌍 Block 6: International & Structured Data
+## 🌍 Block 6: International & Structured Data ✅ COMPLETED
 
-### 1. Hreflang Validation
-*   **Missing Feature:** Validating ISO codes and reciprocal returns.
-*   **🐍 Backend Implementation:**
-    *   **Files:** `issue_detector.py`
-    *   **Logic:** Regex check `lang` codes. Check if Target URL points back to Source URL.
-*   **🖥️ Frontend Implementation:**
-    *   **New Component:** `HreflangMatrix.tsx`
-    *   **Logic:** Database table view: `Page | Lang | Linked URL | Reciprocal Status (✅/❌)`.
+### 1. Hreflang Validation ✅
+*   **Status:** ✅ IMPLEMENTED
+*   **🐍 Backend:** `issue_detector.py` has `detect_hreflang_issues()` that validates ISO 639-1 codes, checks reciprocal links, detects missing self-references, and flags hreflang pointing to non-200 pages (lines 1656-1810).
+*   **🖥️ Frontend:** `HreflangMatrix.tsx` displays a table with source page, language code, target URL, reciprocal status (✅/❌), and HTTP status. Added as "International" tab in `crawler-results.tsx`.
 
-### 2. AI Readiness (Schema)
-*   **Missing Feature:** Validating Schema types (FAQ, LocalBusiness).
-*   **🐍 Backend Implementation:**
-    *   **Files:** `seo_extractor.py`, `issue_detector.py`
-    *   **Logic:** Validate JSON-LD structure. Check for "FAQPage" presence.
-*   **🖥️ Frontend Implementation:**
-    *   **New Preview:** "Rich Result Preview"
-    *   **Logic:** Render a mock "Google Search Result" card using the extracted Schema data (e.g., showing the FAQ dropdowns).
+### 2. AI Readiness (Schema) ✅
+*   **Status:** ✅ IMPLEMENTED
+*   **🐍 Backend:** `issue_detector.py` enhanced `_check_structured_data_issues()` to detect AI-ready schema types (FAQPage, LocalBusiness, Article, Product, etc.), extract FAQ items for preview, and validate schema structure (lines 675-825).
+*   **🖥️ Frontend:** `RichResultPreview.tsx` renders a mock Google Search result with FAQ accordions, rating stars, and schema type badges. Integrated into `url-analysis-sheet.tsx` under "Structured Data & AI Readiness" section.

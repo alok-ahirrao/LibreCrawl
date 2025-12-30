@@ -111,11 +111,13 @@ class IssueDetector:
             # Archive/utility: downgrade to 'warning' (still needs attention, but lower priority)
             # Important/other: keep as 'error' (critical SEO issue)
             severity = 'warning' if is_archive_or_utility else 'error'
+            issue_title = 'Missing Title Tag (Archive/Utility)' if severity == 'warning' else 'Missing Title Tag'
+            
             issues.append({
                 'url': url,
                 'type': severity,
                 'category': 'SEO',
-                'issue': 'Missing Title Tag',
+                'issue': issue_title,
                 'details': f"Page has no title tag{' (archive/utility page - lower priority)' if is_archive_or_utility else ''}"
             })
         else:
@@ -174,11 +176,13 @@ class IssueDetector:
             if any(p in parsed_path for p in utility_patterns):
                 severity = 'info'
             
+            issue_title = 'Meta Description: Missing (Archive/Utility)' if severity == 'info' else 'Meta Description: Missing'
+            
             issues.append({
                 'url': url,
                 'type': severity,
                 'category': 'SEO',
-                'issue': 'Meta Description: Missing',
+                'issue': issue_title,
                 'details': f"Page has no meta description{' (archive/utility page - low priority)' if severity == 'info' else ''}"
             })
         else:
@@ -229,11 +233,13 @@ class IssueDetector:
         if not h1 and not h1_list:
             # Archives often lack a formal H1 or use a generic one.
             severity = 'warning' if is_archive_or_utility else 'error'
+            issue_title = 'Missing H1 Tag (Archive/Utility)' if severity == 'warning' else 'Missing H1 Tag'
+            
             issues.append({
                 'url': url,
                 'type': severity,
                 'category': 'SEO',
-                'issue': 'Missing H1 Tag',
+                'issue': issue_title,
                 'details': f"Page has no H1 heading{' (archive/utility - lower priority)' if severity == 'warning' else ''}"
             })
         elif len(h1_list) > 1:
@@ -281,11 +287,13 @@ class IssueDetector:
                 if last_level == 0 and level != 1:
                      # FIRST heading is not H1 (e.g. H2 appears before H1)
                      severity = 'info' if is_archive_or_utility else 'warning'
+                     issue_title = f'H{level} appears before H1 (Archive/Utility)' if severity == 'info' else f'H{level} appears before H1'
+                     
                      issues.append({
                         'url': url,
                         'type': severity,
                         'category': 'SEO',
-                        'issue': f'H{level} appears before H1',
+                        'issue': issue_title,
                         'details': f'The first heading is an H{level}, should be H1.'
                     })
                 elif last_level > 0:
@@ -322,11 +330,13 @@ class IssueDetector:
              if non_boilerplate_dupes:
                  # Real content duplication issues
                  severity = 'info' if is_archive_or_utility else 'warning'
+                 issue_title = 'H2: Duplicate (Archive/Utility)' if severity == 'info' else 'H2: Duplicate'
+
                  issues.append({
                     'url': url,
                     'type': severity,
                     'category': 'SEO',
-                    'issue': 'H2: Duplicate',
+                    'issue': issue_title,
                     'details': f"Page has duplicate H2 tags: {', '.join(non_boilerplate_dupes)}{' (archive/utility - low priority)' if severity == 'info' else ''}"
                 })
              elif duplicates:
@@ -391,6 +401,108 @@ class IssueDetector:
                 'issue': 'Response Codes: External No Response',
                 'details': 'Server did not respond'
             })
+
+        # Soft 404 Detection: 200 OK but appears to be an error page
+        if status_code == 200:
+            title = result.get('title', '').lower()
+            h1 = result.get('h1', '').lower()
+            word_count = result.get('word_count', 0)
+            page_size = result.get('size', 0)
+            
+            # Error patterns to detect soft 404s
+            error_patterns = [
+                'not found', '404', 'page not found', 'error 404',
+                'page doesn\'t exist', 'page does not exist',
+                'no longer available', 'has been removed',
+                'could not be found', 'cannot be found',
+                'doesn\'t exist', 'does not exist',
+                'oops', 'sorry', 'nothing here'
+            ]
+            
+            # Check if title or H1 contains error patterns
+            is_error_title = any(pattern in title for pattern in error_patterns)
+            is_error_h1 = any(pattern in h1 for pattern in error_patterns)
+            
+            # Very thin content (less than 100 words AND small page size) can indicate soft 404
+            is_thin_error_page = word_count < 100 and page_size < 5000 and (is_error_title or is_error_h1)
+            
+            # Flag as soft 404 if clear error signals are present
+            if is_error_title or is_error_h1:
+                # Determine severity based on signals
+                if is_error_title and is_error_h1:
+                    severity = 'error'
+                    details = f'Title: "{result.get("title", "")[:50]}" and H1: "{result.get("h1", "")[:50]}" suggest error page'
+                elif is_error_title:
+                    severity = 'warning'
+                    details = f'Title "{result.get("title", "")[:60]}" suggests this is an error page'
+                else:
+                    severity = 'warning'
+                    details = f'H1 "{result.get("h1", "")[:60]}" suggests this is an error page'
+                
+                issues.append({
+                    'url': url,
+                    'type': severity,
+                    'category': 'Technical',
+                    'issue': 'Soft 404: Returns 200 but appears broken',
+                    'details': details
+                })
+                
+                # Mark the result for frontend badge display
+                result['is_soft_404'] = True
+
+        # [NEW] Redirect Chain Detection
+        redirect_chain = result.get('redirect_chain', [])
+        redirect_count = result.get('redirect_count', 0) or len(redirect_chain) - 1 if redirect_chain else 0
+        
+        if redirect_count > 0:
+            # Check for redirect loops (same URL appearing multiple times)
+            chain_urls = [r.get('url', '') for r in redirect_chain]
+            seen_urls = set()
+            has_loop = False
+            loop_url = None
+            for chain_url in chain_urls:
+                normalized = self._normalize_url_for_comparison(chain_url)
+                if normalized in seen_urls:
+                    has_loop = True
+                    loop_url = chain_url
+                    break
+                seen_urls.add(normalized)
+            
+            if has_loop:
+                # Redirect Loop - Critical Error
+                issues.append({
+                    'url': url,
+                    'type': 'error',
+                    'category': 'Technical',
+                    'issue': 'Redirect Loop Detected',
+                    'details': f'URL redirects back to itself: {loop_url}',
+                    'redirect_chain': redirect_chain
+                })
+                result['has_redirect_loop'] = True
+            elif redirect_count > 3:
+                # Long redirect chain (> 3 hops) - Warning
+                chain_summary = ' → '.join([f"{r.get('status_code', '?')}" for r in redirect_chain])
+                issues.append({
+                    'url': url,
+                    'type': 'warning',
+                    'category': 'Technical',
+                    'issue': 'Long Redirect Chain',
+                    'details': f'{redirect_count} redirects before final destination. Chain: {chain_summary}',
+                    'redirect_chain': redirect_chain
+                })
+                result['has_long_redirect_chain'] = True
+            elif redirect_count > 1:
+                # Multi-hop redirect (2-3 hops) - Info
+                chain_summary = ' → '.join([f"{r.get('status_code', '?')}" for r in redirect_chain])
+                issues.append({
+                    'url': url,
+                    'type': 'info',
+                    'category': 'Technical',
+                    'issue': 'Redirect Chain',
+                    'details': f'{redirect_count} redirects: {chain_summary}',
+                    'redirect_chain': redirect_chain
+                })
+            # Single redirect (1 hop) is normal, no issue needed
 
         # Canonical URL checks
         canonical_url = result.get('canonical_url', '')
@@ -561,10 +673,34 @@ class IssueDetector:
             })
 
     def _check_structured_data_issues(self, result, issues):
-        """Check for structured data issues"""
+        """Check for structured data issues and AI readiness"""
         url = result.get('url', '')
-
-        if not result.get('json_ld') and not result.get('schema_org'):
+        json_ld_data = result.get('json_ld', [])
+        schema_org_data = result.get('schema_org', [])
+        
+        # AI-ready schema types that enable rich results
+        ai_ready_types = {
+            'FAQPage': {'name': 'FAQ', 'rich_result': 'FAQ Accordion'},
+            'HowTo': {'name': 'How-To', 'rich_result': 'Step-by-step Guide'},
+            'Recipe': {'name': 'Recipe', 'rich_result': 'Recipe Card'},
+            'Product': {'name': 'Product', 'rich_result': 'Product Snippet'},
+            'Review': {'name': 'Review', 'rich_result': 'Review Stars'},
+            'AggregateRating': {'name': 'Rating', 'rich_result': 'Star Rating'},
+            'LocalBusiness': {'name': 'Local Business', 'rich_result': 'Knowledge Panel'},
+            'Organization': {'name': 'Organization', 'rich_result': 'Knowledge Panel'},
+            'Person': {'name': 'Person', 'rich_result': 'Knowledge Panel'},
+            'Article': {'name': 'Article', 'rich_result': 'Article Preview'},
+            'NewsArticle': {'name': 'News Article', 'rich_result': 'News Carousel'},
+            'BlogPosting': {'name': 'Blog Post', 'rich_result': 'Article Preview'},
+            'Event': {'name': 'Event', 'rich_result': 'Event Listing'},
+            'JobPosting': {'name': 'Job Posting', 'rich_result': 'Job Listing'},
+            'Course': {'name': 'Course', 'rich_result': 'Course Card'},
+            'SoftwareApplication': {'name': 'Software App', 'rich_result': 'App Info'},
+            'VideoObject': {'name': 'Video', 'rich_result': 'Video Preview'},
+            'BreadcrumbList': {'name': 'Breadcrumbs', 'rich_result': 'Breadcrumb Trail'},
+        }
+        
+        if not json_ld_data and not schema_org_data:
             issues.append({
                 'url': url,
                 'type': 'warning',
@@ -572,6 +708,143 @@ class IssueDetector:
                 'issue': 'No Structured Data',
                 'details': 'Page has no JSON-LD or Schema.org markup'
             })
+            return
+        
+        # Extract and validate schema types
+        detected_types = set()
+        schema_analysis = {
+            'types': [],
+            'faq_items': [],
+            'has_organization': False,
+            'has_website': False,
+            'has_breadcrumbs': False,
+            'issues': []
+        }
+        
+        def extract_type(schema_obj, depth=0):
+            """Recursively extract @type from schema object"""
+            if depth > 10:  # Prevent infinite recursion
+                return
+            
+            if isinstance(schema_obj, dict):
+                schema_type = schema_obj.get('@type')
+                if schema_type:
+                    if isinstance(schema_type, list):
+                        for t in schema_type:
+                            detected_types.add(t)
+                    else:
+                        detected_types.add(schema_type)
+                    
+                    # Extract FAQ items
+                    if schema_type == 'FAQPage' or (isinstance(schema_type, list) and 'FAQPage' in schema_type):
+                        main_entity = schema_obj.get('mainEntity', [])
+                        if isinstance(main_entity, list):
+                            for item in main_entity:
+                                if item.get('@type') == 'Question':
+                                    q = item.get('name', '')
+                                    a_obj = item.get('acceptedAnswer', {})
+                                    a = a_obj.get('text', '') if isinstance(a_obj, dict) else ''
+                                    if q:
+                                        schema_analysis['faq_items'].append({'question': q, 'answer': a[:200] + '...' if len(a) > 200 else a})
+                    
+                    # Check for organization
+                    if schema_type in ['Organization', 'LocalBusiness', 'Corporation']:
+                        schema_analysis['has_organization'] = True
+                    
+                    # Check for website
+                    if schema_type == 'WebSite':
+                        schema_analysis['has_website'] = True
+                    
+                    # Check for breadcrumbs
+                    if schema_type == 'BreadcrumbList':
+                        schema_analysis['has_breadcrumbs'] = True
+                
+                # Recurse into nested objects
+                for key, value in schema_obj.items():
+                    if isinstance(value, (dict, list)):
+                        extract_type(value, depth + 1)
+            
+            elif isinstance(schema_obj, list):
+                for item in schema_obj:
+                    extract_type(item, depth + 1)
+        
+        # Process JSON-LD
+        for schema in json_ld_data:
+            extract_type(schema)
+        
+        # Process Schema.org microdata
+        for schema in schema_org_data:
+            schema_type = schema.get('type', '')
+            if schema_type:
+                # Extract type from full URL like "https://schema.org/Article"
+                if '/' in schema_type:
+                    schema_type = schema_type.split('/')[-1]
+                detected_types.add(schema_type)
+        
+        # Store detected types in result for frontend
+        result['schema_types'] = list(detected_types)
+        result['schema_analysis'] = schema_analysis
+        schema_analysis['types'] = list(detected_types)
+        
+        # Check for AI-ready schemas
+        ai_ready_found = []
+        for schema_type in detected_types:
+            if schema_type in ai_ready_types:
+                ai_ready_found.append(ai_ready_types[schema_type])
+        
+        result['ai_ready_schemas'] = ai_ready_found
+        
+        # Validation checks
+        # Check 1: Has basic organizational schema (recommended for all sites)
+        page_type = self._classify_page_type(url)
+        
+        if page_type == 'important' and not schema_analysis['has_organization'] and not schema_analysis['has_website']:
+            if 'Article' not in detected_types and 'BlogPosting' not in detected_types and 'Product' not in detected_types:
+                issues.append({
+                    'url': url,
+                    'type': 'info',
+                    'category': 'Structured Data',
+                    'issue': 'Schema: Missing Organization/WebSite',
+                    'details': 'Consider adding Organization or WebSite schema for brand visibility'
+                })
+        
+        # Check 2: FAQ validation
+        if 'FAQPage' in detected_types:
+            if len(schema_analysis['faq_items']) == 0:
+                issues.append({
+                    'url': url,
+                    'type': 'warning',
+                    'category': 'Structured Data',
+                    'issue': 'Schema: FAQPage has no questions',
+                    'details': 'FAQPage schema found but no Question items detected'
+                })
+            elif len(schema_analysis['faq_items']) < 3:
+                issues.append({
+                    'url': url,
+                    'type': 'info',
+                    'category': 'Structured Data',
+                    'issue': 'Schema: FAQPage has few questions',
+                    'details': f'Only {len(schema_analysis["faq_items"])} FAQ items found (3+ recommended)'
+                })
+        
+        # Check 3: Article/BlogPosting validation
+        if 'Article' in detected_types or 'BlogPosting' in detected_types or 'NewsArticle' in detected_types:
+            # These should have author, datePublished, headline
+            has_required = False
+            for schema in json_ld_data:
+                if schema.get('@type') in ['Article', 'BlogPosting', 'NewsArticle']:
+                    if schema.get('headline') and schema.get('datePublished'):
+                        has_required = True
+                        break
+            
+            if not has_required:
+                issues.append({
+                    'url': url,
+                    'type': 'warning',
+                    'category': 'Structured Data',
+                    'issue': 'Schema: Article missing required fields',
+                    'details': 'Article schema should have headline and datePublished'
+                })
 
     def _check_performance_issues(self, result, issues):
         """Check for performance issues"""
@@ -917,52 +1190,111 @@ class IssueDetector:
         links_data = result.get('links_data', [])
         images = result.get('images', [])
         
-        # Missing Content-Security-Policy - SITE-WIDE issue, report only once per domain
-        # Headers keys are case-insensitive in requests usually.
-        has_csp = False
-        for k in headers.keys():
-            if k.lower() == 'content-security-policy':
-                has_csp = True
-                break
+        # Headers keys are case-insensitive in requests usually, but let's normalize for safety
+        headers_lower = {k.lower(): v for k, v in headers.items()}
         
-        if not has_csp:
-            # Only report once per domain
+        # 1. Content-Security-Policy (CSP)
+        # SITE-WIDE issue, report only once per domain
+        if 'content-security-policy' not in headers_lower:
             try:
                 domain = urlparse(url).netloc
                 issue_key = (domain, 'missing_csp')
                 if issue_key not in self.reported_sitewide_issues:
                     self.reported_sitewide_issues.add(issue_key)
                     issues.append({
-                        'url': f'{urlparse(url).scheme}://{domain}',  # Use domain as URL
+                        'url': f'{urlparse(url).scheme}://{domain}',
                         'type': 'info',
                         'category': 'Security',
-                        'issue': 'Security: Missing Content-Security-Policy Header',
+                        'issue': 'Security: Missing Content-Security-Policy',
                         'details': 'Server does not send Content-Security-Policy header. This is a site-wide configuration issue.'
                     })
             except:
                 pass
+
+        # 2. Strict-Transport-Security (HSTS)
+        # Only relevant for HTTPS pages
+        if url.startswith('https://') and 'strict-transport-security' not in headers_lower:
+             try:
+                domain = urlparse(url).netloc
+                issue_key = (domain, 'missing_hsts')
+                if issue_key not in self.reported_sitewide_issues:
+                    self.reported_sitewide_issues.add(issue_key)
+                    issues.append({
+                        'url': f'{urlparse(url).scheme}://{domain}',
+                        'type': 'warning',
+                        'category': 'Security',
+                        'issue': 'Security: Missing HSTS Header',
+                        'details': 'HTTP Strict Transport Security (HSTS) is not enabled. Users effectively can be downgraded to HTTP.'
+                    })
+             except:
+                pass
+                
+        # 3. X-Frame-Options
+        if 'x-frame-options' not in headers_lower:
+             try:
+                domain = urlparse(url).netloc
+                issue_key = (domain, 'missing_xfo')
+                if issue_key not in self.reported_sitewide_issues:
+                    self.reported_sitewide_issues.add(issue_key)
+                    issues.append({
+                        'url': f'{urlparse(url).scheme}://{domain}',
+                        'type': 'info',
+                        'category': 'Security',
+                        'issue': 'Security: Missing X-Frame-Options',
+                        'details': 'Missing X-Frame-Options header can leave the site vulnerable to Clickjacking.'
+                    })
+             except:
+                pass
+
+
+        # 4. Mixed Content Detection (Active on HTTPS pages)
+        if url.startswith('https://'):
+            mixed_content_assets = []
             
-        # Protocol-Relative Resource Links
-        # Check images and links
-        protocol_relative_count = 0
-        for img in images:
-            if img.get('src', '').startswith('//'):
-                protocol_relative_count += 1
-                
-        # Note: Extracted links might be absolute already, need to check if raw href was protocol relative.
-        # links_data stores 'href' as raw?
-        for link in links_data:
-            if link.get('href', '').startswith('//'):
-                protocol_relative_count += 1
-                
-        if protocol_relative_count > 0:
-             issues.append({
-                'url': url,
-                'type': 'warning',
-                'category': 'Security',
-                'issue': 'Security: Protocol-Relative Resource Links',
-                'details': f'{protocol_relative_count} resources use protocol-relative URLs (//)'
-            })
+            # Check Images
+            for img in images:
+                src = img.get('src', '')
+                if src.startswith('http://'):
+                    mixed_content_assets.append(f'Image: {src}')
+            
+            # Check Scripts (if accessible, though mainly we have links_data and images)
+            # We can check links_data for external scripts if they were categorized as such, 
+            # but currently links_data is mostly anchor tags.
+            # However, we can check if any *resources* we tracked are HTTP.
+            
+            # Check for protocol-relative links (Legacy check, moved here)
+            protocol_relative_count = 0
+            for img in images:
+                if img.get('src', '').startswith('//'):
+                    protocol_relative_count += 1
+            for link in links_data:
+                if link.get('href', '').startswith('//'):
+                    protocol_relative_count += 1
+            
+            if mixed_content_assets:
+                # Limit details length
+                details_list = mixed_content_assets[:5]
+                details_str = ', '.join(details_list)
+                if len(mixed_content_assets) > 5:
+                    details_str += f', and {len(mixed_content_assets) - 5} more'
+                    
+                issues.append({
+                    'url': url,
+                    'type': 'error',
+                    'category': 'Security',
+                    'issue': 'Security: Mixed Content',
+                    'details': f'Secure page loads insecure (HTTP) assets: {details_str}',
+                    'mixed_content_assets': mixed_content_assets # Pass full list for frontend
+                })
+
+            if protocol_relative_count > 0:
+                 issues.append({
+                    'url': url,
+                    'type': 'warning',
+                    'category': 'Security',
+                    'issue': 'Security: Protocol-Relative Resource Links',
+                    'details': f'{protocol_relative_count} resources use protocol-relative URLs (//). Use explicit HTTPS instead.'
+                })
 
     def detect_duplication_issues(self, all_results, similarity_threshold=0.85):
         """
@@ -1156,6 +1488,485 @@ class IssueDetector:
             505: 'HTTP Version Not Supported'
         }
         return messages.get(status_code, f'HTTP {status_code} Error')
+
+    def detect_sitemap_issues(self, sitemap_urls, all_results):
+        """
+        Cross-reference sitemap URLs with crawled results to detect "Dirty Sitemap" issues.
+        
+        Args:
+            sitemap_urls: List of URLs found in sitemaps
+            all_results: List of crawled result dictionaries
+            
+        Returns:
+            dict: Summary with categorized counts and issues list for frontend
+        """
+        if not sitemap_urls or not all_results:
+            return {
+                'total': 0,
+                'valid': 0,
+                'errors': 0,
+                'noindex': 0,
+                'non_canonical': 0,
+                'redirects': 0,
+                'not_crawled': 0,
+                'issues': []
+            }
+        
+        # Build lookup dict from crawled results (normalized URL -> result)
+        results_lookup = {}
+        for result in all_results:
+            url = result.get('url', '')
+            if url:
+                normalized = self._normalize_url_for_comparison(url)
+                results_lookup[normalized] = result
+
+        # DEBUG: Print sample keys
+        if sitemap_urls:
+            print(f"DEBUG SITEMAP: Sitemap URLs count: {len(sitemap_urls)}")
+            print(f"DEBUG SITEMAP: Crawled lookup keys count: {len(results_lookup)}")
+            sample_sitemap = sitemap_urls[0]
+            norm_sitemap = self._normalize_url_for_comparison(sample_sitemap)
+            print(f"DEBUG SITEMAP: Sample Sitemap URL: '{sample_sitemap}' -> '{norm_sitemap}'")
+            if results_lookup:
+                sample_crawled = list(results_lookup.keys())[0]
+                print(f"DEBUG SITEMAP: Sample Crawled Key: '{sample_crawled}'")
+                if norm_sitemap not in results_lookup:
+                    print(f"DEBUG SITEMAP: Mismatch! '{norm_sitemap}' not found in lookup.")
+    
+        # Track counts
+        valid_count = 0
+        error_count = 0
+        noindex_count = 0
+        non_canonical_count = 0
+        redirect_count = 0
+        not_crawled_count = 0
+        sitemap_issues = []
+        
+        for sitemap_url in sitemap_urls:
+            normalized_sitemap_url = self._normalize_url_for_comparison(sitemap_url)
+            result = results_lookup.get(normalized_sitemap_url)
+            
+            if not result:
+                # URL in sitemap but not crawled
+                not_crawled_count += 1
+                continue
+            
+            status_code = result.get('status_code', 0)
+            robots_meta = result.get('robots', '').lower()
+            x_robots_tag = result.get('x_robots_tag', '').lower()
+            canonical_url = result.get('canonical_url', '')
+            
+            is_noindex = 'noindex' in robots_meta or 'noindex' in x_robots_tag
+            
+            # Check for non-self-canonical
+            is_non_canonical = False
+            if canonical_url:
+                normalized_canonical = self._normalize_url_for_comparison(canonical_url)
+                if normalized_canonical != normalized_sitemap_url:
+                    is_non_canonical = True
+            
+            # Categorize the URL
+            if status_code >= 400 or status_code == 0:
+                # Error (4xx, 5xx, or connection failed)
+                error_count += 1
+                sitemap_issues.append({
+                    'url': sitemap_url,
+                    'type': 'error',
+                    'category': 'Sitemap',
+                    'issue': 'Sitemap: Broken URL',
+                    'details': f'URL returns {self._get_status_code_message(status_code)} (Status {status_code})'
+                })
+            elif status_code >= 300 and status_code < 400:
+                # Redirect
+                redirect_count += 1
+                sitemap_issues.append({
+                    'url': sitemap_url,
+                    'type': 'warning',
+                    'category': 'Sitemap',
+                    'issue': 'Sitemap: Redirecting URL',
+                    'details': f'URL redirects ({status_code}) - update sitemap with final destination'
+                })
+            elif is_noindex:
+                # Noindex
+                noindex_count += 1
+                sitemap_issues.append({
+                    'url': sitemap_url,
+                    'type': 'warning',
+                    'category': 'Sitemap',
+                    'issue': 'Sitemap: Noindexed URL',
+                    'details': 'URL has noindex directive - remove from sitemap or remove noindex'
+                })
+            elif is_non_canonical:
+                # Non-canonical
+                non_canonical_count += 1
+                sitemap_issues.append({
+                    'url': sitemap_url,
+                    'type': 'warning',
+                    'category': 'Sitemap',
+                    'issue': 'Sitemap: Non-Canonical URL',
+                    'details': f'URL canonicalises to {canonical_url} - update sitemap with canonical URL'
+                })
+            else:
+                # Valid (200 OK, indexable, self-canonical)
+                valid_count += 1
+        
+        # Add issues to main detected_issues list
+        with self.issues_lock:
+            self.detected_issues.extend(sitemap_issues)
+        
+        return {
+            'total': len(sitemap_urls),
+            'valid': valid_count,
+            'errors': error_count,
+            'noindex': noindex_count,
+            'non_canonical': non_canonical_count,
+            'redirects': redirect_count,
+            'not_crawled': not_crawled_count,
+            'issues': sitemap_issues
+        }
+
+    def detect_links_to_redirects(self, all_results, all_links):
+        """
+        Detect internal links that point to URLs that redirect.
+        This wastes crawl budget and should be fixed by updating the href.
+        
+        Args:
+            all_results: List of all crawled result dictionaries
+            all_links: List of all link dictionaries {source_url, target_url, is_internal, ...}
+            
+        Returns:
+            dict: Summary with count and list of problematic links
+        """
+        if not all_results or not all_links:
+            return {'total_links_to_redirects': 0, 'pages_affected': 0, 'links': []}
+        
+        # Build a lookup of URL -> status code and redirect info
+        url_status_map = {}
+        for result in all_results:
+            url = result.get('url', '')
+            if not url:
+                continue
+            normalized = self._normalize_url_for_comparison(url)
+            url_status_map[normalized] = {
+                'status_code': result.get('status_code', 0),
+                'final_url': result.get('final_url', ''),
+                'redirect_chain': result.get('redirect_chain', [])
+            }
+        
+        # Track links pointing to redirects
+        links_to_redirects = []
+        pages_with_redirect_links = set()
+        
+        for link in all_links:
+            source_url = link.get('source_url', '')
+            target_url = link.get('target_url', '')
+            is_internal = link.get('is_internal', False)
+            
+            if not source_url or not target_url or not is_internal:
+                continue
+            
+            # Check target URL's status
+            normalized_target = self._normalize_url_for_comparison(target_url)
+            target_info = url_status_map.get(normalized_target)
+            
+            if target_info:
+                status = target_info.get('status_code', 0)
+                if 300 <= status < 400:
+                    # This is a link to a redirect!
+                    final_url = target_info.get('final_url', '')
+                    links_to_redirects.append({
+                        'source_url': source_url,
+                        'target_url': target_url,
+                        'target_status': status,
+                        'final_url': final_url,
+                        'anchor_text': link.get('text', ''),
+                        'redirect_chain': target_info.get('redirect_chain', [])
+                    })
+                    pages_with_redirect_links.add(source_url)
+        
+        # Create issues for pages with links to redirects
+        # Group by source URL to avoid duplicate issues per page
+        links_by_source = {}
+        for link in links_to_redirects:
+            source = link['source_url']
+            if source not in links_by_source:
+                links_by_source[source] = []
+            links_by_source[source].append(link)
+        
+        with self.issues_lock:
+            for source_url, source_links in links_by_source.items():
+                count = len(source_links)
+                # Show first few examples
+                examples = [f"{l['target_url']} ({l['target_status']})" for l in source_links[:3]]
+                examples_str = ', '.join(examples)
+                if count > 3:
+                    examples_str += f', and {count - 3} more'
+                
+                self.detected_issues.append({
+                    'url': source_url,
+                    'type': 'warning',
+                    'category': 'Links',
+                    'issue': 'Links: Internal Links to Redirects',
+                    'details': f'{count} internal links point to redirecting URLs: {examples_str}',
+                    'links_to_redirects': source_links
+                })
+        
+        return {
+            'total_links_to_redirects': len(links_to_redirects),
+            'pages_affected': len(pages_with_redirect_links),
+            'links': links_to_redirects
+        }
+
+    def detect_broken_link_sources(self, all_results, all_links):
+        """
+        Find which pages contain links to broken URLs (4xx/5xx status).
+        Enriches broken URL issues with source page information.
+        
+        Args:
+            all_results: List of all crawled result dictionaries
+            all_links: List of all link dictionaries {source_url, target_url, is_internal, ...}
+            
+        Returns:
+            dict: Summary with broken URLs and their source pages
+        """
+        if not all_results or not all_links:
+            return {'broken_urls': [], 'total_broken_links': 0}
+        
+        # Build a lookup of URL -> status code
+        url_status_map = {}
+        for result in all_results:
+            url = result.get('url', '')
+            if not url:
+                continue
+            normalized = self._normalize_url_for_comparison(url)
+            url_status_map[normalized] = {
+                'status_code': result.get('status_code', 0),
+                'title': result.get('title', ''),
+                'url': url
+            }
+        
+        # Build a lookup of target URL -> list of source pages
+        target_sources_map = {}
+        for link in all_links:
+            source_url = link.get('source_url', '')
+            target_url = link.get('target_url', '')
+            
+            if not source_url or not target_url:
+                continue
+            
+            normalized_target = self._normalize_url_for_comparison(target_url)
+            if normalized_target not in target_sources_map:
+                target_sources_map[normalized_target] = []
+            
+            target_sources_map[normalized_target].append({
+                'source_url': source_url,
+                'anchor_text': link.get('text', ''),
+                'is_internal': link.get('is_internal', False)
+            })
+        
+        # Find broken URLs and their sources
+        broken_urls_with_sources = []
+        
+        for normalized_url, status_info in url_status_map.items():
+            status = status_info.get('status_code', 0)
+            original_url = status_info.get('url', normalized_url)
+            
+            if status >= 400 or status == 0:  # 4xx, 5xx, or no response
+                sources = target_sources_map.get(normalized_url, [])
+                
+                if sources:
+                    broken_urls_with_sources.append({
+                        'broken_url': original_url,
+                        'status_code': status,
+                        'title': status_info.get('title', ''),
+                        'source_pages': sources,
+                        'source_count': len(sources)
+                    })
+        
+        # Enhance existing 4xx/5xx issues with source page info
+        # Also create new issues that highlight the source pages
+        with self.issues_lock:
+            for broken_item in broken_urls_with_sources:
+                broken_url = broken_item['broken_url']
+                status = broken_item['status_code']
+                sources = broken_item['source_pages']
+                source_count = broken_item['source_count']
+                
+                if source_count > 0:
+                    # Get first few source URLs for the issue details
+                    source_urls = [s['source_url'] for s in sources[:5]]
+                    source_list = ', '.join(source_urls)
+                    if source_count > 5:
+                        source_list += f' and {source_count - 5} more'
+                    
+                    self.detected_issues.append({
+                        'url': broken_url,
+                        'type': 'error' if status >= 400 else 'warning',
+                        'category': 'Links',
+                        'issue': f'Broken Link Sources: {status} error linked from {source_count} pages',
+                        'details': f'This broken URL is linked from: {source_list}',
+                        'source_pages': sources,
+                        'source_count': source_count
+                    })
+        
+        return {
+            'broken_urls': broken_urls_with_sources,
+            'total_broken_links': sum(item['source_count'] for item in broken_urls_with_sources)
+        }
+
+    def detect_hreflang_issues(self, all_results):
+        """
+        Detect hreflang implementation issues across all crawled pages.
+        
+        Checks:
+        1. Invalid ISO language/region codes
+        2. Missing reciprocal hreflang links (if page A points to B, B should point back to A)
+        3. Missing self-referencing hreflang
+        4. Hreflang pointing to non-200 pages
+        
+        Returns a summary dict with hreflang data for frontend visualization.
+        """
+        # Valid ISO 639-1 language codes (common ones)
+        valid_lang_codes = {
+            'aa', 'ab', 'af', 'ak', 'am', 'ar', 'as', 'ay', 'az', 'ba', 'be', 'bg', 'bh', 'bi', 'bn', 'bo', 'br', 'bs',
+            'ca', 'co', 'cs', 'cy', 'da', 'de', 'dz', 'el', 'en', 'eo', 'es', 'et', 'eu', 'fa', 'fi', 'fj', 'fo', 'fr',
+            'fy', 'ga', 'gd', 'gl', 'gn', 'gu', 'ha', 'he', 'hi', 'hr', 'hu', 'hy', 'ia', 'id', 'ie', 'ik', 'is', 'it',
+            'iu', 'ja', 'jv', 'ka', 'kk', 'kl', 'km', 'kn', 'ko', 'ks', 'ku', 'ky', 'la', 'lb', 'ln', 'lo', 'lt', 'lv',
+            'mg', 'mi', 'mk', 'ml', 'mn', 'mr', 'ms', 'mt', 'my', 'na', 'ne', 'nl', 'no', 'oc', 'om', 'or', 'pa', 'pl',
+            'ps', 'pt', 'qu', 'rm', 'rn', 'ro', 'ru', 'rw', 'sa', 'sd', 'sg', 'sh', 'si', 'sk', 'sl', 'sm', 'sn', 'so',
+            'sq', 'sr', 'ss', 'st', 'su', 'sv', 'sw', 'ta', 'te', 'tg', 'th', 'ti', 'tk', 'tl', 'tn', 'to', 'tr', 'ts',
+            'tt', 'tw', 'ug', 'uk', 'ur', 'uz', 've', 'vi', 'vo', 'wo', 'xh', 'yi', 'yo', 'za', 'zh', 'zu',
+            'x-default'  # Special value for default/fallback
+        }
+        
+        # Regex for valid hreflang format: lang or lang-region (e.g., en, en-US, zh-Hans-CN)
+        hreflang_pattern = re.compile(r'^[a-z]{2,3}(-[A-Za-z]{2,4})?(-[A-Za-z]{2})?$|^x-default$', re.IGNORECASE)
+        
+        # Build URL -> hreflang map and status map
+        url_hreflang_map = {}  # url -> list of {lang, target_url}
+        url_status_map = {}    # url -> status_code
+        
+        for result in all_results:
+            url = result.get('url', '')
+            if not url:
+                continue
+            
+            normalized_url = self._normalize_url_for_comparison(url)
+            url_status_map[normalized_url] = result.get('status_code', 0)
+            
+            hreflang_list = result.get('hreflang', [])
+            if hreflang_list:
+                url_hreflang_map[normalized_url] = {
+                    'original_url': url,
+                    'hreflangs': hreflang_list
+                }
+        
+        # Track all hreflang entries for frontend matrix
+        hreflang_matrix = []
+        
+        # Detect issues
+        for normalized_url, data in url_hreflang_map.items():
+            source_url = data['original_url']
+            hreflangs = data['hreflangs']
+            
+            has_self_reference = False
+            
+            for hreflang_entry in hreflangs:
+                lang = hreflang_entry.get('lang', '')
+                target_url = hreflang_entry.get('url', '')
+                
+                if not lang or not target_url:
+                    continue
+                
+                normalized_target = self._normalize_url_for_comparison(target_url)
+                
+                # Check 1: Validate language code format
+                lang_base = lang.split('-')[0].lower()
+                if not hreflang_pattern.match(lang):
+                    with self.issues_lock:
+                        self.detected_issues.append({
+                            'url': source_url,
+                            'type': 'warning',
+                            'category': 'International',
+                            'issue': 'Hreflang: Invalid Language Code',
+                            'details': f'Invalid hreflang code "{lang}" - should be ISO 639-1 format (e.g., en, en-US)'
+                        })
+                elif lang_base not in valid_lang_codes and lang.lower() != 'x-default':
+                    with self.issues_lock:
+                        self.detected_issues.append({
+                            'url': source_url,
+                            'type': 'warning',
+                            'category': 'International',
+                            'issue': 'Hreflang: Unknown Language Code',
+                            'details': f'Unrecognized language code "{lang}" - verify it is a valid ISO 639-1 code'
+                        })
+                
+                # Check for self-reference
+                if normalized_target == normalized_url:
+                    has_self_reference = True
+                
+                # Check 2: Reciprocal link validation
+                reciprocal_status = 'unknown'
+                if normalized_target in url_hreflang_map:
+                    target_hreflangs = url_hreflang_map[normalized_target]['hreflangs']
+                    # Check if target points back to source
+                    points_back = any(
+                        self._normalize_url_for_comparison(h.get('url', '')) == normalized_url
+                        for h in target_hreflangs
+                    )
+                    if points_back:
+                        reciprocal_status = 'valid'
+                    else:
+                        reciprocal_status = 'missing'
+                        with self.issues_lock:
+                            self.detected_issues.append({
+                                'url': source_url,
+                                'type': 'warning',
+                                'category': 'International',
+                                'issue': 'Hreflang: Missing Reciprocal Link',
+                                'details': f'Page points to {target_url} ({lang}) but target does not point back'
+                            })
+                else:
+                    # Target not crawled or doesn't have hreflang
+                    reciprocal_status = 'not_crawled'
+                
+                # Check 3: Target page status
+                target_status = url_status_map.get(normalized_target, 0)
+                if target_status >= 400 or target_status == 0:
+                    with self.issues_lock:
+                        self.detected_issues.append({
+                            'url': source_url,
+                            'type': 'error',
+                            'category': 'International',
+                            'issue': 'Hreflang: Points to Non-200 Page',
+                            'details': f'Hreflang ({lang}) points to {target_url} which returns status {target_status}'
+                        })
+                
+                # Add to matrix for frontend
+                hreflang_matrix.append({
+                    'source_url': source_url,
+                    'lang': lang,
+                    'target_url': target_url,
+                    'reciprocal_status': reciprocal_status,
+                    'target_status': target_status
+                })
+            
+            # Check 4: Missing self-reference
+            if hreflangs and not has_self_reference:
+                with self.issues_lock:
+                    self.detected_issues.append({
+                        'url': source_url,
+                        'type': 'info',
+                        'category': 'International',
+                        'issue': 'Hreflang: Missing Self-Reference',
+                        'details': 'Page has hreflang tags but no self-referencing hreflang'
+                    })
+        
+        return {
+            'hreflang_matrix': hreflang_matrix,
+            'pages_with_hreflang': len(url_hreflang_map),
+            'total_hreflang_entries': len(hreflang_matrix)
+        }
 
     def get_issues(self):
         """Get all detected issues"""

@@ -1,12 +1,14 @@
-"""
-Main web crawler orchestrator with smooth rate limiting and modular architecture.
-Refactored for better code practices and maintainability.
-"""
 import requests
 import threading
 import time
 import asyncio
 import re
+import random
+import hashlib
+import time
+import asyncio
+import re
+import random
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
@@ -29,10 +31,20 @@ class WebCrawler:
     """
 
     def __init__(self, crawl_id=None, resume_from_db=False):
-        # HTTP session
+        # HTTP session with browser-like headers to avoid bot detection
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'LibreCrawl/1.0 (Web Crawler)'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0'
         })
 
         # Base URL tracking
@@ -99,12 +111,13 @@ class WebCrawler:
         return {
             'max_depth': 3,
             'max_urls': 1000,
-            'delay': 1.0,
+            'delay': 2.0,  # Increased to prevent 429 rate limiting
             'follow_redirects': True,
             'crawl_external': False,
             'crawl_subdomains': True,
-            'user_agent': 'LibreCrawl/1.0 (Web Crawler)',
-            'timeout': 10,
+            # Use a real browser User-Agent to avoid bot detection
+            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'timeout': 15,  # Increased timeout
             'retries': 3,
             'accept_language': 'en-US,en;q=0.9',
             'respect_robots': True,
@@ -114,7 +127,7 @@ class WebCrawler:
             'include_patterns': [],
             'exclude_patterns': [],
             'max_file_size': 50 * 1024 * 1024,
-            'concurrency': 5,
+            'concurrency': 3,  # Reduced from 5 to prevent 429 rate limiting
             'memory_limit': 512 * 1024 * 1024,
             'log_level': 'INFO',
             'enable_proxy': False,
@@ -122,6 +135,8 @@ class WebCrawler:
             'custom_headers': {},
             'discover_sitemaps': True,
             'enable_pagespeed': False,
+            # Polite mode for aggressive anti-bot sites (Cloudflare, etc.)
+            'polite_mode': False,  # When enabled: 5-10s delays, single worker, random jitter
             'enable_javascript': False,
             'js_wait_time': 3,
             'js_timeout': 30,
@@ -272,6 +287,13 @@ class WebCrawler:
 
     def _initialize_components(self):
         """Initialize all crawler components"""
+        # Apply polite mode settings if enabled
+        if self.config.get('polite_mode', False):
+            print("🐢 Polite Mode enabled - using slow crawl settings for aggressive sites")
+            self.config['delay'] = 7.0  # 7 second base delay (will add random jitter)
+            self.config['concurrency'] = 1  # Single worker only
+            self.config['retries'] = 5  # More retries with longer wait
+        
         # Calculate requests per second from delay
         if self.config['delay'] > 0:
             requests_per_second = 1.0 / self.config['delay']
@@ -543,6 +565,22 @@ class WebCrawler:
         pending_count = link_stats.get('pending', 0)
         print(f"get_status called - crawl_results: {len(self.crawl_results)}, status: {status}, crawled: {self.stats['crawled']}, pending: {pending_count}")
 
+        # Compute sitemap health stats for frontend
+        sitemap_health = None
+        if self.sitemap_urls and self.crawl_results:
+            sitemap_health = self.issue_detector.detect_sitemap_issues(
+                self.sitemap_urls, 
+                self.crawl_results
+            )
+            # Remove issues from return (already added to issue_detector.detected_issues)
+            if sitemap_health:
+                sitemap_health = {k: v for k, v in sitemap_health.items() if k != 'issues'}
+
+        # Compute hreflang data for frontend matrix
+        hreflang_data = None
+        if self.crawl_results:
+            hreflang_data = self.issue_detector.detect_hreflang_issues(self.crawl_results)
+
         return {
             'status': status,
             'crawl_id': self.crawl_id,
@@ -555,7 +593,9 @@ class WebCrawler:
             'issues': self.issue_detector.get_issues() if self.issue_detector else [],
             'traps': self.link_manager.get_traps() if self.link_manager else [],
             'robots_data': self.robots_data,
-            'sitemap_urls': self.sitemap_urls,  # [NEW] Return for UI comparison
+            'sitemap_urls': self.sitemap_urls,
+            'sitemap_health': sitemap_health,
+            'hreflang_data': hreflang_data,  # [NEW] Hreflang validation data for matrix
             'progress': min(100, (self.stats['crawled'] / max(link_stats['discovered'], 1)) * 100),
             'is_running_pagespeed': self.is_running_pagespeed,
             'memory': self.memory_monitor.get_stats(),
@@ -794,6 +834,26 @@ class WebCrawler:
             self.issue_detector.detect_duplication_issues(self.crawl_results, duplication_threshold)
             print(f"Duplication detection complete. Total issues: {len(self.issue_detector.get_issues())}")
 
+        # Detect internal links pointing to redirecting URLs
+        if self.issue_detector:
+            print("Detecting internal links to redirects...")
+            all_links = self.link_manager.all_links if self.link_manager else []
+            links_to_redirects_result = self.issue_detector.detect_links_to_redirects(
+                self.crawl_results, 
+                all_links
+            )
+            if links_to_redirects_result.get('total_links_to_redirects', 0) > 0:
+                print(f"Found {links_to_redirects_result['total_links_to_redirects']} internal links to redirects on {links_to_redirects_result['pages_affected']} pages")
+
+            # Detect broken link sources (which pages link to broken URLs)
+            print("Detecting broken link sources...")
+            broken_link_result = self.issue_detector.detect_broken_link_sources(
+                self.crawl_results,
+                all_links
+            )
+            if broken_link_result.get('total_broken_links', 0) > 0:
+                print(f"Found {len(broken_link_result['broken_urls'])} broken URLs linked from pages")
+
         # Save final data and mark as complete
         if self.db_save_enabled and self.crawl_id:
             self._save_batch_to_db(force=True)
@@ -836,8 +896,15 @@ class WebCrawler:
                 except:
                     pass  # Continue if HEAD request fails
 
-            # Fetch the page with retries
+            # Fetch the page with retries and 429 handling
             response = None
+            base_delay = self.config.get('delay', 1.0)
+            
+            # Add random jitter for polite mode to appear more human-like
+            if self.config.get('polite_mode', False):
+                jitter = random.uniform(2.0, 5.0)  # 2-5 seconds random jitter
+                time.sleep(jitter)
+            
             for attempt in range(retries + 1):
                 try:
                     response = self.session.get(
@@ -845,11 +912,34 @@ class WebCrawler:
                         timeout=self.config['timeout'],
                         allow_redirects=self.config['follow_redirects']
                     )
-                    break
+                    
+                    # Handle 429 Too Many Requests with exponential backoff
+                    if response.status_code == 429:
+                        if attempt >= retries:
+                            print(f"429 Too Many Requests after {retries + 1} attempts: {url}")
+                            break  # Return the 429 response so it's recorded as an issue
+                        
+                        # Get retry-after header if present, otherwise use exponential backoff
+                        retry_after = response.headers.get('Retry-After')
+                        if retry_after:
+                            try:
+                                wait_time = int(retry_after)
+                            except ValueError:
+                                wait_time = base_delay * (2 ** attempt)  # Exponential backoff
+                        else:
+                            wait_time = base_delay * (2 ** attempt)  # 1s, 2s, 4s, 8s...
+                        
+                        wait_time = min(wait_time, 30)  # Cap at 30 seconds
+                        print(f"429 Rate limited. Waiting {wait_time}s before retry {attempt + 1}/{retries}...")
+                        time.sleep(wait_time)
+                        continue
+                    
+                    break  # Success, exit retry loop
+                    
                 except Exception as e:
                     if attempt >= retries:
                         raise e
-                    time.sleep(1)
+                    time.sleep(base_delay * (attempt + 1))  # Incremental delay on errors
 
             # Determine if URL is internal
             is_internal = self.link_manager.is_internal(url)
@@ -899,13 +989,33 @@ class WebCrawler:
                 'response_headers': dict(response.headers),
                 'response_time': 0,
                 'redirects': [],
-                'hreflang': [],
-                'schema_org': [],
+                'redirect_chain': [],  # [NEW] Detailed redirect chain
                 'hreflang': [],
                 'schema_org': [],
                 'linked_from': [],
                 'x_robots_tag': response.headers.get('X-Robots-Tag', '')
             }
+
+            # [NEW] Extract redirect chain from response.history
+            if response.history:
+                redirect_chain = []
+                for i, resp in enumerate(response.history):
+                    redirect_chain.append({
+                        'url': resp.url,
+                        'status_code': resp.status_code,
+                        'hop': i + 1
+                    })
+                # Add final destination
+                redirect_chain.append({
+                    'url': response.url,
+                    'status_code': response.status_code,
+                    'hop': len(response.history) + 1,
+                    'final': True
+                })
+                result['redirect_chain'] = redirect_chain
+                result['redirects'] = [r['url'] for r in redirect_chain]
+                result['final_url'] = response.url
+                result['redirect_count'] = len(response.history)
 
             # Only parse HTML content
             if 'text/html' in response.headers.get('content-type', ''):
@@ -964,6 +1074,12 @@ class WebCrawler:
         start_time = time.time()
 
         try:
+            # Hash function helper
+            def get_content_hash(content):
+                if isinstance(content, str):
+                    content = content.encode('utf-8')
+                return hashlib.md5(content).hexdigest()
+
             # Render page with JavaScript
             html_content, status_code, headers, error = await self.js_renderer.render_page(url)
 
@@ -972,6 +1088,55 @@ class WebCrawler:
 
             # Determine if URL is internal
             is_internal = self.link_manager.is_internal(url)
+
+            # --- JS Rendering Difference Detection ---
+            requires_js = False
+            raw_html_hash = None
+            rendered_html_hash = None
+
+            try:
+                # Fetch raw HTML in parallel (run in executor to not block async loop)
+                loop = asyncio.get_event_loop()
+                # Use a separate plain request to get raw content
+                # We need to replicate session headers but avoid session state potentially
+                # For simplicity, we can use the same session but careful with async/sync split
+                # Ideally, we submit this to our thread pool
+                
+                def fetch_raw():
+                    try:
+                        resp = self.session.get(url, timeout=self.config['timeout'], stream=True)
+                        # Limit size for raw fetch too?
+                        raw_content = resp.content
+                        # Enforce max size limit
+                        if len(raw_content) > self.config['max_file_size']:
+                            return None
+                        return raw_content
+                    except:
+                        return None
+
+                raw_content = await loop.run_in_executor(None, fetch_raw)
+
+                if raw_content:
+                    raw_html_hash = get_content_hash(raw_content)
+                    rendered_html_hash = get_content_hash(html_content)
+
+                    # Comparison Logic:
+                    # 1. Hashes must be different
+                    # 2. Rendered content size differs significantly or contains critical new info
+                    # For now, simple size check: if rendered is > 10% larger than raw
+                    
+                    raw_size = len(raw_content)
+                    rendered_size = len(html_content.encode('utf-8'))
+                    
+                    if raw_html_hash != rendered_html_hash:
+                         # Requires JS if rendered is larger by 10% OR raw was very small/empty
+                         if raw_size == 0 or (rendered_size / raw_size) > 1.1:
+                             requires_js = True
+
+            except Exception as e:
+                print(f"Error checking raw content for {url}: {e}")
+
+            # -----------------------------------------
 
             # Create result structure
             result = {
@@ -993,6 +1158,11 @@ class WebCrawler:
                 'og_tags': {},
                 'twitter_tags': {},
                 'canonical_url': '',
+                'dom_size': 0,
+                'dom_depth': 0,
+                'requires_js': requires_js,
+                'raw_html_hash': raw_html_hash,
+                'rendered_html_hash': rendered_html_hash,
                 'lang': '',
                 'charset': '',
                 'viewport': '',

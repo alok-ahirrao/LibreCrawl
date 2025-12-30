@@ -105,6 +105,13 @@ def init_crawl_tables():
 
                 response_time REAL,
                 javascript_rendered BOOLEAN DEFAULT 0,
+                
+                dom_size INTEGER DEFAULT 0,
+                dom_depth INTEGER DEFAULT 0,
+
+                requires_js BOOLEAN DEFAULT 0,
+                raw_html_hash TEXT,
+                rendered_html_hash TEXT,
 
                 crawled_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
@@ -208,6 +215,33 @@ def init_crawl_tables():
             cursor.execute('ALTER TABLE crawls ADD COLUMN robots_data TEXT')
         except:
             pass # Column likely exists
+
+        # Attempt to add dom_size and dom_depth columns to crawled_urls
+        try:
+            cursor.execute('ALTER TABLE crawled_urls ADD COLUMN dom_size INTEGER DEFAULT 0')
+        except:
+            pass
+            
+        try:
+            cursor.execute('ALTER TABLE crawled_urls ADD COLUMN dom_depth INTEGER DEFAULT 0')
+        except:
+            pass
+
+        # Attempt to add JS rendering columns
+        try:
+            cursor.execute('ALTER TABLE crawled_urls ADD COLUMN requires_js BOOLEAN DEFAULT 0')
+        except:
+            pass
+            
+        try:
+            cursor.execute('ALTER TABLE crawled_urls ADD COLUMN raw_html_hash TEXT')
+        except:
+            pass
+
+        try:
+            cursor.execute('ALTER TABLE crawled_urls ADD COLUMN rendered_html_hash TEXT')
+        except:
+            pass
 
         print("Crawl persistence tables initialized successfully")
 
@@ -323,7 +357,12 @@ def save_url_batch(crawl_id, urls):
                     url_data.get('external_links'),
                     url_data.get('internal_links'),
                     url_data.get('response_time'),
-                    url_data.get('javascript_rendered', False)
+                    url_data.get('javascript_rendered', False),
+                    url_data.get('dom_size', 0),
+                    url_data.get('dom_depth', 0),
+                    url_data.get('requires_js', False),
+                    url_data.get('raw_html_hash'),
+                    url_data.get('rendered_html_hash')
                 )
                 rows.append(row)
 
@@ -334,8 +373,9 @@ def save_url_batch(crawl_id, urls):
                     canonical_url, lang, charset, viewport, robots,
                     meta_tags, og_tags, twitter_tags, json_ld, analytics, images,
                     hreflang, schema_org, redirects, linked_from,
-                    external_links, internal_links, response_time, javascript_rendered
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    external_links, internal_links, response_time, javascript_rendered,
+                    dom_size, dom_depth, requires_js, raw_html_hash, rendered_html_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', rows)
 
             print(f"Saved {len(urls)} URLs to database for crawl {crawl_id}")
