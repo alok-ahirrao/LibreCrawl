@@ -19,8 +19,18 @@ class SEOExtractor:
         result['meta_description'] = meta_desc.get('content', '').strip() if meta_desc else ''
 
         # Extract headings
-        h1_tag = soup.find('h1')
-        result['h1'] = h1_tag.get_text().strip() if h1_tag else ''
+        h1_tags = soup.find_all('h1')
+        result['h1_list'] = [h.get_text().strip() for h in h1_tags]
+        result['h1'] = result['h1_list'][0] if result['h1_list'] else ''
+
+        # Extract sequential structure
+        headings = []
+        for tag in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+            headings.append({
+                'level': int(tag.name[1]),
+                'text': tag.get_text().strip()
+            })
+        result['headings_structure'] = headings
 
         h2_tags = soup.find_all('h2')
         result['h2'] = [h2.get_text().strip() for h2 in h2_tags[:10]]
@@ -196,10 +206,22 @@ class SEOExtractor:
                 url_domain_clean = parsed_url.netloc.replace('www.', '', 1)
                 base_domain_clean = base_domain.replace('www.', '', 1)
 
-                if url_domain_clean == base_domain_clean:
+                is_internal = url_domain_clean == base_domain_clean
+
+                if is_internal:
                     result['internal_links'] += 1
                 else:
                     result['external_links'] += 1
+                    
+                # Extract detailed link data
+                result['links_data'].append({
+                    'href': href,
+                    'absolute_url': absolute_url,
+                    'text': link.get_text().strip(),
+                    'rel': link.get('rel', []),
+                    'target': link.get('target', ''),
+                    'is_internal': is_internal
+                })
 
     @staticmethod
     def extract_hreflang(soup, result):
@@ -267,6 +289,8 @@ class SEOExtractor:
             'title': '',
             'meta_description': '',
             'h1': '',
+            'h1_list': [],
+            'headings_structure': [],
             'h2': [],
             'h3': [],
             'word_count': 0,
@@ -295,10 +319,12 @@ class SEOExtractor:
             'images': [],
             'external_links': 0,
             'internal_links': 0,
+            'links_data': [],
             'response_time': 0,
             'redirects': [],
             'hreflang': [],
             'schema_org': [],
             'linked_from': [],
+            'response_headers': {},
             'error': error
         }

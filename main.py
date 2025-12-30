@@ -36,6 +36,7 @@ DISABLE_REGISTER = args.disable_register
 
 app = Flask(__name__, template_folder='web/templates', static_folder='web/static')
 app.secret_key = 'librecrawl-secret-key-change-in-production'  # TODO: Use environment variable in production
+app.config['SESSION_COOKIE_NAME'] = 'librecrawl_session'  # Rename cookie to avoid collision with Next.js
 
 # Enable compression for all responses
 Compress(app)
@@ -647,6 +648,11 @@ def start_crawl():
     crawler = get_or_create_crawler()
     settings_manager = get_session_settings()
 
+    # [NEW] Apply settings from request if provided (stateless config)
+    if 'settings' in data and isinstance(data['settings'], dict):
+        print(f"Applying settings from request: {data['settings']}")
+        settings_manager.save_settings(data['settings'])
+
     # Apply current settings to crawler before starting
     try:
         crawler_config = settings_manager.get_crawler_config()
@@ -664,6 +670,49 @@ def start_crawl():
         log_crawl_start(user_id, url)
 
     return jsonify({'success': success, 'message': message, 'crawl_id': crawler.crawl_id})
+
+@app.route('/api/run_pagespeed', methods=['POST'])
+@login_required
+def run_pagespeed():
+    """Run PageSpeed analysis on a specific URL without full crawl"""
+    data = request.get_json()
+    url = data.get('url')
+    
+    if not url:
+        return jsonify({'success': False, 'error': 'URL is required'})
+    
+    # Get crawler and settings
+    crawler = get_or_create_crawler()
+    settings_manager = get_session_settings()
+    
+    # Apply settings if provided (crucial for API keys)
+    if 'settings' in data and isinstance(data['settings'], dict):
+        settings_manager.save_settings(data['settings'])
+        
+    # Update crawler config
+    try:
+        crawler_config = settings_manager.get_crawler_config()
+        crawler.update_config(crawler_config)
+        
+        # Verify API Key
+        if not crawler_config.get('google_api_key'):
+             return jsonify({'success': False, 'error': 'Google PageSpeed API Key is required. Please set it in settings.'})
+             
+    except Exception as e:
+        return jsonify({'success': False, 'error': f"Configuration error: {str(e)}"})
+
+    # Run Analysis
+    try:
+        results = crawler.analyze_pagespeed([url])
+        
+        # Save to database if crawl is persistent
+        if crawler.crawl_id and crawler.db_save_enabled:
+            crawler._save_batch_to_db(force=True)
+            
+        return jsonify({'success': True, 'results': results})
+    except Exception as e:
+        print(f"PageSpeed API Error: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/stop_crawl', methods=['POST'])
 @login_required
@@ -711,6 +760,14 @@ def crawl_status():
         filtered_issues = filter_issues_by_exclusion_patterns(issues, exclusion_patterns)
         status_data['issues'] = filtered_issues
 
+    # Add polling control flags
+    current_status = status_data.get('status', 'idle')
+    terminal_states = ['completed', 'stopped', 'failed']
+    
+    # Tell frontend whether to continue polling
+    status_data['should_poll'] = current_status not in terminal_states
+    status_data['poll_interval'] = 2000  # milliseconds
+    
     return jsonify(status_data)
 
 @app.route('/api/visualization_data')
@@ -1010,7 +1067,8 @@ def get_crawl(crawl_id):
             'crawl': crawl,
             'urls': urls,
             'links': links,
-            'issues': issues
+            'issues': issues,
+            'robots_data': crawl.get('robots_data', {'content': None, 'issues': []})
         })
     except Exception as e:
         import traceback
@@ -1054,18 +1112,26 @@ def load_crawl_into_session(crawl_id):
             crawler.base_url = crawl['base_url']
             crawler.base_domain = crawl['base_domain']
 
+        # Initialize link_manager if not exists
+        if not crawler.link_manager:
+            from src.core.link_manager import LinkManager
+            crawler.link_manager = LinkManager(crawl['base_domain'], trap_threshold=100)
+
         # Load links into link manager
-        if crawler.link_manager:
-            crawler.link_manager.all_links = links
-            # Rebuild links_set
-            crawler.link_manager.links_set.clear()
-            for link in links:
-                link_key = f"{link['source_url']}|{link['target_url']}"
-                crawler.link_manager.links_set.add(link_key)
+        crawler.link_manager.all_links = links
+        # Rebuild links_set
+        crawler.link_manager.links_set.clear()
+        for link in links:
+            link_key = f"{link['source_url']}|{link['target_url']}"
+            crawler.link_manager.links_set.add(link_key)
+
+        # Initialize issue_detector if not exists
+        if not crawler.issue_detector:
+            from src.core.issue_detector import IssueDetector
+            crawler.issue_detector = IssueDetector(crawler.config.get('issue_exclusion_patterns', []))
 
         # Load issues into issue detector
-        if crawler.issue_detector:
-            crawler.issue_detector.detected_issues = issues
+        crawler.issue_detector.detected_issues = issues
 
         # Set Flask session flag for force full refresh
         session['force_full_refresh'] = True
@@ -1408,14 +1474,6 @@ def main():
     print(f"💾 Settings stored in browser localStorage")
     print(f"\nPress Ctrl+C to stop the server\n")
     print("=" * 60 + "\n")
-
-    # Open browser in a separate thread after short delay
-    def open_browser():
-        time.sleep(1.5)  # Wait for Flask to start
-        webbrowser.open('http://localhost:5000')
-
-    browser_thread = threading.Thread(target=open_browser, daemon=True)
-    browser_thread.start()
 
     # Run Flask server with Waitress (production-grade WSGI server)
     from waitress import serve

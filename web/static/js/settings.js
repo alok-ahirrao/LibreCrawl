@@ -9,7 +9,7 @@ let defaultSettings = {
     crawlExternalLinks: false,
 
     // Request settings
-    userAgent: 'LibreCrawl/1.0 (Web Crawler)',
+    userAgent: 'GrowthOS-Crawler/1.0',
     timeout: 10,
     retries: 3,
     acceptLanguage: 'en-US,en;q=0.9',
@@ -49,7 +49,7 @@ let defaultSettings = {
     jsTimeout: 30,
     jsBrowser: 'chromium',
     jsHeadless: true,
-    jsUserAgent: 'LibreCrawl/1.0 (Web Crawler with JavaScript)',
+    jsUserAgent: 'GrowthOS-Crawler/1.0 (JavaScript)',
     jsViewportWidth: 1920,
     jsViewportHeight: 1080,
     jsMaxConcurrentPages: 3,
@@ -266,7 +266,7 @@ let defaultSettings = {
 };
 
 // Initialize settings when page loads
-document.addEventListener('DOMContentLoaded', function() {
+document.addEventListener('DOMContentLoaded', function () {
     loadSettings();
     setupSettingsEventHandlers();
     applyCustomCSS();
@@ -276,7 +276,7 @@ function setupSettingsEventHandlers() {
     // Proxy checkbox handler
     const enableProxyCheckbox = document.getElementById('enableProxy');
     if (enableProxyCheckbox) {
-        enableProxyCheckbox.addEventListener('change', function() {
+        enableProxyCheckbox.addEventListener('change', function () {
             const proxySettings = document.getElementById('proxySettings');
             if (proxySettings) {
                 proxySettings.style.display = this.checked ? 'block' : 'none';
@@ -287,7 +287,7 @@ function setupSettingsEventHandlers() {
     // JavaScript checkbox handler
     const enableJavaScriptCheckbox = document.getElementById('enableJavaScript');
     if (enableJavaScriptCheckbox) {
-        enableJavaScriptCheckbox.addEventListener('change', function() {
+        enableJavaScriptCheckbox.addEventListener('change', function () {
             const jsSettingsGroups = [
                 'jsSettings', 'jsTimeoutGroup', 'jsBrowserGroup', 'jsHeadlessGroup',
                 'jsUserAgentGroup', 'jsViewportGroup', 'jsConcurrencyGroup', 'jsWarning'
@@ -525,20 +525,20 @@ function saveSettings() {
         },
         body: JSON.stringify(newSettings)
     })
-    .then(response => response.json())
-    .then(data => {
-        if (!data.success) {
-            console.warn('Backend sync failed:', data.error);
-        }
+        .then(response => response.json())
+        .then(data => {
+            if (!data.success) {
+                console.warn('Backend sync failed:', data.error);
+            }
 
-        // Update crawler with new settings if it's running
-        if (window.crawlState && window.crawlState.isRunning) {
-            updateCrawlerSettings();
-        }
-    })
-    .catch(error => {
-        console.error('Error syncing settings to backend:', error);
-    });
+            // Update crawler with new settings if it's running
+            if (window.crawlState && window.crawlState.isRunning) {
+                updateCrawlerSettings();
+            }
+        })
+        .catch(error => {
+            console.error('Error syncing settings to backend:', error);
+        });
 }
 
 function resetSettings() {
@@ -719,17 +719,17 @@ function updateCrawlerSettings() {
         },
         body: JSON.stringify(currentSettings)
     })
-    .then(response => response.json())
-    .then(data => {
-        if (data.success) {
-            console.log('Crawler settings updated');
-        } else {
-            console.warn('Failed to update crawler settings:', data.error);
-        }
-    })
-    .catch(error => {
-        console.error('Error updating crawler settings:', error);
-    });
+        .then(response => response.json())
+        .then(data => {
+            if (data.success) {
+                console.log('Crawler settings updated');
+            } else {
+                console.warn('Failed to update crawler settings:', data.error);
+            }
+        })
+        .catch(error => {
+            console.error('Error updating crawler settings:', error);
+        });
 }
 
 function exportSettings() {
@@ -753,7 +753,7 @@ function importSettings(event) {
     if (!file) return;
 
     const reader = new FileReader();
-    reader.onload = function(e) {
+    reader.onload = function (e) {
         try {
             const importedSettings = JSON.parse(e.target.result);
 
@@ -828,7 +828,7 @@ function showNotification(message, type = 'info') {
 }
 
 // Close modal when clicking outside
-document.addEventListener('click', function(event) {
+document.addEventListener('click', function (event) {
     const modal = document.getElementById('settingsModal');
     if (event.target === modal) {
         closeSettings();
@@ -836,7 +836,7 @@ document.addEventListener('click', function(event) {
 });
 
 // Close modal with Escape key
-document.addEventListener('keydown', function(event) {
+document.addEventListener('keydown', function (event) {
     if (event.key === 'Escape') {
         const modal = document.getElementById('settingsModal');
         if (modal.style.display === 'flex') {
@@ -846,7 +846,7 @@ document.addEventListener('keydown', function(event) {
 });
 
 // Export current settings object for use by other modules
-window.getCurrentSettings = function() {
+window.getCurrentSettings = function () {
     return currentSettings;
 };
 

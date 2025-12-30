@@ -57,6 +57,8 @@ def init_crawl_tables():
                 can_resume BOOLEAN DEFAULT 1,
                 resume_checkpoint TEXT,
 
+                sitemap_urls TEXT,
+
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
         ''')
@@ -114,22 +116,31 @@ def init_crawl_tables():
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS crawl_links (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                crawl_id INTEGER NOT NULL,
-
-                source_url TEXT NOT NULL,
-                target_url TEXT NOT NULL,
+                crawl_id INTEGER,
+                source_url TEXT,
+                target_url TEXT,
                 anchor_text TEXT,
-
                 is_internal BOOLEAN,
-                target_domain TEXT,
+                is_nofollow BOOLEAN,
                 target_status INTEGER,
                 placement TEXT,
-
-                discovered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-                FOREIGN KEY (crawl_id) REFERENCES crawls(id) ON DELETE CASCADE
+                scope TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (crawl_id) REFERENCES crawls (id)
             )
         ''')
+        
+        # Attempt to add scope column if it doesn't exist (migrations-lite)
+        try:
+            cursor.execute('ALTER TABLE crawl_links ADD COLUMN scope TEXT')
+        except:
+            pass # Column likely exists
+
+        # Attempt to add is_nofollow column as well
+        try:
+            cursor.execute('ALTER TABLE crawl_links ADD COLUMN is_nofollow BOOLEAN')
+        except:
+            pass # Column likely exists
 
         # Issues table
         cursor.execute('''
@@ -180,6 +191,24 @@ def init_crawl_tables():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawl_issues_category ON crawl_issues(crawl_id, category)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawl_queue_crawl ON crawl_queue(crawl_id)')
 
+        # Attempt to add pagespeed_results column
+        try:
+            cursor.execute('ALTER TABLE crawls ADD COLUMN pagespeed_results TEXT')
+        except:
+            pass # Column likely exists
+
+        # Attempt to add sitemap_urls column
+        try:
+            cursor.execute('ALTER TABLE crawls ADD COLUMN sitemap_urls TEXT')
+        except:
+            pass # Column likely exists
+
+        # Attempt to add robots_data column
+        try:
+            cursor.execute('ALTER TABLE crawls ADD COLUMN robots_data TEXT')
+        except:
+            pass # Column likely exists
+
         print("Crawl persistence tables initialized successfully")
 
 def create_crawl(user_id, session_id, base_url, base_domain, config_snapshot):
@@ -202,7 +231,7 @@ def create_crawl(user_id, session_id, base_url, base_domain, config_snapshot):
         print(f"Error creating crawl: {e}")
         return None
 
-def update_crawl_stats(crawl_id, discovered=None, crawled=None, max_depth=None, peak_memory_mb=None, estimated_size_mb=None):
+def update_crawl_stats(crawl_id, discovered=None, crawled=None, max_depth=None, peak_memory_mb=None, estimated_size_mb=None, pagespeed_results=None, sitemap_urls=None, robots_data=None):
     """Update crawl statistics"""
     try:
         with get_db() as conn:
@@ -226,6 +255,15 @@ def update_crawl_stats(crawl_id, discovered=None, crawled=None, max_depth=None, 
             if estimated_size_mb is not None:
                 updates.append("estimated_size_mb = ?")
                 params.append(estimated_size_mb)
+            if pagespeed_results is not None:
+                updates.append("pagespeed_results = ?")
+                params.append(json.dumps(pagespeed_results))
+            if sitemap_urls is not None:
+                updates.append("sitemap_urls = ?")
+                params.append(json.dumps(sitemap_urls))
+            if robots_data is not None:
+                updates.append("robots_data = ?")
+                params.append(json.dumps(robots_data))
 
             updates.append("last_saved_at = CURRENT_TIMESTAMP")
             params.append(crawl_id)
@@ -326,17 +364,18 @@ def save_links_batch(crawl_id, links):
                     link.get('target_url'),
                     link.get('anchor_text'),
                     link.get('is_internal'),
-                    link.get('target_domain'),
+                    link.get('nofollow', False), # is_nofollow
                     link.get('target_status'),
-                    link.get('placement', 'body')
+                    link.get('placement', 'body'),
+                    link.get('scope', 'external') # scope
                 )
                 rows.append(row)
 
             cursor.executemany('''
                 INSERT INTO crawl_links (
                     crawl_id, source_url, target_url, anchor_text,
-                    is_internal, target_domain, target_status, placement
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    is_internal, is_nofollow, target_status, placement, scope
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', rows)
 
             print(f"Saved {len(links)} links to database for crawl {crawl_id}")
@@ -442,6 +481,21 @@ def get_crawl_by_id(crawl_id):
                     crawl['config_snapshot'] = json.loads(crawl['config_snapshot'])
                 if crawl.get('resume_checkpoint'):
                     crawl['resume_checkpoint'] = json.loads(crawl['resume_checkpoint'])
+                if crawl.get('pagespeed_results'):
+                    try:
+                        crawl['pagespeed_results'] = json.loads(crawl['pagespeed_results'])
+                    except:
+                        crawl['pagespeed_results'] = []
+                if crawl.get('sitemap_urls'):
+                    try:
+                        crawl['sitemap_urls'] = json.loads(crawl['sitemap_urls'])
+                    except:
+                        crawl['sitemap_urls'] = []
+                if crawl.get('robots_data'):
+                    try:
+                        crawl['robots_data'] = json.loads(crawl['robots_data'])
+                    except:
+                        crawl['robots_data'] = {'content': None, 'issues': []}
                 return crawl
             return None
 

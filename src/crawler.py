@@ -38,6 +38,7 @@ class WebCrawler:
         # Base URL tracking
         self.base_url = None
         self.base_domain = None
+        self.robots_data = {'content': None, 'issues': []}
 
         # Component instances (initialized on demand)
         self.rate_limiter = None
@@ -75,6 +76,9 @@ class WebCrawler:
         # Robots.txt cache
         self._robots_cache = {}
 
+        # Sitemap data
+        self.sitemap_urls = []
+
         # Database persistence
         self.crawl_id = crawl_id
         self.resume_mode = resume_from_db
@@ -98,6 +102,7 @@ class WebCrawler:
             'delay': 1.0,
             'follow_redirects': True,
             'crawl_external': False,
+            'crawl_subdomains': True,
             'user_agent': 'LibreCrawl/1.0 (Web Crawler)',
             'timeout': 10,
             'retries': 3,
@@ -275,7 +280,7 @@ class WebCrawler:
             requests_per_second = 100.0
 
         self.rate_limiter = RateLimiter(requests_per_second)
-        self.link_manager = LinkManager(self.base_domain)
+        self.link_manager = LinkManager(self.base_domain, trap_threshold=self.config.get('trap_threshold', 100))
         self.sitemap_parser = SitemapParser(self.session, self.base_domain, self.config['timeout'])
         self.issue_detector = IssueDetector(self.config.get('issue_exclusion_patterns', []))
 
@@ -305,6 +310,9 @@ class WebCrawler:
     def _discover_and_add_sitemap_urls(self, base_url):
         """Discover sitemaps and add URLs to crawl queue"""
         sitemap_urls = self.sitemap_parser.discover_sitemaps(base_url)
+        # Deduplicate sitemap URLs
+        self.sitemap_urls = list(set(sitemap_urls))  # Store unique URLs for comparison UI
+        print(f"Sitemap discovery: {len(sitemap_urls)} total, {len(self.sitemap_urls)} unique")
 
         added_count = 0
         filtered_count = 0
@@ -318,6 +326,15 @@ class WebCrawler:
 
         self.stats['discovered'] = self.link_manager.get_stats()['discovered']
         print(f"Sitemap processing: {added_count} added, {filtered_count} filtered")
+
+        # Save discovered sitemap URLs to database
+        if self.db_save_enabled and self.crawl_id:
+            try:
+                from src.crawl_db import update_crawl_stats
+                update_crawl_stats(self.crawl_id, sitemap_urls=self.sitemap_urls)
+                print(f"Saved {len(self.sitemap_urls)} sitemap URLs to database")
+            except Exception as e:
+                print(f"Error saving sitemap URLs: {e}")
 
     def stop_crawl(self):
         """Stop the current crawl"""
@@ -523,10 +540,12 @@ class WebCrawler:
             self.issue_detector.detected_issues if self.issue_detector else []
         )
 
-        print(f"get_status called - crawl_results length: {len(self.crawl_results)}, status: {status}, crawled: {self.stats['crawled']}")
+        pending_count = link_stats.get('pending', 0)
+        print(f"get_status called - crawl_results: {len(self.crawl_results)}, status: {status}, crawled: {self.stats['crawled']}, pending: {pending_count}")
 
         return {
             'status': status,
+            'crawl_id': self.crawl_id,
             'stats': {
                 **self.stats,
                 'discovered': link_stats['discovered']
@@ -534,6 +553,9 @@ class WebCrawler:
             'urls': self.crawl_results.copy(),
             'links': self.link_manager.all_links.copy() if self.link_manager else [],
             'issues': self.issue_detector.get_issues() if self.issue_detector else [],
+            'traps': self.link_manager.get_traps() if self.link_manager else [],
+            'robots_data': self.robots_data,
+            'sitemap_urls': self.sitemap_urls,  # [NEW] Return for UI comparison
             'progress': min(100, (self.stats['crawled'] / max(link_stats['discovered'], 1)) * 100),
             'is_running_pagespeed': self.is_running_pagespeed,
             'memory': self.memory_monitor.get_stats(),
@@ -571,7 +593,10 @@ class WebCrawler:
                 crawled=self.stats['crawled'],
                 max_depth=self.stats['depth'],
                 peak_memory_mb=memory_stats.get('peak_mb', 0),
-                estimated_size_mb=memory_stats.get('estimated_crawl_mb', 0)
+                estimated_size_mb=memory_stats.get('estimated_crawl_mb', 0),
+                pagespeed_results=self.stats.get('pagespeed_results'),
+                sitemap_urls=self.sitemap_urls if self.sitemap_urls else None,
+                robots_data=self.robots_data if self.robots_data.get('content') else None
             )
 
             self.last_save_time = time.time()
@@ -735,9 +760,18 @@ class WebCrawler:
                     if link_stats['pending'] == 0 and len(active_futures) == 0:
                         print("No more URLs to crawl")
                         break
-
+                    elif link_stats['pending'] > 0 and len(active_futures) == 0:
+                        # DEBUG: Loop detected where we have pending but not picking up work
+                        # This could happen if get_next_url returns None (filtered, depth, etc)
+                        # We need to know if we are stuck here.
+                        print(f"DEBUG: Stall detected? Pending: {link_stats['pending']}, Active: {len(active_futures)}")
+                        
+                        # Monitor if this persists
+                        # If get_next_url keeps returning None, we might be in an infinite loop
+                        # But get_next_url should eventually exhaust the discovered_urls queue
+                        
                     # Tiny sleep only to yield CPU
-                    time.sleep(0.001)
+                    time.sleep(0.1) # Increased from 0.001 to reduce CPU usage and log spam if spinning
 
                 except Exception as e:
                     print(f"Error in crawl worker: {e}")
@@ -831,6 +865,8 @@ class WebCrawler:
                 'title': '',
                 'meta_description': '',
                 'h1': '',
+                'h1_list': [],
+                'headings_structure': [],
                 'h2': [],
                 'h3': [],
                 'word_count': 0,
@@ -859,11 +895,16 @@ class WebCrawler:
                 'images': [],
                 'external_links': 0,
                 'internal_links': 0,
+                'links_data': [],
+                'response_headers': dict(response.headers),
                 'response_time': 0,
                 'redirects': [],
                 'hreflang': [],
                 'schema_org': [],
-                'linked_from': []
+                'hreflang': [],
+                'schema_org': [],
+                'linked_from': [],
+                'x_robots_tag': response.headers.get('X-Robots-Tag', '')
             }
 
             # Only parse HTML content
@@ -884,7 +925,8 @@ class WebCrawler:
 
                 # Collect all links
                 links_before = len(self.link_manager.all_links)
-                self.link_manager.collect_all_links(soup, url, self.crawl_results)
+                # Pass base_domain for scope calculation
+                self.link_manager.collect_all_links(soup, url, self.crawl_results, self.base_domain)
                 links_after = len(self.link_manager.all_links)
 
                 # Add newly discovered links to unsaved batch
@@ -923,7 +965,7 @@ class WebCrawler:
 
         try:
             # Render page with JavaScript
-            html_content, status_code, error = await self.js_renderer.render_page(url)
+            html_content, status_code, headers, error = await self.js_renderer.render_page(url)
 
             if error:
                 return self.seo_extractor.create_empty_result(url, depth, status_code, error)
@@ -942,6 +984,8 @@ class WebCrawler:
                 'title': '',
                 'meta_description': '',
                 'h1': '',
+                'h1_list': [],
+                'headings_structure': [],
                 'h2': [],
                 'h3': [],
                 'word_count': 0,
@@ -970,12 +1014,17 @@ class WebCrawler:
                 'images': [],
                 'external_links': 0,
                 'internal_links': 0,
+                'links_data': [],
+                'internal_links': 0,
+                'links_data': [],
+                'response_headers': headers,
                 'response_time': 0,
                 'redirects': [],
                 'hreflang': [],
                 'schema_org': [],
                 'linked_from': [],
-                'javascript_rendered': True
+                'javascript_rendered': True,
+                'x_robots_tag': headers.get('x-robots-tag', '')  # Headers from Playwright are lower-cased
             }
 
             # Parse HTML
@@ -1108,19 +1157,36 @@ class WebCrawler:
             if self.issue_detector and self.config.get('enable_duplication_check', True):
                 print("Running duplication detection...")
                 duplication_threshold = self.config.get('duplication_threshold', 0.85)
+            # Duplication detection
+            if self.issue_detector:
+                duplication_threshold = self.config.get('duplication_threshold', 0.85)
                 self.issue_detector.detect_duplication_issues(self.crawl_results, duplication_threshold)
                 print(f"Duplication detection complete. Total issues: {len(self.issue_detector.get_issues())}")
 
             # Save final data and mark as complete
             if self.db_save_enabled and self.crawl_id:
+                # Save one last time using the CORRECT method name
                 self._save_batch_to_db(force=True)
-                from src.crawl_db import set_crawl_status
-                set_crawl_status(self.crawl_id, 'completed')
+                
+                # Update status
+                from src.crawl_db import set_crawl_status # Import here to avoid circular dependency
+                
+                if self.is_paused:
+                    set_crawl_status(self.crawl_id, 'paused')
+                    print(f"Crawl paused. Discovered: {self.stats['discovered']}, Crawled: {self.stats['crawled']}")
+                elif not self.is_running:
+                     # Stopped manually
+                     set_crawl_status(self.crawl_id, 'stopped')
+                     print(f"Crawl stopped. Discovered: {self.stats['discovered']}, Crawled: {self.stats['crawled']}")
+                else:
+                    # Completed naturally
+                    self.is_running = False
+                    set_crawl_status(self.crawl_id, 'completed')
+                    print(f"Crawl completed. Discovered: {self.stats['discovered']}, Crawled: {self.stats['crawled']}")
 
             # Clean up
-            await self.js_renderer.cleanup()
-            self.is_running = False
-            print(f"Crawl completed. Discovered: {self.stats['discovered']}, Crawled: {self.stats['crawled']}")
+            if self.js_renderer:
+                await self.js_renderer.cleanup()
 
     def _update_all_linked_from(self):
         """Update linked_from field for all crawled URLs based on collected source_pages data"""
@@ -1138,12 +1204,33 @@ class WebCrawler:
 
     def _should_crawl_url(self, url):
         """Check if URL should be crawled based on settings"""
+    
         parsed = urlparse(url)
 
-        # Check external domain policy
-        if not self.config['crawl_external']:
-            if not self.link_manager.is_internal(url):
+        # --- Domain Policy Check ---
+        is_strict_internal = self.link_manager.is_internal(url)
+        
+        # Check if subdomain (relaxed internal)
+        # is_internal matches "base_domain" vs "sub.base_domain" logic in link_manager, 
+        # but we need to know if it's strictly the SAME domain vs a SUBDOMAIN.
+        # Actually link_manager.is_internal checks: url_domain_clean == base_domain_clean
+        # So if base is 'example.com' and url is 'sub.example.com', is_internal is FALSE.
+        
+        if is_strict_internal:
+            # Always allow strict internal
+            pass
+            
+        elif urlparse(url).netloc.endswith('.' + self.base_domain.replace('www.', '')):
+            # It is a SUBDOMAIN
+            if not self.config.get('crawl_subdomains', True):
                 return False
+                
+        else:
+            # It is EXTERNAL
+            if not self.config['crawl_external']:
+                return False
+                
+        # --- End Domain Policy ---
 
         # Check robots.txt
         if self.config['respect_robots']:
@@ -1186,19 +1273,111 @@ class WebCrawler:
 
             if robots_url not in self._robots_cache:
                 rp = RobotFileParser()
-                rp.set_url(robots_url)
+                # Check if internal (allow subdomains)
+                is_internal = False
                 try:
-                    rp.read()
-                    self._robots_cache[robots_url] = rp
+                    target_domain = urlparse(url).netloc
+                    base_domain = urlparse(self.base_url).netloc
+                    
+                    # Log for debugging
+                    # print(f"Comparing {target_domain} with {base_domain}")
+                    
+                    if target_domain == base_domain:
+                        is_internal = True
+                    else:
+                        # Allow subdomains: endswith comparison
+                        # e.g. sub.example.com ends with example.com
+                        # We remove 'www.' to be safe for base comparison
+                        clean_base = base_domain.replace('www.', '')
+                        if target_domain.endswith(clean_base) or target_domain.endswith('.' + clean_base):
+                            is_internal = True
                 except:
-                    return True
+                    is_internal = False
+
+                # Only fetch robots.txt if the URL is internal or if external crawling is enabled
+                # and the URL is not explicitly disallowed by the internal check
+                if is_internal or self.config['crawl_external']:
+                    rp.set_url(robots_url)
+                    try:
+                        # Manual fetch to get content for validation
+                        try:
+                            resp = self.session.get(robots_url, timeout=10)
+                            if resp.status_code == 200:
+                                raw_content = resp.text
+                                self.robots_data['content'] = raw_content
+                                self.robots_data['issues'] = self._validate_robots_txt(raw_content)
+                                rp.parse(raw_content.splitlines())
+                            else:
+                                self.robots_data['issues'].append({
+                                    'line': 0, 'type': 'fetch_error', 
+                                    'message': f'Failed to fetch robots.txt (Status {resp.status_code})'
+                                })
+                                rp.read() # Fallback to standard read attempt
+                        except Exception as e:
+                             print(f"Manual robots fetch failed: {e}")
+                             rp.read()
+
+                        self._robots_cache[robots_url] = rp
+                    except:
+                        # If robots.txt can't be read, assume allowed
+                        return True
+                else:
+                    # If not internal and external crawling is disabled, treat as disallowed
+                    return False
 
             rp = self._robots_cache[robots_url]
             user_agent = self.config.get('user_agent', '*')
             return rp.can_fetch(user_agent, url)
 
-        except Exception:
+        except Exception as e:
+            print(f"Error checking robots.txt: {e}")
             return True
+
+    def _validate_robots_txt(self, content):
+        """Validate robots.txt content for syntax errors"""
+        issues = []
+        VALID_DIRECTIVES = {
+            'user-agent', 'disallow', 'allow', 'sitemap', 'crawl-delay', 'host', 'clean-param'
+        }
+        
+        lines = content.split('\n')
+        for i, line in enumerate(lines):
+            line_num = i + 1
+            line = line.strip()
+            
+            if not line or line.startswith('#'):
+                continue
+                
+            if ':' not in line:
+                issues.append({
+                    'line': line_num,
+                    'type': 'syntax_error',
+                    'message': 'Missing colon separator',
+                    'content': line
+                })
+                continue
+                
+            parts = line.split(':', 1)
+            directive = parts[0].strip().lower()
+            value = parts[1].strip()
+            
+            if directive not in VALID_DIRECTIVES:
+                 issues.append({
+                    'line': line_num,
+                    'type': 'unknown_directive',
+                    'message': f"Unknown directive '{directive}'",
+                    'content': line
+                })
+            
+            if not value and directive == 'user-agent':
+                 issues.append({
+                    'line': line_num,
+                    'type': 'missing_value',
+                    'message': "User-agent cannot be empty",
+                    'content': line
+                })
+        
+        return issues
 
     def _run_pagespeed_analysis(self):
         """Run PageSpeed analysis on selected pages"""
@@ -1235,7 +1414,6 @@ class WebCrawler:
                     'desktop': desktop_result,
                     'analysis_date': time.strftime('%Y-%m-%d %H:%M:%S')
                 })
-
                 if i < len(selected_pages) - 1:
                     time.sleep(3)
 
@@ -1245,42 +1423,91 @@ class WebCrawler:
         except Exception as e:
             print(f"Error running PageSpeed analysis: {e}")
 
+    def analyze_pagespeed(self, urls):
+        """
+        Public method to run PageSpeed analysis on specific URLs on demand.
+        Returns the results list.
+        """
+        results = []
+        print(f"Starting on-demand PageSpeed analysis for {len(urls)} URLs")
+
+        for i, url in enumerate(urls):
+            print(f"Analyzing {url}...")
+            
+            # Mobile
+            mobile_res = self._call_pagespeed_api(url, 'mobile')
+            time.sleep(1) # Short delay
+            
+            # Desktop
+            desktop_res = self._call_pagespeed_api(url, 'desktop')
+            
+            result_entry = {
+                'url': url,
+                'mobile': mobile_res,
+                'desktop': desktop_res,
+                'analysis_date': time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+            results.append(result_entry)
+            
+            if i < len(urls) - 1:
+                time.sleep(2)
+
+        # Update stats
+        if 'pagespeed_results' not in self.stats:
+            self.stats['pagespeed_results'] = []
+            
+        # Update or append
+        existing_map = {r['url']: i for i, r in enumerate(self.stats['pagespeed_results'])}
+        
+        for res in results:
+            if res['url'] in existing_map:
+                # Update existing
+                idx = existing_map[res['url']]
+                self.stats['pagespeed_results'][idx] = res
+            else:
+                # Append new
+                self.stats['pagespeed_results'].append(res)
+                
+        return results
+
     def _select_pages_for_pagespeed(self):
-        """Select homepage and 2 category pages for PageSpeed analysis"""
+        """Select only the homepage for PageSpeed analysis"""
         selected_pages = []
 
-        # Find homepage
+        # Find homepage from crawl results
         homepage = None
         min_path_length = float('inf')
 
+        # Try to find the exact base URL first
         for result in self.crawl_results:
-            if result.get('status_code') == 200 and result.get('is_internal'):
-                url = result['url']
-                parsed = urlparse(url)
-                path = parsed.path.rstrip('/')
+            if result.get('url') == self.base_url or result.get('url') == self.base_url + '/':
+                homepage = result['url']
+                break
 
-                if path == '' or path == '/':
-                    homepage = url
-                    break
-                elif len(path) < min_path_length:
-                    homepage = url
-                    min_path_length = len(path)
+        # If exact match not found in results (unlikely if crawled), look for shortest path
+        if not homepage:
+            for result in self.crawl_results:
+                if result.get('status_code') == 200 and result.get('is_internal'):
+                    url = result['url']
+                    parsed = urlparse(url)
+                    path = parsed.path.rstrip('/')
+
+                    if path == '' or path == '/':
+                        homepage = url
+                        break
+                    elif len(path) < min_path_length:
+                        homepage = url
+                        min_path_length = len(path)
 
         if homepage:
             selected_pages.append(homepage)
+        elif self.crawl_results:
+            # Fallback: just take the first internal page found
+            for result in self.crawl_results:
+                 if result.get('status_code') == 200 and result.get('is_internal'):
+                     selected_pages.append(result['url'])
+                     break
 
-        # Find category pages
-        category_pages = []
-        for result in self.crawl_results:
-            if result.get('status_code') == 200 and result.get('is_internal'):
-                url = result['url']
-                parsed = urlparse(url)
-                path = parsed.path.strip('/')
-
-                if path and '/' not in path and url != homepage:
-                    category_pages.append(url)
-
-        selected_pages.extend(category_pages[:2])
         return selected_pages
 
     def _call_pagespeed_api(self, url, strategy='mobile', retries=3):
@@ -1307,6 +1534,12 @@ class WebCrawler:
                         lighthouse_result = data.get('lighthouseResult', {})
                         audits = lighthouse_result.get('audits', {})
                         categories = lighthouse_result.get('categories', {})
+                        loading_experience = data.get('loadingExperience', {})
+                        
+                        # Debug logging
+                        # print(f"PageSpeed Keys: {list(data.keys())}")
+                        # print(f"Lighthouse Keys: {list(lighthouse_result.keys())}")
+                        # print(f"Audits found: {len(audits)}")
 
                         performance_score = None
                         if 'performance' in categories:
@@ -1316,29 +1549,61 @@ class WebCrawler:
 
                         metrics = {}
 
+                        # Field Data (CrUX)
+                        crux_metrics = loading_experience.get('metrics', {})
+                        if crux_metrics:
+                            if 'FIRST_CONTENTFUL_PAINT_MS' in crux_metrics:
+                                val = crux_metrics['FIRST_CONTENTFUL_PAINT_MS'].get('percentile')
+                                if val: metrics['field_fcp'] = round(val / 1000, 2)
+                            
+                            if 'LARGEST_CONTENTFUL_PAINT_MS' in crux_metrics:
+                                val = crux_metrics['LARGEST_CONTENTFUL_PAINT_MS'].get('percentile')
+                                if val: metrics['field_lcp'] = round(val / 1000, 2)
+                                
+                            if 'CUMULATIVE_LAYOUT_SHIFT_SCORE' in crux_metrics:
+                                val = crux_metrics['CUMULATIVE_LAYOUT_SHIFT_SCORE'].get('percentile')
+                                if val: metrics['field_cls'] = round(val / 100, 3) # CLS is unitless 0-1 usually
+
+                        # Lab Data (Lighthouse)
                         if 'first-contentful-paint' in audits:
                             fcp = audits['first-contentful-paint'].get('numericValue')
-                            metrics['first_contentful_paint'] = round(fcp / 1000, 2) if fcp else None
+                            metrics['first_contentful_paint'] = round(fcp / 1000, 2) if fcp is not None else None
 
                         if 'largest-contentful-paint' in audits:
                             lcp = audits['largest-contentful-paint'].get('numericValue')
-                            metrics['largest_contentful_paint'] = round(lcp / 1000, 2) if lcp else None
+                            metrics['largest_contentful_paint'] = round(lcp / 1000, 2) if lcp is not None else None
 
                         if 'cumulative-layout-shift' in audits:
                             cls = audits['cumulative-layout-shift'].get('numericValue')
-                            metrics['cumulative_layout_shift'] = round(cls, 3) if cls else None
+                            metrics['cumulative_layout_shift'] = round(cls, 3) if cls is not None else None
 
                         if 'max-potential-fid' in audits:
                             fid = audits['max-potential-fid'].get('numericValue')
-                            metrics['first_input_delay'] = round(fid, 2) if fid else None
+                            metrics['first_input_delay'] = round(fid, 2) if fid is not None else None
 
                         if 'speed-index' in audits:
                             si = audits['speed-index'].get('numericValue')
-                            metrics['speed_index'] = round(si / 1000, 2) if si else None
+                            metrics['speed_index'] = round(si / 1000, 2) if si is not None else None
 
                         if 'interactive' in audits:
                             tti = audits['interactive'].get('numericValue')
-                            metrics['time_to_interactive'] = round(tti / 1000, 2) if tti else None
+                            metrics['time_to_interactive'] = round(tti / 1000, 2) if tti is not None else None
+                            
+                        if 'total-blocking-time' in audits:
+                            tbt = audits['total-blocking-time'].get('numericValue')
+                            metrics['total_blocking_time'] = round(tbt, 0) if tbt is not None else None
+
+                        # Fallback to Field Data if Lab Data is missing
+                        if metrics.get('first_contentful_paint') is None and metrics.get('field_fcp') is not None:
+                            metrics['first_contentful_paint'] = metrics['field_fcp']
+                            
+                        if metrics.get('largest_contentful_paint') is None and metrics.get('field_lcp') is not None:
+                            metrics['largest_contentful_paint'] = metrics['field_lcp']
+                            
+                        if metrics.get('cumulative_layout_shift') is None and metrics.get('field_cls') is not None:
+                            metrics['cumulative_layout_shift'] = metrics['field_cls']
+
+                        print(f"Metrics extracted for {url}: FCP={metrics.get('first_contentful_paint')}, Field FCP={metrics.get('field_fcp')}")
 
                         return {
                             'success': True,

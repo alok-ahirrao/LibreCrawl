@@ -1,4 +1,4 @@
-"""Link management and extraction"""
+import re
 import threading
 from urllib.parse import urljoin, urlparse
 from collections import deque
@@ -7,7 +7,7 @@ from collections import deque
 class LinkManager:
     """Manages link discovery, tracking, and extraction"""
 
-    def __init__(self, base_domain):
+    def __init__(self, base_domain, trap_threshold=100):
         self.base_domain = base_domain
         self.visited_urls = set()
         self.discovered_urls = deque()
@@ -15,9 +15,30 @@ class LinkManager:
         self.all_links = []
         self.links_set = set()
         self.source_pages = {}  # Maps target_url -> list of source_urls
+        
+        # Trap detection
+        self.url_pattern_counts = {}
+        self.trap_patterns = {}
+        self.TRAP_THRESHOLD = trap_threshold  # Configurable per crawl
 
         self.urls_lock = threading.Lock()
         self.links_lock = threading.Lock()
+        
+    def _get_url_signature(self, url):
+        """Generate a signature for the URL by replacing dynamic segments"""
+        try:
+            parsed = urlparse(url)
+            path = parsed.path
+            
+            # Replace digits with \d+
+            path = re.sub(r'\d+', r'\\d+', path)
+            
+            # Replace UUIDs (simplistic)
+            path = re.sub(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', r'\\uuid', path)
+            
+            return path
+        except:
+            return url
 
     def extract_links(self, soup, current_url, depth, should_crawl_callback):
         """Extract links from HTML and add to discovery queue"""
@@ -44,73 +65,108 @@ class LinkManager:
                     self.source_pages[clean_url] = []
                 if current_url not in self.source_pages[clean_url]:
                     self.source_pages[clean_url].append(current_url)
+                
+                # Check trap detection BEFORE checking if discovered
+                # This ensures we count patterns even across different discovery paths
+                # But to avoid re-counting the SAME URL, we normally check if in discovered.
+                # Here we only want to block NEW URLs.
 
                 if (clean_url not in self.visited_urls and
                     clean_url not in self.all_discovered_urls and
                     clean_url != current_url):
+                    
+                    # Trap logic
+                    signature = self._get_url_signature(clean_url)
+                    count = self.url_pattern_counts.get(signature, 0)
+                    
+                    if count >= self.TRAP_THRESHOLD:
+                         # It is a trap
+                        if signature not in self.trap_patterns:
+                            self.trap_patterns[signature] = {
+                                'pattern': signature,
+                                'example_url': clean_url,
+                                'count': 0
+                            }
+                        self.trap_patterns[signature]['count'] += 1
+                        # SKIP adding
+                        continue
 
-                    # Check if this URL should be crawled
+                    # Check if checks out with crawler policy
                     if should_crawl_callback(clean_url):
+                        # Increment count only if we decide to crawl it
+                        self.url_pattern_counts[signature] = count + 1
+                        
                         self.all_discovered_urls.add(clean_url)
                         self.discovered_urls.append((clean_url, depth))
 
-    def collect_all_links(self, soup, source_url, crawl_results):
-        """Collect all links for the Links tab display"""
-        links = soup.find_all('a', href=True)
+    def collect_all_links(self, soup, source_url, crawl_results, base_domain=None):
+        """
+        Extract all links from the page for reporting purposes (Internal vs External)
+        Stores in self.all_links
+        """
+        if not soup:
+            return
 
-        for link in links:
-            href = link['href'].strip()
-            if not href or href.startswith('#'):
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag.get('href')
+            anchor_text = a_tag.get_text(strip=True)[:100]  # Limit length
+            
+            absolute_url = urljoin(source_url, href)
+            # Normalize - remove fragment
+            if '#' in absolute_url:
+                absolute_url = absolute_url.split('#')[0]
+            
+            # Skip empty or invalid
+            if not absolute_url.startswith(('http://', 'https://')):
                 continue
-
-            # Get anchor text
-            anchor_text = link.get_text().strip()[:100]
-
-            # Handle special link types
-            if href.startswith('mailto:') or href.startswith('tel:'):
-                continue
-
-            # Convert relative URLs to absolute
+            
             try:
-                absolute_url = urljoin(source_url, href)
+                # Parse target URL for domain info
                 parsed_target = urlparse(absolute_url)
+                
+                # Determine scope if base_domain provided
+                scope = 'external'
+                if base_domain:
+                    scope = self._determine_scope(absolute_url, base_domain)
+                else:
+                    # Fallback logic if no base_domain
+                    is_int = self.is_internal(absolute_url)
+                    scope = 'root' if is_int else 'external'
 
-                # Clean URL (remove fragment)
-                clean_url = f"{parsed_target.scheme}://{parsed_target.netloc}{parsed_target.path}"
-                if parsed_target.query:
-                    clean_url += f"?{parsed_target.query}"
-
-                # Determine if link is internal or external
-                target_domain_clean = parsed_target.netloc.replace('www.', '', 1)
-                base_domain_clean = self.base_domain.replace('www.', '', 1)
-                is_internal = target_domain_clean == base_domain_clean
-
+                # Define is_internal for DB compatibility (root or sub = internal)
+                is_internal = scope in ['root', 'sub']
+                
                 # Find the status of the target URL if we've crawled it
                 target_status = None
                 for result in crawl_results:
-                    if result['url'] == clean_url:
+                    if result['url'] == absolute_url:
                         target_status = result['status_code']
                         break
 
                 # Determine placement (navigation, footer, body)
-                placement = self._detect_link_placement(link)
+                placement = self._detect_link_placement(a_tag)
+
+                # Determine nofollow attribute
+                nofollow = 'nofollow' in a_tag.get('rel', [])
 
                 link_data = {
                     'source_url': source_url,
-                    'target_url': clean_url,
+                    'target_url': absolute_url,
                     'anchor_text': anchor_text or '(no text)',
                     'is_internal': is_internal,
                     'target_domain': parsed_target.netloc,
                     'target_status': target_status,
-                    'placement': placement
+                    'placement': placement,
+                    'nofollow': nofollow,
+                    'scope': scope
                 }
 
                 # Track source page for this URL (for "Linked From" feature)
                 with self.urls_lock:
-                    if clean_url not in self.source_pages:
-                        self.source_pages[clean_url] = []
-                    if source_url not in self.source_pages[clean_url]:
-                        self.source_pages[clean_url].append(source_url)
+                    if absolute_url not in self.source_pages:
+                        self.source_pages[absolute_url] = []
+                    if source_url not in self.source_pages[absolute_url]:
+                        self.source_pages[absolute_url].append(source_url)
 
                 # Thread-safe adding to links collection with duplicate checking
                 with self.links_lock:
@@ -121,7 +177,9 @@ class LinkManager:
                         self.all_links.append(link_data)
 
             except Exception:
+                # Skip problematic links silently
                 continue
+
 
     def _detect_link_placement(self, link_element):
         """Detect where on the page a link is placed"""
@@ -217,3 +275,27 @@ class LinkManager:
         with self.links_lock:
             self.all_links.clear()
             self.links_set.clear()
+
+    def _determine_scope(self, url, base_domain):
+        """
+        Determine if a URL is root, subdomain, or external.
+        root: example.com, www.example.com
+        sub: blog.example.com
+        external: google.com
+        """
+        parsed_url = urlparse(url)
+        url_domain = parsed_url.netloc
+        base_clean = base_domain.replace('www.', '')
+        url_clean = url_domain.replace('www.', '')
+
+        if url_clean == base_clean:
+            return 'root'
+        elif url_clean.endswith('.' + base_clean):
+            return 'sub'
+        else:
+            return 'external'
+
+    def get_traps(self):
+        """Get list of detected crawl traps"""
+        with self.urls_lock:
+            return list(self.trap_patterns.values())

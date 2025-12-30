@@ -26,7 +26,7 @@ class SettingsManager:
         # user: Crawler, Export, Issue Exclusion tabs
         user_settings = [
             # Crawler tab
-            'maxDepth', 'maxUrls', 'crawlDelay', 'followRedirects', 'crawlExternalLinks',
+            'maxDepth', 'maxUrls', 'crawlDelay', 'followRedirects', 'crawlExternalLinks', 'crawlSubdomains', 'trapThreshold',
             # Export tab
             'exportFormat', 'exportFields',
             # Issues tab
@@ -78,6 +78,8 @@ class SettingsManager:
             'crawlDelay': 1,
             'followRedirects': True,
             'crawlExternalLinks': False,
+            'crawlSubdomains': True,
+            'trapThreshold': 100,  # URL pattern repetition limit
 
             # Request settings
             'userAgent': 'LibreCrawl/1.0 (Web Crawler)',
@@ -430,6 +432,7 @@ class SettingsManager:
                 'retries': (0, 10),
                 'maxFileSize': (1, 1000),
                 'concurrency': (1, 50),
+                'trapThreshold': (10, 1000),
                 'memoryLimit': (64, 4096),
                 'jsWaitTime': (0, 30),
                 'jsTimeout': (5, 120),
@@ -480,6 +483,8 @@ class SettingsManager:
             'delay': settings['crawlDelay'],
             'follow_redirects': settings['followRedirects'],
             'crawl_external': settings['crawlExternalLinks'],
+            'crawl_subdomains': settings['crawlSubdomains'],
+            'trap_threshold': settings.get('trapThreshold', 100),
             'user_agent': settings['userAgent'],
             'timeout': settings['timeout'],
             'retries': settings['retries'],
