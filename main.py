@@ -44,6 +44,10 @@ Compress(app)
 # Initialize database on startup
 init_db()
 
+# [NEW] Register GMB Blueprint
+from src.gmb_core.router import gmb_bp
+app.register_blueprint(gmb_bp)
+
 def generate_random_password(length=16):
     """Generate a random password with letters, digits, and symbols"""
     alphabet = string.ascii_letters + string.digits + string.punctuation
