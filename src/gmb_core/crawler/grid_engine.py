@@ -31,7 +31,8 @@ class GridEngine:
         center_lat: float, 
         center_lng: float, 
         radius_meters: float, 
-        grid_size: int = 5
+        grid_size: int = 5,
+        shape: str = 'square'
     ) -> List[Tuple[int, float, float]]:
         """
         Generate a grid of coordinates around a center point.
@@ -40,7 +41,9 @@ class GridEngine:
             center_lat: Center latitude
             center_lng: Center longitude
             radius_meters: Radius from center to edge in meters
-            grid_size: Number of points per side (e.g., 5 = 5x5 = 25 points)
+            grid_size: Number of points per side (e.g., 5 = 5x5 = 25 points). 
+                       For circle, this determines the density/rings.
+            shape: 'square' or 'circle'
             
         Returns:
             List of (index, lat, lng) tuples
@@ -49,10 +52,53 @@ class GridEngine:
         
         # Convert meters to degrees (approximate)
         # At equator: 1 degree lat ≈ 111,320 meters
-        # 1 degree lng varies with latitude
         meters_per_degree_lat = 111320
         meters_per_degree_lng = 111320 * math.cos(math.radians(center_lat))
         
+        # Circular (Radial) Grid Generation
+        if shape == 'circle':
+            # Always add center point first
+            points.append((0, round(center_lat, 6), round(center_lng, 6)))
+            
+            if grid_size <= 1:
+                return points
+                
+            # Determine rings based on grid_size mapping
+            # 3x3 (9pts) -> 1 ring
+            # 5x5 (25pts) -> 2 rings
+            # 7x7 (49pts) -> 3 rings
+            num_rings = (grid_size - 1) // 2
+            
+            index = 1
+            for r in range(1, num_rings + 1):
+                # Radius for this ring
+                current_radius = (r / num_rings) * radius_meters
+                
+                # Number of points in this ring = 8 * ring_index
+                points_in_ring = 8 * r
+                
+                for i in range(points_in_ring):
+                    # Distribute points evenly
+                    angle = (2 * math.pi * i) / points_in_ring
+                    
+                    # Calculate offset in meters
+                    # Using sin for Lat (North) and cos for Lng (East) to start from Top
+                    dy = current_radius * math.sin(angle)
+                    dx = current_radius * math.cos(angle)
+                    
+                    # Convert to degrees
+                    d_lat = dy / meters_per_degree_lat
+                    d_lng = dx / meters_per_degree_lng
+                    
+                    lat = center_lat + d_lat
+                    lng = center_lng + d_lng
+                    
+                    points.append((index, round(lat, 6), round(lng, 6)))
+                    index += 1
+            
+            return points
+
+        # Square Grid Generation (Default)
         radius_degrees_lat = radius_meters / meters_per_degree_lat
         radius_degrees_lng = radius_meters / meters_per_degree_lng
         
@@ -203,7 +249,8 @@ class GridEngine:
         radius_meters: float,
         grid_size: int,
         target_place_id: str = None,
-        target_business_name: str = None
+        target_business_name: str = None,
+        grid_shape: str = 'square'
     ) -> List[dict]:
         """
         Execute a full grid scan.
@@ -224,7 +271,7 @@ class GridEngine:
         print(f"[GridEngine] execute_scan called - scan_id={scan_id}, keyword='{keyword}', target_business='{target_business_name}'")
         
         # Generate grid points
-        points = self.generate_grid(center_lat, center_lng, radius_meters, grid_size)
+        points = self.generate_grid(center_lat, center_lng, radius_meters, grid_size, grid_shape)
         total_points = len(points)
         
         results = []

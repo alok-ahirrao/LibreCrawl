@@ -452,6 +452,7 @@ def start_grid_scan():
     center_lng = data.get('center_lng')
     radius_meters = data.get('radius_meters', 3000)
     grid_size = data.get('grid_size', 5)
+    grid_shape = data.get('grid_shape', 'square')
     location_id = data.get('location_id')
     target_business = data.get('target_business')
     target_place_id = data.get('target_place_id')  # Extract place_id for exact match (New)
@@ -462,7 +463,7 @@ def start_grid_scan():
     # Limit grid size
     grid_size = min(max(grid_size, 3), 9)  # 3x3 to 9x9
     
-    print(f"[GridScan] Received request - keyword='{keyword}', target='{target_business}', place_id='{target_place_id}'")
+    print(f"[GridScan] Received request - keyword='{keyword}', target='{target_business}', place_id='{target_place_id}', shape='{grid_shape}'")
 
     # Create scan record
     from .models import get_db
@@ -495,7 +496,8 @@ def start_grid_scan():
                 radius_meters, 
                 grid_size,
                 target_place_id=target_place_id,  # Pass extracted place_id
-                target_business_name=target_business
+                target_business_name=target_business,
+                grid_shape=grid_shape
             )
             print(f"[GridScan] Scan {scan_id} completed successfully!")
         except Exception as e:
