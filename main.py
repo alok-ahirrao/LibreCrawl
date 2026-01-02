@@ -48,6 +48,10 @@ init_db()
 from src.gmb_core.router import gmb_bp
 app.register_blueprint(gmb_bp)
 
+# [NEW] Register Competitor Blueprint
+from src.competitor.routes import competitor_bp
+app.register_blueprint(competitor_bp)
+
 def generate_random_password(length=16):
     """Generate a random password with letters, digits, and symbols"""
     alphabet = string.ascii_letters + string.digits + string.punctuation

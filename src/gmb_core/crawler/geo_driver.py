@@ -158,15 +158,15 @@ class GeoCrawlerDriver:
                 url = f'https://www.google.com/maps/search/{keyword}/@{lat},{lng},15z'
                 page.goto(url, wait_until='domcontentloaded', timeout=self.timeout)
                 
-                # Random human-like delay
-                time.sleep(random.uniform(2.0, 4.0))
+                # Reduced delay for speed
+                time.sleep(random.uniform(1.0, 2.0))
                 
                 # Handle consent popup if present
                 try:
                     consent_button = page.locator('button:has-text("Accept all")')
-                    if consent_button.is_visible(timeout=2000):
+                    if consent_button.is_visible(timeout=1500):
                         consent_button.click()
-                        time.sleep(1)
+                        time.sleep(0.5)
                 except:
                     pass
                 
@@ -174,15 +174,15 @@ class GeoCrawlerDriver:
                 sidebar_selector = 'div[role="feed"]'
                 
                 try:
-                    page.wait_for_selector(sidebar_selector, timeout=8000)
+                    page.wait_for_selector(sidebar_selector, timeout=5000)
                     
-                    # Scroll multiple times with random delays
-                    for _ in range(random.randint(2, 4)):
+                    # Reduced scrolling - just 1-2 times
+                    for _ in range(random.randint(1, 2)):
                         page.eval_on_selector(
                             sidebar_selector, 
                             '(el) => el.scrollTop += 600 + Math.random() * 400'
                         )
-                        time.sleep(random.uniform(0.5, 1.5))
+                        time.sleep(random.uniform(0.3, 0.7))
                         
                 except Exception as scroll_error:
                     print(f"Scroll warning: {scroll_error}")
@@ -199,7 +199,7 @@ class GeoCrawlerDriver:
             finally:
                 browser.close()
     
-    def scan_place_details(self, place_url: str) -> str:
+    def scan_place_details(self, place_url: str) -> tuple:
         """
         Scrape details from a specific place page.
         
@@ -207,7 +207,7 @@ class GeoCrawlerDriver:
             place_url: Full Google Maps place URL
             
         Returns:
-            HTML content of the place page
+            Tuple of (HTML content, final_url) - final_url is the redirected URL with coordinates
         """
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -232,6 +232,10 @@ class GeoCrawlerDriver:
                 page.goto(place_url, wait_until='domcontentloaded', timeout=self.timeout)
                 time.sleep(random.uniform(2.0, 3.0))
                 
+                # Capture the final URL after any redirects (contains coordinates)
+                final_url = page.url
+                print(f"[ScanPlaceDetails] Final URL after redirect: {final_url}")
+                
                 # Click "About" tab if exists to load more details
                 try:
                     about_tab = page.locator('button[aria-label*="About"]')
@@ -241,11 +245,11 @@ class GeoCrawlerDriver:
                 except:
                     pass
                 
-                return page.content()
+                return page.content(), final_url
                 
             except Exception as e:
                 print(f"Error scraping place details: {e}")
-                return None
+                return None, None
                 
             finally:
                 browser.close()
@@ -308,27 +312,27 @@ class GeoCrawlerDriver:
                 print(f"[BusinessSearch] Navigating to: {url}")
                 page.goto(url, wait_until='domcontentloaded', timeout=self.timeout)
                 
-                # Wait for results to load
-                time.sleep(random.uniform(2.0, 3.5))
+                # Wait for results to load (optimized for speed)
+                time.sleep(random.uniform(1.0, 1.5))
                 
                 # Handle consent popup if present
                 try:
                     consent_button = page.locator('button:has-text("Accept all")')
-                    if consent_button.is_visible(timeout=2000):
+                    if consent_button.is_visible(timeout=1500):
                         consent_button.click()
-                        time.sleep(1)
+                        time.sleep(0.5)
                 except:
                     pass
                 
                 # Wait for results panel
                 try:
-                    page.wait_for_selector('div[role="feed"]', timeout=8000)
+                    page.wait_for_selector('div[role="feed"]', timeout=5000)
                 except:
                     # Try waiting for single business result
-                    page.wait_for_selector('h1', timeout=5000)
+                    page.wait_for_selector('h1', timeout=3000)
                 
                 # Small delay for final rendering
-                time.sleep(random.uniform(1.0, 2.0))
+                time.sleep(random.uniform(0.3, 0.7))
                 
                 content = page.content()
                 final_url = page.url

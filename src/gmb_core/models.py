@@ -239,6 +239,45 @@ def init_gmb_tables():
             ON gmb_serp_cache(keyword, lat, lng, expires_at)
         ''')
 
+        # 9. Competitive Analyses
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS competitive_analyses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_place_id TEXT,
+                keyword TEXT,
+                competitor_ids TEXT,
+                deficits TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        try:
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_competitive_analyses_user 
+                ON competitive_analyses(user_place_id)
+            ''')
+        except Exception as e:
+            print(f"Note: Could not create index idx_competitive_analyses_user: {e}")
+
+        # 10. GMB Categories Reference
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS gmb_categories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category_id TEXT UNIQUE,
+                display_name TEXT,
+                parent_category TEXT,
+                is_primary_eligible INTEGER DEFAULT 1
+            )
+        ''')
+        
+        try:
+            cursor.execute('''
+                CREATE INDEX IF NOT EXISTS idx_gmb_categories_parent 
+                ON gmb_categories(parent_category)
+            ''')
+        except Exception as e:
+            print(f"Note: Could not create index idx_gmb_categories_parent: {e}")
+
         print("GMB Core tables initialized successfully")
         
         # Run migrations for existing databases
@@ -268,6 +307,48 @@ def _run_migrations(conn):
     if 'target_business' not in columns:
         print("Migration: Adding target_business column to gmb_grid_scans")
         cursor.execute('ALTER TABLE gmb_grid_scans ADD COLUMN target_business TEXT')
+    
+    # Migration: Add new columns to gmb_competitors
+    cursor.execute("PRAGMA table_info(gmb_competitors)")
+    comp_columns = [col[1] for col in cursor.fetchall()]
+    
+    if 'hours' not in comp_columns:
+        print("Migration: Adding hours column to gmb_competitors")
+        cursor.execute('ALTER TABLE gmb_competitors ADD COLUMN hours TEXT')
+    
+    if 'services' not in comp_columns:
+        print("Migration: Adding services column to gmb_competitors")
+        cursor.execute('ALTER TABLE gmb_competitors ADD COLUMN services TEXT')
+    
+    if 'post_count' not in comp_columns:
+        print("Migration: Adding post_count column to gmb_competitors")
+        cursor.execute('ALTER TABLE gmb_competitors ADD COLUMN post_count INTEGER DEFAULT 0')
+    
+    if 'q_and_a_count' not in comp_columns:
+        print("Migration: Adding q_and_a_count column to gmb_competitors")
+        cursor.execute('ALTER TABLE gmb_competitors ADD COLUMN q_and_a_count INTEGER DEFAULT 0')
+    
+    # Migration: Fix competitive_analyses table if it exists with wrong schema
+    cursor.execute("PRAGMA table_info(competitive_analyses)")
+    ca_columns = [col[1] for col in cursor.fetchall()]
+    
+    if ca_columns and 'user_place_id' not in ca_columns:
+        print("Migration: Recreating competitive_analyses table with correct schema")
+        cursor.execute('DROP TABLE IF EXISTS competitive_analyses')
+        cursor.execute('''
+            CREATE TABLE competitive_analyses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_place_id TEXT,
+                keyword TEXT,
+                competitor_ids TEXT,
+                deficits TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_competitive_analyses_user 
+            ON competitive_analyses(user_place_id)
+        ''')
 
 
 # ==================== Helper Functions ====================

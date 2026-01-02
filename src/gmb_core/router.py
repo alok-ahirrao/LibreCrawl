@@ -154,6 +154,148 @@ def search_business():
         }), 500
 
 
+# ==================== Business URL Resolution ====================
+
+@gmb_bp.route('/business/resolve-url', methods=['POST'])
+def resolve_business_url():
+    """
+    Resolve a Google Maps URL to structured business data.
+    Supports various URL formats:
+    - https://maps.app.goo.gl/xxxxx (short URLs)
+    - https://www.google.com/maps/place/...
+    - https://goo.gl/maps/xxxxx
+    
+    Body: {
+        "url": "https://maps.app.goo.gl/L3q31V3rQKeATSHF9"
+    }
+    
+    Returns: {
+        "success": true,
+        "business": {
+            "place_id": "...",
+            "name": "Business Name",
+            "rating": 4.2,
+            "review_count": 156,
+            "address": "123 Main St",
+            "phone": "(555) 123-4567",
+            "lat": 40.7580,
+            "lng": -73.9855,
+            "category": "Restaurant"
+        }
+    }
+    """
+    if not session.get('user_id'):
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    
+    data = request.get_json()
+    url = data.get('url', '').strip()
+    
+    if not url:
+        return jsonify({
+            'success': False, 
+            'error': 'URL is required'
+        }), 400
+    
+    # Validate URL format
+    import re
+    valid_patterns = [
+        r'maps\.app\.goo\.gl',
+        r'goo\.gl/maps',
+        r'google\.[a-z]+/maps',
+        r'maps\.google\.[a-z]+'
+    ]
+    
+    if not any(re.search(pattern, url) for pattern in valid_patterns):
+        return jsonify({
+            'success': False,
+            'error': 'Invalid Google Maps URL format. Please use a Google Maps share link.'
+        }), 400
+    
+    print(f"[BusinessResolveURL] Resolving URL: {url}")
+    
+    try:
+        # Initialize crawler
+        driver = GeoCrawlerDriver(
+            headless=config.CRAWLER_HEADLESS,
+            proxy_url=config.PROXY_URL if config.PROXY_ENABLED else None
+        )
+        
+        # Navigate to the URL and get the page content + final URL after redirect
+        html, final_url = driver.scan_place_details(url)
+        
+        if not html:
+            return jsonify({
+                'success': False,
+                'error': "Could not load the business page. Please check the URL and try again."
+            }), 400
+        
+        # Parse the place details
+        parser = GoogleMapsParser()
+        details = parser.parse_place_details(html)
+        
+        if not details.get('name'):
+            return jsonify({
+                'success': False,
+                'error': "Could not extract business information from this URL."
+            }), 400
+        
+        # Try to extract coordinates from the final URL (after redirect - has coords)
+        lat, lng = None, None
+        if final_url:
+            lat, lng = parser._extract_coordinates_from_url(final_url)
+            print(f"[BusinessResolveURL] Extracted coords from final URL: {lat}, {lng}")
+        
+        # Fallback: try original URL
+        if lat is None or lng is None:
+            lat, lng = parser._extract_coordinates_from_url(url)
+        
+        # If still no coords, try to extract from HTML
+        if lat is None or lng is None:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, 'html.parser')
+            # Look for coordinates in meta tags or data attributes
+            meta_content = soup.find('meta', {'content': re.compile(r'@[-0-9.]+,[-0-9.]+')})
+            if meta_content:
+                coord_match = re.search(r'@([-0-9.]+),([-0-9.]+)', meta_content.get('content', ''))
+                if coord_match:
+                    lat = float(coord_match.group(1))
+                    lng = float(coord_match.group(2))
+        
+        # Try extracting Place ID from URL
+        place_id = parser._extract_place_id(url)
+        
+        # Build response
+        business = {
+            'place_id': place_id or '',
+            'name': details.get('name'),
+            'rating': details.get('rating') or 0,
+            'review_count': details.get('review_count') or 0,
+            'address': details.get('address') or '',
+            'phone': details.get('phone') or None,
+            'lat': lat or 0,
+            'lng': lng or 0,
+            'category': details.get('primary_category') or 'Business',
+            'website': details.get('website') or None,
+            'is_open': None  # Would need additional parsing
+        }
+        
+        print(f"[BusinessResolveURL] Resolved: {business['name']} at ({lat}, {lng})")
+        
+        return jsonify({
+            'success': True,
+            'business': business
+        })
+        
+    except Exception as e:
+        print(f"[BusinessResolveURL] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
 # ==================== OAuth Endpoints ====================
 
 @gmb_bp.route('/auth/url', methods=['GET'])

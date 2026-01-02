@@ -645,10 +645,36 @@ class GoogleMapsParser:
         }
         
         try:
-            # Name
-            title = soup.select_one('h1')
-            if title:
-                details['name'] = title.get_text(strip=True)
+            # Name - try multiple selectors for robustness
+            name_selectors = [
+                'h1',
+                'h1.DUwDvf',
+                'h1.fontHeadlineLarge',
+                'span.DUwDvf',
+                'div[role="main"] h1',
+                'div.lMbq3e h1',
+                'div[data-attrid="title"] span',
+            ]
+            for selector in name_selectors:
+                title = soup.select_one(selector)
+                if title:
+                    name_text = title.get_text(strip=True)
+                    if name_text and len(name_text) > 1:
+                        details['name'] = name_text
+                        print(f"[Parser] Found name '{name_text}' using selector: {selector}")
+                        break
+            
+            # Fallback: extract from title tag
+            if not details['name']:
+                title_tag = soup.find('title')
+                if title_tag:
+                    title_text = title_tag.get_text(strip=True)
+                    # Title format is usually "Business Name - Google Maps"
+                    if ' - Google Maps' in title_text:
+                        details['name'] = title_text.replace(' - Google Maps', '').strip()
+                        print(f"[Parser] Found name from title tag: {details['name']}")
+                    elif title_text and 'Google Maps' not in title_text:
+                        details['name'] = title_text.strip()
             
             # Rating and reviews
             rating_div = soup.select_one('div[role="img"][aria-label*="stars"]')
@@ -658,6 +684,15 @@ class GoogleMapsParser:
                 if rating_match:
                     details['rating'] = float(rating_match.group(1))
             
+            # Fallback for rating
+            if not details['rating']:
+                rating_span = soup.select_one('span.ceNzKf, span.fontDisplayLarge')
+                if rating_span:
+                    try:
+                        details['rating'] = float(rating_span.get_text(strip=True))
+                    except:
+                        pass
+            
             reviews_span = soup.select_one('button[aria-label*="reviews"]')
             if reviews_span:
                 label = reviews_span.get('aria-label', '')
@@ -665,10 +700,27 @@ class GoogleMapsParser:
                 if count_match:
                     details['review_count'] = int(count_match.group(1).replace(',', ''))
             
+            # Fallback for review count
+            if not details['review_count']:
+                review_elements = soup.select('span.F7nice span')
+                for el in review_elements:
+                    text = el.get_text(strip=True)
+                    if 'review' in text.lower() or text.replace(',', '').replace('(', '').replace(')', '').isdigit():
+                        count_match = re.search(r'([0-9,]+)', text)
+                        if count_match:
+                            details['review_count'] = int(count_match.group(1).replace(',', ''))
+                            break
+            
             # Categories
             category_button = soup.select_one('button[jsaction*="category"]')
             if category_button:
                 details['primary_category'] = category_button.get_text(strip=True)
+            
+            # Fallback for category
+            if not details['primary_category']:
+                category_span = soup.select_one('button.DkEaL')
+                if category_span:
+                    details['primary_category'] = category_span.get_text(strip=True)
             
             # Additional categories in "About" section
             about_section = soup.select('div[aria-label="About"] div')
@@ -682,6 +734,12 @@ class GoogleMapsParser:
             address_link = soup.select_one('button[data-item-id="address"]')
             if address_link:
                 details['address'] = address_link.get('aria-label', '').replace('Address: ', '')
+            
+            # Fallback for address
+            if not details['address']:
+                address_div = soup.select_one('div.rogA2c, div.Io6YTe')
+                if address_div:
+                    details['address'] = address_div.get_text(strip=True)
             
             # Phone
             phone_link = soup.select_one('button[data-item-id*="phone"]')
@@ -708,8 +766,12 @@ class GoogleMapsParser:
                 if attr_text:
                     details['attributes'].append(attr_text)
             
+            print(f"[Parser] Parsed details: name={details['name']}, rating={details['rating']}, reviews={details['review_count']}")
+            
         except Exception as e:
             print(f"Error parsing place details: {e}")
+            import traceback
+            traceback.print_exc()
         
         return details
 
