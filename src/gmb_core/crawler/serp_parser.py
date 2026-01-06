@@ -628,6 +628,16 @@ class GoogleSerpParser:
                         category_elem = item.select_one('div.rllt__details span:first-child')
                         category = category_elem.get_text(strip=True) if category_elem else ''
                         
+                        # [NEW] Detect if this is a sponsored/ad listing
+                        is_ad = False
+                        item_text = item.get_text().lower()
+                        if 'sponsored' in item_text or 'ad' in item.get('class', []):
+                            is_ad = True
+                        # Also check for "Sponsored" in any span
+                        sponsored_elem = item.find(lambda tag: tag.name == 'span' and 'Sponsored' in tag.get_text())
+                        if sponsored_elem:
+                            is_ad = True
+                        
                         if name:
                             local_results.append({
                                 'rank': idx,
@@ -635,6 +645,7 @@ class GoogleSerpParser:
                                 'rating': rating,
                                 'reviews': reviews,
                                 'category': category,
+                                'is_ad': is_ad,  # [NEW] Add ad flag
                             })
                             
                     except Exception as e:

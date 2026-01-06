@@ -278,6 +278,33 @@ def init_gmb_tables():
         except Exception as e:
             print(f"Note: Could not create index idx_gmb_categories_parent: {e}")
 
+        # 11. SERP Search History
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS serp_searches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                keyword TEXT NOT NULL,
+                location TEXT,
+                lat REAL,
+                lng REAL,
+                device TEXT DEFAULT 'desktop',
+                language TEXT DEFAULT 'en',
+                depth INTEGER DEFAULT 10,
+                organic_count INTEGER DEFAULT 0,
+                local_pack_count INTEGER DEFAULT 0,
+                hotel_count INTEGER DEFAULT 0,
+                shopping_count INTEGER DEFAULT 0,
+                target_rank INTEGER,
+                target_url TEXT,
+                results_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_serp_searches_keyword 
+            ON serp_searches(keyword, created_at DESC)
+        ''')
+
         print("GMB Core tables initialized successfully")
         
         # Run migrations for existing databases
@@ -478,3 +505,70 @@ def save_serp_cache(keyword: str, lat: float, lng: float, results: list, ttl_sec
                 expires_at = excluded.expires_at,
                 created_at = CURRENT_TIMESTAMP
         ''', (keyword, round(lat, 6), round(lng, 6), json.dumps(results), ttl_seconds))
+
+
+def save_serp_search(search_data: dict) -> int:
+    """Save a SERP search to history."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO serp_searches (
+                keyword, location, lat, lng, device, language, depth,
+                organic_count, local_pack_count, hotel_count, shopping_count,
+                target_rank, target_url, results_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            search_data.get('keyword', ''),
+            search_data.get('location', ''),
+            search_data.get('lat'),
+            search_data.get('lng'),
+            search_data.get('device', 'desktop'),
+            search_data.get('language', 'en'),
+            search_data.get('depth', 10),
+            search_data.get('organic_count', 0),
+            search_data.get('local_pack_count', 0),
+            search_data.get('hotel_count', 0),
+            search_data.get('shopping_count', 0),
+            search_data.get('target_rank'),
+            search_data.get('target_url'),
+            json.dumps(search_data.get('results', {}))
+        ))
+        return cursor.lastrowid
+
+
+def get_serp_history(limit: int = 50) -> list:
+    """Get SERP search history."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, keyword, location, lat, lng, device, language, depth,
+                   organic_count, local_pack_count, hotel_count, shopping_count,
+                   target_rank, target_url, created_at
+            FROM serp_searches
+            ORDER BY created_at DESC
+            LIMIT ?
+        ''', (limit,))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_serp_search_by_id(search_id: int) -> dict:
+    """Get a specific SERP search with full results."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM serp_searches WHERE id = ?
+        ''', (search_id,))
+        row = cursor.fetchone()
+        if row:
+            result = dict(row)
+            result['results'] = json.loads(result.get('results_json', '{}'))
+            return result
+        return None
+
+
+def delete_serp_search(search_id: int) -> bool:
+    """Delete a SERP search from history."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM serp_searches WHERE id = ?', (search_id,))
+        return cursor.rowcount > 0

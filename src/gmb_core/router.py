@@ -826,6 +826,49 @@ def check_serp_ranking():
     lat = data.get('lat')
     lng = data.get('lng')
     
+    # [NEW] IP-based location detection
+    use_ip_location = data.get('use_ip_location', False)
+    detected_location = None
+    
+    if use_ip_location:
+        from .geoip import get_location_from_ip, get_client_ip_from_request
+        client_ip = get_client_ip_from_request(request)
+        print(f"[SerpCheck] IP-based location requested. Client IP: {client_ip}")
+        
+        if client_ip:
+            geo = get_location_from_ip(client_ip)
+            if geo and geo.get('lat') and geo.get('lng'):
+                # Use detected location
+                detected_location = f"{geo['city']}, {geo['region']}" if geo['city'] else geo['country']
+                
+                # [FIX] For product/shopping searches, Google uses the 'gl' (country) parameter
+                # The geo_driver's scan_serp function infers gl_code from the location string
+                # So we need to include country name for proper gl inference
+                # Format: "City, Region, Country" - this helps with both geolocation AND gl inference
+                if geo.get('country'):
+                    location = f"{geo['city']}, {geo['region']}, {geo['country']}" if geo['city'] else geo['country']
+                else:
+                    location = detected_location
+                    
+                lat = geo['lat']
+                lng = geo['lng']
+                print(f"[SerpCheck] Auto-detected location: {location} ({lat}, {lng})")
+            else:
+                print(f"[SerpCheck] Could not resolve IP {client_ip}, using default location")
+    
+    # [NEW] Geocode the selected location if no coordinates provided
+    # This ensures local searches like "dentist near me" work with the selected location
+    if lat is None or lng is None:
+        from .geoip import geocode_location
+        print(f"[SerpCheck] Geocoding selected location: '{location}'...")
+        geo_result = geocode_location(location)
+        if geo_result and geo_result.get('lat') and geo_result.get('lng'):
+            lat = geo_result['lat']
+            lng = geo_result['lng']
+            print(f"[SerpCheck] Geocoded '{location}' -> ({lat}, {lng})")
+        else:
+            print(f"[SerpCheck] WARNING: Could not geocode '{location}' - local searches may not work correctly")
+    
     if not keyword:
         return jsonify({
             'success': False,
@@ -870,10 +913,30 @@ def check_serp_ranking():
         parser = GoogleSerpParser()
         results = parser.parse_serp_results(html, target_domain=domain if domain else None)
         
+        # [NEW] Save search to history
+        from .models import save_serp_search
+        save_serp_search({
+            'keyword': keyword,
+            'location': location,
+            'lat': lat,
+            'lng': lng,
+            'device': device,
+            'language': language,
+            'depth': depth,
+            'organic_count': len(results['organic_results']),
+            'local_pack_count': len(results['local_pack']),
+            'hotel_count': len(results.get('hotel_results', [])),
+            'shopping_count': len(results.get('shopping_results', [])),
+            'target_rank': results['target_rank'],
+            'target_url': results['target_url'],
+            'results': results
+        })
+        
         return jsonify({
             'success': True,
             'keyword': keyword,
             'location': location,
+            'detected_location': detected_location,
             'device': device,
             'organic_results': results['organic_results'],
             'local_pack': results['local_pack'],
@@ -894,3 +957,41 @@ def check_serp_ranking():
             'error': str(e)
         }), 500
 
+
+@gmb_bp.route('/serp/history', methods=['GET'])
+def get_serp_search_history():
+    """Get SERP search history."""
+    from .models import get_serp_history
+    
+    limit = request.args.get('limit', 50, type=int)
+    history = get_serp_history(limit=limit)
+    
+    return jsonify({
+        'success': True,
+        'history': history
+    })
+
+
+@gmb_bp.route('/serp/history/<int:search_id>', methods=['GET'])
+def get_serp_search_detail(search_id):
+    """Get a specific SERP search with full results."""
+    from .models import get_serp_search_by_id
+    
+    search = get_serp_search_by_id(search_id)
+    if not search:
+        return jsonify({'success': False, 'error': 'Search not found'}), 404
+    
+    return jsonify({
+        'success': True,
+        'search': search
+    })
+
+
+@gmb_bp.route('/serp/history/<int:search_id>', methods=['DELETE'])
+def delete_serp_search_endpoint(search_id):
+    """Delete a SERP search from history."""
+    from .models import delete_serp_search
+    
+    if delete_serp_search(search_id):
+        return jsonify({'success': True})
+    return jsonify({'success': False, 'error': 'Search not found'}), 404

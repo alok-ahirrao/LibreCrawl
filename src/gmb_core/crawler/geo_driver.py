@@ -152,6 +152,61 @@ class GeoCrawlerDriver:
         
         return f"w+CAIQICI{key}{b64}"
 
+    def resolve_location_to_coords(self, location_name: str) -> tuple:
+        """
+        Resolve a location string (e.g. 'Boston, MA') to (lat, lng) using Google Maps.
+        Returns (None, None) if resolution fails.
+        """
+        from urllib.parse import quote_plus
+        import re
+        
+        print(f"[Geo] Resolving coordinates for '{location_name}'...")
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=self.headless,
+                args=['--disable-blink-features=AutomationControlled']
+            )
+            # Use a fresh context with no specific location to let Google find the best match
+            context = browser.new_context(
+                user_agent=self._get_random_user_agent(),
+                viewport=self._get_random_viewport()
+            )
+            # Block media for speed
+            context.route("**/*", lambda route: route.abort() 
+                if route.request.resource_type in ["image", "media", "font"] 
+                else route.continue_())
+                
+            page = context.new_page()
+            try:
+                # Search for the location
+                url = f"https://www.google.com/maps/search/{quote_plus(location_name)}"
+                page.goto(url, wait_until='domcontentloaded', timeout=15000)
+                
+                # Wait for URL to update with coordinates
+                # Pattern: /@lat,lng,zoom
+                target_url = page.url
+                # Wait up to 5s for redirect/update
+                for _ in range(10):
+                    if '@' in target_url:
+                        break
+                    time.sleep(0.5)
+                    target_url = page.url
+                    
+                match = re.search(r'@([-0-9.]+),([-0-9.]+)', target_url)
+                if match:
+                    lat = float(match.group(1))
+                    lng = float(match.group(2))
+                    print(f"[Geo] Resolved '{location_name}' -> ({lat}, {lng})")
+                    return lat, lng
+                else:
+                    print(f"[Geo] Could not extract coordinates from URL: {target_url}")
+                    return None, None
+            except Exception as e:
+                print(f"[Geo] Resolution error: {e}")
+                return None, None
+            finally:
+                browser.close()
+
     def scan_grid_point(self, keyword: str, lat: float, lng: float, fast_mode: bool = False) -> str:
         """
         Perform a search for 'keyword' at the precise 'lat, lng'.
@@ -492,11 +547,90 @@ class GeoCrawlerDriver:
         if not gl_code and not cleaned_loc:
              gl_code = 'us'
 
+        # [NEW] Automatic Coordinate Resolution for Local Search
+        # If we have a specific location (no gl_code match) and no coordinates, try to find them
+        # [FIX] Use API-based geocoding instead of browser to avoid opening extra browser windows
+        if location.strip() and not gl_code and (lat is None or lng is None):
+            print(f"[SerpScan] Location '{location}' needs coordinates. Resolving via API...")
+            try:
+                from ..geoip import geocode_location
+                geo_result = geocode_location(location)
+                if geo_result and geo_result.get('lat') and geo_result.get('lng'):
+                    lat = geo_result['lat']
+                    lng = geo_result['lng']
+                    
+                    # Use country_code from geocoding result for gl parameter
+                    country_code = geo_result.get('country_code', '').lower()
+                    if country_code and country_code in ['us', 'gb', 'ca', 'au', 'de', 'fr', 'in', 'br', 'mx', 'es', 'it', 'nl', 'jp']:
+                        gl_code = country_code
+                    
+                    print(f"[SerpScan] Resolved coordinates: {lat}, {lng} -> GL: {gl_code}")
+                else:
+                    print(f"[SerpScan] Could not resolve coordinates for '{location}'")
+            except Exception as e:
+                print(f"[SerpScan] Geocoding error: {e}")
+                # Fallback to browser-based resolution if API fails
+                r_lat, r_lng = self.resolve_location_to_coords(location)
+                if r_lat is not None and r_lng is not None:
+                    lat = r_lat
+                    lng = r_lng
+                    
+                    # Infer GL code from coordinates
+                    if not gl_code:
+                        if -125 <= lng <= -65: gl_code = 'us'
+                        elif -10 <= lng <= 3 and 49 <= lat <= 60: gl_code = 'gb'
+                        elif 68 <= lng <= 97 and 8 <= lat <= 37: gl_code = 'in'
+                        elif 112 <= lng <= 154 and -44 <= lat <= -10: gl_code = 'au'
+                        elif -141 <= lng <= -52 and 41 <= lat <= 83: gl_code = 'ca'
+                        
+                    print(f"[SerpScan] Fallback resolved: {lat}, {lng} -> GL: {gl_code}")
+
+
+
         uule = ""
         # Generate UULE if it's a custom location (not a country code match)
+        # BUT skip UULE if we have precise coordinates to avoid conflict?
+        # Actually Google sometimes prefers UULE over Geo, so let's keep it but prioritize Geo in context
         if hasattr(self, '_generate_uule') and location.strip() and not gl_code:
+             # Only use UULE if we didn't resolve coordinates? 
+             # No, UULE is good backup. But if we have lat/lng, maybe we don't strictly need it?
+             # Let's keep it for now but log it.
             uule = self._generate_uule(location)
             print(f"[SerpScan] Generated UULE for '{location}': {uule}")
+        
+        # [FIX] If we have lat/lng but no gl_code yet, infer gl_code from coordinates
+        # This is essential for product/shopping searches which rely on gl parameter
+        if lat is not None and lng is not None and not gl_code:
+            print(f"[SerpScan] Inferring GL code from coordinates: {lat}, {lng}")
+            if -125 <= lng <= -65:  # US
+                gl_code = 'us'
+            elif -10 <= lng <= 3 and 49 <= lat <= 60:  # UK
+                gl_code = 'gb'
+            elif 68 <= lng <= 97 and 8 <= lat <= 37:  # India
+                gl_code = 'in'
+            elif 112 <= lng <= 154 and -44 <= lat <= -10:  # Australia
+                gl_code = 'au'
+            elif -141 <= lng <= -52 and 41 <= lat <= 83:  # Canada
+                gl_code = 'ca'
+            elif 5 <= lng <= 15 and 47 <= lat <= 55:  # Germany
+                gl_code = 'de'
+            elif -5 <= lng <= 10 and 42 <= lat <= 51:  # France
+                gl_code = 'fr'
+            elif 6 <= lng <= 18 and 36 <= lat <= 47:  # Italy
+                gl_code = 'it'
+            elif -9 <= lng <= 4 and 36 <= lat <= 44:  # Spain
+                gl_code = 'es'
+            elif 129 <= lng <= 146 and 30 <= lat <= 46:  # Japan
+                gl_code = 'jp'
+            elif -73 <= lng <= -34 and -34 <= lat <= 5:  # Brazil
+                gl_code = 'br'
+            elif -118 <= lng <= -86 and 14 <= lat <= 33:  # Mexico
+                gl_code = 'mx'
+            elif 3 <= lng <= 7 and 50 <= lat <= 54:  # Netherlands
+                gl_code = 'nl'
+            
+            if gl_code:
+                print(f"[SerpScan] Inferred GL code from coordinates: {gl_code}")
         
         # Device viewport settings
         if device.lower() == 'mobile':
@@ -536,8 +670,13 @@ class GeoCrawlerDriver:
             # Helper to get timezone (simple approximation or default)
             tz_id = "America/New_York"
             if lat and lng:
-                if 60 < lng < 100: tz_id = "Asia/Kolkata" # Rough guess for India/Nashik
-                elif -10 < lng < 3: tz_id = "Europe/London"
+                if 60 < lng < 100: tz_id = "Asia/Kolkata" # India
+                elif -10 < lng < 3: tz_id = "Europe/London" # UK
+                elif -125 < lng < -65: # US
+                     if lng < -115: tz_id = "America/Los_Angeles"
+                     elif lng < -105: tz_id = "America/Denver"
+                     elif lng < -95: tz_id = "America/Chicago"
+                     else: tz_id = "America/New_York"
                 # Add more if needed, or implement proper lookup
             
             # Add Geolocation if available
@@ -648,156 +787,24 @@ class GeoCrawlerDriver:
                 # Default to google.com if no gl_code
                 google_domain = GOOGLE_DOMAINS.get(gl_code, 'google.com')
                 
-                # WARM UP: Visit location-specific Google homepage
-                # Only append gl param if we have a valid gl_code
-                warmup_url = f'https://www.{google_domain}/?hl={language}'
+                # Warmup skipped for speed
+                # proceeding to direct navigation optimization
+                
+                # (Simulation removed)
+                
+                # DIRECT NAVIGATION (Optimized)
+                # Skip warm-up and simulated typing for speed
+                
+                search_url = f'https://www.{google_domain}/search?q={quote_plus(keyword)}&hl={language}&num={depth}'
+                
                 if gl_code:
-                    warmup_url += f'&gl={gl_code}'
-                    
-                print(f"[SerpScan] Warming up - visiting {warmup_url}...")
-                page.goto(warmup_url, wait_until='domcontentloaded', timeout=20000)
-                time.sleep(random.uniform(1.5, 3.0))
+                    search_url += f'&gl={gl_code}'
                 
-                # Handle consent popup on homepage
-                try:
-                    consent_selectors = [
-                        'button:has-text("Accept all")',
-                        'button:has-text("I agree")',
-                        'button:has-text("Accept")',
-                        'button[id*="agree"]',
-                        'div[role="button"]:has-text("Accept all")',
-                    ]
-                    for selector in consent_selectors:
-                        try:
-                            btn = page.locator(selector).first
-                            if btn.is_visible(timeout=1500):
-                                btn.click()
-                                print("[SerpScan] Clicked consent button")
-                                time.sleep(random.uniform(1.0, 2.0))
-                                break
-                        except:
-                            continue
-                except:
-                    pass
-                
-                # Simulate complex human-like behavior
-                def simulate_human_behavior(page):
-                    """Mimics human behavior with Bezier mouse curves, reading pauses, and scrolling."""
+                if uule:
+                    search_url += f'&uule={uule}'
                     
-                    def bezier_curve(p0, p1, p2, p3, steps=20):
-                        t = np.linspace(0, 1, steps)
-                        x = (1-t)**3 * p0[0] + 3*(1-t)**2 * t * p1[0] + 3*(1-t) * t**2 * p2[0] + t**3 * p3[0]
-                        y = (1-t)**3 * p0[1] + 3*(1-t)**2 * t * p1[1] + 3*(1-t) * t**2 * p2[1] + t**3 * p3[1]
-                        return zip(x, y)
-
-                    try:
-                        # 1. Random Mouse Movement (Bezier)
-                        start_pos = (random.randint(0, 500), random.randint(0, 400))
-                        end_pos = (random.randint(100, 1200), random.randint(100, 800))
-                        control1 = (random.randint(0, 1000), random.randint(0, 800))
-                        control2 = (random.randint(0, 1000), random.randint(0, 800))
-                        
-                        for x, y in bezier_curve(start_pos, control1, control2, end_pos, steps=random.randint(15, 30)):
-                            page.mouse.move(x, y)
-                            time.sleep(random.uniform(0.01, 0.03))  # Fast localized movement
-
-                        # 2. Reading Pauses (scroll + stop)
-                        for _ in range(random.randint(2, 4)):
-                            # ensure mouse is over the results list (left side) to avoid zooming map
-                            try:
-                                # Safe zone: Left 30% of screen, middle vertical
-                                safe_x = random.randint(50, 400)
-                                safe_y = random.randint(200, 600)
-                                page.mouse.move(safe_x, safe_y, steps=5)
-                            except:
-                                pass
-                                
-                            # Scroll down
-                            scroll_amount = random.randint(300, 700)
-                            page.mouse.wheel(0, scroll_amount)
-                            # "Reading" pause
-                            time.sleep(random.uniform(0.8, 2.5))
-                            
-                            # Occasional scroll up (re-reading)
-                            if random.random() < 0.3:
-                                page.mouse.wheel(0, -random.randint(100, 300))
-                                time.sleep(random.uniform(0.5, 1.2))
-                    except Exception as e:
-                        print(f"[Stealth] Human simulation error: {e}")
-                        pass
-                
-                simulate_human_behavior(page)
-                time.sleep(random.uniform(1.0, 2.0))
-                
-                # For depth > 10, we need to use URL with num parameter
-                # Google doesn't support more than 10 results without the num param
-                # For depth > 10 OR specific location targeting (UULE), we need to use URL params
-                # Google doesn't support more than 10 results without the num param in URL
-                # And UULE requires URL parameter as well
-                if depth > 10 or uule:
-                    # Direct URL navigation for larger result sets or specific locations
-                    search_url = f'https://www.{google_domain}/search?q={quote_plus(keyword)}&hl={language}&num={depth}'
-                    
-                    if gl_code:
-                        search_url += f'&gl={gl_code}'
-                    
-                    if uule:
-                        search_url += f'&uule={uule}'
-                    
-                    if uule:
-                        search_url += f'&uule={uule}'
-                        
-                    print(f"[SerpScan] Requesting via URL (Depth={depth}, UULE={'Yes' if uule else 'No'}): {search_url}")
-                    page.goto(search_url, wait_until='domcontentloaded', timeout=30000)
-                else:
-                    # Type search query in the search box (more human-like for 10 results)
-                    print(f"[SerpScan] Typing search query: {keyword}")
-                    search_input = page.locator('textarea[name="q"], input[name="q"]').first
-                    
-                    if search_input.is_visible(timeout=5000):
-                        search_input.click()
-                        time.sleep(random.uniform(0.3, 0.8))
-                        
-                        # Advanced human-like typing with mistakes and varying speed
-                        def type_with_mistakes(element, text):
-                            chars = list(text)
-                            i = 0
-                            while i < len(chars):
-                                char = chars[i]
-                                
-                                # 5% chance of making a mistake (if not start/end)
-                                if 0 < i < len(chars)-1 and random.random() < 0.05:
-                                    # Type wrong neighbor key (simplified)
-                                    wrong_char = chr(ord(char) + 1)
-                                    element.type(wrong_char, delay=random.randint(100, 300))
-                                    time.sleep(random.uniform(0.2, 0.5))
-                                    # Backspace
-                                    element.press('Backspace')
-                                    time.sleep(random.uniform(0.1, 0.4))
-                                    # Correct it
-                                    element.type(char, delay=random.randint(150, 400))
-                                else:
-                                    element.type(char, delay=random.randint(100, 300))
-                                
-                                # Random hesitation between words
-                                if char == ' ':
-                                    time.sleep(random.uniform(0.3, 0.8))
-                                
-                                i += 1
-
-                        type_with_mistakes(search_input, keyword)
-                        
-                        time.sleep(random.uniform(0.5, 1.0))
-                        
-                        # Press Enter to search
-                        page.keyboard.press('Enter')
-                    else:
-                        # Fallback: direct URL navigation with location-specific domain
-                        search_url = f'https://www.{google_domain}/search?q={quote_plus(keyword)}&hl={language}&num={depth}'
-                        if gl_code:
-                            search_url += f'&gl={gl_code}'
-                        print(f"[SerpScan] Fallback - direct navigation to: {search_url}")
-                        page.goto(search_url, wait_until='networkidle', timeout=30000)
+                print(f"[SerpScan] fast-nav -> {search_url}")
+                page.goto(search_url, wait_until='domcontentloaded', timeout=30000)
                 
                 # Wait for results
                 print(f"[SerpScan] Waiting for search results (depth={depth})...")
@@ -1010,6 +1017,13 @@ class GeoCrawlerDriver:
                             local_url = local_link.get('href')
                             if local_url.startswith('/'):
                                 local_url = f"https://www.{google_domain}{local_url}"
+                            
+                            # [FIX] Append UULE/GL to Local URL to preserve location
+                            if uule and 'uule=' not in local_url:
+                                local_url += f"&uule={uule}"
+                            if gl_code and 'gl=' not in local_url:
+                                local_url += f"&gl={gl_code}"
+
                                 
                             # VALIDATION: Ensure it looks like a map/search URL (not video)
                             if '/maps' in local_url or 'tbs=lrf' in local_url or '/search?' in local_url:
@@ -1031,6 +1045,13 @@ class GeoCrawlerDriver:
                             hotel_url = hotel_link.get('href')
                             if hotel_url.startswith('/'):
                                 hotel_url = f"https://www.{google_domain}{hotel_url}"
+                            
+                            # [FIX] Append UULE/GL to Hotel URL
+                            if uule and 'uule=' not in hotel_url:
+                                hotel_url += f"&uule={uule}"
+                            if gl_code and 'gl=' not in hotel_url:
+                                hotel_url += f"&gl={gl_code}"
+
                             
                             print(f"[SerpScan] Found Hotel View URL: {hotel_url}")
                             print("[SerpScan] Navigating to Hotel Finder...")
@@ -1065,6 +1086,13 @@ class GeoCrawlerDriver:
                              shopping_url = shopping_tab.get('href')
                              if shopping_url.startswith('/'):
                                  shopping_url = f"https://www.{google_domain}{shopping_url}"
+                             
+                             # [FIX] Append UULE/GL to Shopping URL
+                             if uule and 'uule=' not in shopping_url:
+                                 shopping_url += f"&uule={uule}"
+                             if gl_code and 'gl=' not in shopping_url:
+                                 shopping_url += f"&gl={gl_code}"
+
                              
                              print(f"[SerpScan] Found Shopping Tab URL: {shopping_url}")
                              print("[SerpScan] Navigating to Shopping Tab...")
