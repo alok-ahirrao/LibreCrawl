@@ -57,6 +57,10 @@ class Config:
     CACHE_TTL_API_RESPONSE = int(os.getenv('GMB_CACHE_TTL_API', '900'))  # 15 minutes
     CACHE_TTL_SERP_RESULT = int(os.getenv('GMB_CACHE_TTL_SERP', '3600'))  # 1 hour
     
+    # Performance Settings
+    CRAWLER_FAST_MODE = os.getenv('GMB_CRAWLER_FAST_MODE', 'true').lower() == 'true'
+    CRAWLER_WORKERS = int(os.getenv('GMB_CRAWLER_WORKERS', '5'))  # Increased default for fast mode
+    
     # Database
     DATABASE_FILE = os.getenv('GMB_DATABASE_FILE', 'users.db')
     

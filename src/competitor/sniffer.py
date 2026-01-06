@@ -93,12 +93,14 @@ class CompetitorSniffer:
         
         return competitors
     
-    def scrape_competitor_profile(self, place_id: str) -> Optional[Dict]:
+    def scrape_competitor_profile(self, place_id: str, lat: float = None, lng: float = None) -> Optional[Dict]:
         """
         Deep scrape a competitor's full profile from Google Maps.
         
         Args:
             place_id: Google Maps Place ID
+            lat: Optional latitude for context
+            lng: Optional longitude for context
             
         Returns:
             Dict with full profile details or None if failed
@@ -111,7 +113,7 @@ class CompetitorSniffer:
         try:
             # Use the driver's scan_place_details method
             url = f"https://www.google.com/maps/place/?q=place_id:{place_id}"
-            html = driver.scan_place_details(url)
+            html, final_url = driver.scan_place_details(url, lat, lng)
             
             if not html:
                 print(f"[Sniffer] Failed to get HTML for place_id: {place_id}")

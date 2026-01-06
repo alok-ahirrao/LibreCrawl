@@ -92,15 +92,17 @@ def search_business():
     query = data.get('query', '').strip()
     location = data.get('location', '').strip()
     
+    # [NEW] Optional lat/lng for accurate geo-context
+    lat = data.get('lat')
+    lng = data.get('lng')
+    
     if not query or len(query) < 2:
         return jsonify({
             'success': False, 
             'error': 'Query must be at least 2 characters'
         }), 400
     
-    print(f"[BusinessSearch] Searching for: '{query}' in '{location or 'default location'}'")
-    
-    print(f"[BusinessSearch] Searching for: '{query}' in '{location or 'default location'}'")
+    print(f"[BusinessSearch] Searching for: '{query}' in '{location or 'default location'}' (Lat/Lng: {lat}, {lng})")
     
     try:
         # Initialize crawler
@@ -110,7 +112,13 @@ def search_business():
         )
         
         # Perform search - RETURNS TUPLE (html, final_url)
-        html, final_url = driver.search_business(query, location if location else None)
+        # Pass lat/lng if available to force browser location
+        html, final_url = driver.search_business(
+            query, 
+            location if location else None,
+            lat=float(lat) if lat is not None else None,
+            lng=float(lng) if lng is not None else None
+        )
         
         if not html:
             return jsonify({
@@ -777,4 +785,112 @@ def list_scans():
             'success': True,
             'scans': [dict(s) for s in scans]
         })
+
+
+# ==================== SERP Checker ====================
+
+@gmb_bp.route('/serp/check', methods=['POST'])
+def check_serp_ranking():
+    """
+    Check a website's ranking in Google Search results.
+    
+    Body: {
+        "keyword": "best running shoes",
+        "location": "United States",
+        "domain": "example.com",  # Optional - domain to find ranking for
+        "device": "desktop",       # desktop or mobile
+        "depth": 10,               # 10, 20, 50, 100
+        "language": "en"
+    }
+    
+    Returns: {
+        "success": true,
+        "organic_results": [...],
+        "local_pack": [...],
+        "serp_features": {...},
+        "target_rank": 5,
+        "target_url": "https://example.com/page"
+    }
+    """
+    # Auth is handled by the Next.js proxy layer
+    
+    data = request.get_json()
+    keyword = data.get('keyword', '').strip()
+    location = data.get('location', 'United States')
+    domain = data.get('domain', '').strip()
+    device = data.get('device', 'desktop')
+    depth = data.get('depth', 10)
+    language = data.get('language', 'en')
+    
+    # [NEW] Optional lat/lng for accurate geo-context
+    lat = data.get('lat')
+    lng = data.get('lng')
+    
+    if not keyword:
+        return jsonify({
+            'success': False,
+            'error': 'Keyword is required'
+        }), 400
+    
+    # Validate depth
+    valid_depths = [10, 20, 50, 100]
+    if depth not in valid_depths:
+        depth = 10
+    
+    print(f"[SerpCheck] Keyword='{keyword}', Location='{location}' (Lat/Lng: {lat}, {lng}), Domain='{domain}'")
+    
+    try:
+        from .crawler.geo_driver import GeoCrawlerDriver
+        from .crawler.serp_parser import GoogleSerpParser
+        
+        # Initialize driver
+        driver = GeoCrawlerDriver(
+            headless=config.CRAWLER_HEADLESS,
+            proxy_url=config.PROXY_URL if config.PROXY_ENABLED else None
+        )
+        
+        # Perform SERP scan
+        html, final_url = driver.scan_serp(
+            keyword=keyword,
+            location=location,
+            device=device,
+            depth=depth,
+            language=language,
+            lat=float(lat) if lat is not None else None,
+            lng=float(lng) if lng is not None else None
+        )
+        
+        if not html:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to fetch search results. Please try again.'
+            }), 500
+        
+        # Parse results
+        parser = GoogleSerpParser()
+        results = parser.parse_serp_results(html, target_domain=domain if domain else None)
+        
+        return jsonify({
+            'success': True,
+            'keyword': keyword,
+            'location': location,
+            'device': device,
+            'organic_results': results['organic_results'],
+            'local_pack': results['local_pack'],
+            'serp_features': results['serp_features'],
+            'target_rank': results['target_rank'],
+            'target_url': results['target_url'],
+            'total_results': results['total_results'],
+            'hotel_results': results.get('hotel_results', []),
+            'shopping_results': results.get('shopping_results', [])
+        })
+        
+    except Exception as e:
+        print(f"[SerpCheck] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
 

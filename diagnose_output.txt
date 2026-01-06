@@ -1,0 +1,75 @@
+============================================================
+GMB Review Extraction Diagnostic
+============================================================
+Location: (40.758, -73.9855)
+Keyword: 'pizza'
+------------------------------------------------------------
+Found 17 items in feed
+------------------------------------------------------------
+
+=== Item 1 ===
+No link found
+
+=== Item 2 ===
+Name: Wonder Midtown East
+Rating span aria-label: '3.8 stars'
+Spans containing numbers:
+  - Text: '3.8' | aria-label: ''
+  - Text: '3.8' | aria-label: '3.8 stars'
+  - Text: '3.8' | aria-label: ''
+  - Text: '·800 3rd Avenue' | aria-label: ''
+  - Text: '800 3rd Avenue' | aria-label: ''
+  - Text: 'Closed· Opens 10:30 am' | aria-label: ''
+  - Text: 'Closed· Opens 10:30 am' | aria-label: ''
+  - Text: '· Opens 10:30 am' | aria-label: ''
+All elements with aria-label containing 'review' or numbers:
+  - <span>: '3.8 stars'
+Clean text preview: 'SponsoredWonder Midtown East 3.8Restaurant · 800 3rd AvenueClosed · Opens 10:30 am Near Me | Food Delivery & Takeout | Springfield | Di Fara PizzaOrder fast delivery and takeout from the best pizza r'
+
+=== Item 3 ===
+Name: Joe's Pizza Broadway
+Rating span aria-label: '4.5 stars'
+Spans containing numbers:
+  - Text: '4.5' | aria-label: ''
+  - Text: '4.5' | aria-label: '4.5 stars'
+  - Text: '4.5' | aria-label: ''
+  - Text: '·1435 Broadway' | aria-label: ''
+  - Text: '1435 Broadway' | aria-label: ''
+  - Text: 'Opens soon· 10 am' | aria-label: ''
+  - Text: 'Opens soon· 10 am' | aria-label: ''
+  - Text: '· 10 am' | aria-label: ''
+All elements with aria-label containing 'review' or numbers:
+  - <span>: '4.5 stars'
+Clean text preview: 'Joe's Pizza Broadway 4.5Pizza restaurant ·  · 1435 BroadwayClassic NYC slice shopOpens soon · 10 am'
+
+=== Item 4 ===
+Name: ANDIAMO PIZZA
+Rating span aria-label: '4.7 stars'
+Spans containing numbers:
+  - Text: '4.7' | aria-label: ''
+  - Text: '4.7' | aria-label: '4.7 stars'
+  - Text: '4.7' | aria-label: ''
+  - Text: '·818 6th Ave' | aria-label: ''
+  - Text: '818 6th Ave' | aria-label: ''
+  - Text: 'Open· Closes 5 am Sun' | aria-label: ''
+  - Text: 'Open· Closes 5 am Sun' | aria-label: ''
+  - Text: '· Closes 5 am Sun' | aria-label: ''
+All elements with aria-label containing 'review' or numbers:
+  - <span>: '4.7 stars'
+Clean text preview: 'ANDIAMO PIZZA 4.7Pizza restaurant ·  · 818 6th AveSimple Italian joint, open lateOpen · Closes 5 am Sun'
+
+=== Item 5 ===
+Name: Vito's Slices and Ices
+Rating span aria-label: '4.7 stars'
+Spans containing numbers:
+  - Text: '4.7' | aria-label: ''
+  - Text: '4.7' | aria-label: '4.7 stars'
+  - Text: '4.7' | aria-label: ''
+  - Text: '·464 9th Ave' | aria-label: ''
+  - Text: '464 9th Ave' | aria-label: ''
+  - Text: 'Closed· Opens 11 am' | aria-label: ''
+  - Text: 'Closed· Opens 11 am' | aria-label: ''
+  - Text: '· Opens 11 am' | aria-label: ''
+All elements with aria-label containing 'review' or numbers:
+  - <span>: '4.7 stars'
+Clean text preview: 'Vito's Slices and Ices 4.7Pizza restaurant ·  · 464 9th AveCorner spot for classic NYC-style slicesClosed · Opens 11 am'

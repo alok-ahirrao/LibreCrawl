@@ -2,3 +2,5 @@
 *.pyc
 .claude/settings.local.json
 users.db
+browser_profile/
+

@@ -21,10 +21,10 @@ class GridEngine:
     Engine for executing grid-based rank tracking scans.
     """
     
-    def __init__(self, max_workers: int = 3):  # Reduced to 3 for stability
-        self.max_workers = max_workers
+    def __init__(self, max_workers: int = None):
+        self.max_workers = max_workers or config.CRAWLER_WORKERS
         self.parser = GoogleMapsParser()
-        print(f"[GridEngine] Initialized with {max_workers} workers")
+        print(f"[GridEngine] Initialized with {self.max_workers} workers (Fast Mode: {config.CRAWLER_FAST_MODE})")
     
     def generate_grid(
         self, 
@@ -160,7 +160,12 @@ class GridEngine:
                     proxy_url=config.PROXY_URL if config.PROXY_ENABLED else None
                 )
                 
-                html = driver.scan_grid_point(keyword, lat, lng)
+                html = driver.scan_grid_point(
+                    keyword, 
+                    lat, 
+                    lng, 
+                    fast_mode=config.CRAWLER_FAST_MODE
+                )
                 
                 if html:
                     parsed_results = self.parser.parse_list_results(html)
@@ -210,7 +215,11 @@ class GridEngine:
             result['error'] = str(e)
         
         # Rate limiting delay
-        time.sleep(random.uniform(2.0, 5.0) / config.CRAWLER_RATE_LIMIT)
+        if config.CRAWLER_FAST_MODE:
+             # Minimal delay in fast mode
+            time.sleep(random.uniform(0.5, 1.5))
+        else:
+            time.sleep(random.uniform(2.0, 5.0) / config.CRAWLER_RATE_LIMIT)
         
         return result
     

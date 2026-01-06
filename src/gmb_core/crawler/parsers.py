@@ -80,69 +80,203 @@ class GoogleMapsParser:
         return results
     
     def _extract_rating_reviews(self, item) -> tuple:
-        """Extract rating and review count from an item."""
+        """
+        Extract rating and review count from a Google Maps listing item.
+        Uses multiple extraction strategies for robustness.
+        """
         rating = 0.0
         review_count = 0
+        full_text = item.get_text() if item else ""
         
-        # Method 1: Try aria-label on rating span
+        # Method 1: Try aria-label on span[role="img"] (most reliable)
         rating_span = item.select_one('span[role="img"]')
         if rating_span and rating_span.get('aria-label'):
             label = rating_span.get('aria-label')
+            print(f"[Parser] Found aria-label: '{label}'")
             
             # Extract rating: "4.5 stars" or "4.5"
             rating_match = re.search(r'([0-9.]+)\s*(?:stars?)?', label, re.IGNORECASE)
             if rating_match:
-                rating = float(rating_match.group(1))
+                try:
+                    rating = float(rating_match.group(1))
+                except ValueError:
+                    pass
             
-            # Extract review count: "155 reviews" or "(155)"
+            # Extract review count: "155 reviews", "(155)", "1,234 reviews", "1.2K reviews"
+            # Pattern 1: Comma-separated number + "reviews"
             reviews_match = re.search(r'([0-9,]+)\s*reviews?', label, re.IGNORECASE)
             if reviews_match:
                 review_count = int(reviews_match.group(1).replace(',', ''))
+            else:
+                # Pattern 2: K/M suffix (e.g., "1.2K reviews" or "1K")
+                km_match = re.search(r'([0-9.]+)\s*([KkMm])\s*(?:reviews?)?', label)
+                if km_match:
+                    num = float(km_match.group(1))
+                    suffix = km_match.group(2).upper()
+                    if suffix == 'K':
+                        review_count = int(num * 1000)
+                    elif suffix == 'M':
+                        review_count = int(num * 1000000)
         
-        # Method 2: Parse from full item text (handles "Name4.8(68)Category..." format)
+        # Method 2: Try alternative span selectors 
+        if review_count == 0:
+            # Look for spans with review count in various formats
+            all_spans = item.select('span')
+            for span in all_spans:
+                span_text = span.get_text(strip=True)
+                # Check for parentheses format: "(155)" or "(1,234)"
+                paren_match = re.search(r'^\(([0-9,]+)\)$', span_text)
+                if paren_match:
+                    review_count = int(paren_match.group(1).replace(',', ''))
+                    print(f"[Parser] Found review count from span (paren): {review_count}")
+                    break
+                # Check for K/M format in span: "1.2K" or "155"
+                km_span_match = re.search(r'^([0-9.]+)\s*([KkMm])?$', span_text)
+                if km_span_match and len(span_text) < 10:
+                    num = float(km_span_match.group(1))
+                    suffix = km_span_match.group(2)
+                    if suffix:
+                        suffix = suffix.upper()
+                        if suffix == 'K':
+                            review_count = int(num * 1000)
+                        elif suffix == 'M':
+                            review_count = int(num * 1000000)
+                    elif num > 0 and num == int(num):
+                        # Could be a plain number review count - validate context
+                        # Check if previous sibling is a rating
+                        prev = span.find_previous_sibling()
+                        if prev and re.search(r'\d\.\d', prev.get_text(strip=True)):
+                            review_count = int(num)
+                    if review_count > 0:
+                        print(f"[Parser] Found review count from span (km): {review_count}")
+                        break
+        
+        # Method 3: Parse from full item text (handles "Name4.8(68)Category..." format)
         if rating == 0.0 or review_count == 0:
-            full_text = item.get_text()
-            
-            # Extract rating: look for pattern like "4.8" or "4.9"
+            # Extract rating if still not found
             if rating == 0.0:
                 rating_match = re.search(r'(\d+\.\d+)', full_text)
                 if rating_match:
                     try:
                         potential_rating = float(rating_match.group(1))
-                        # Ratings are typically 1.0 to 5.0
                         if 1.0 <= potential_rating <= 5.0:
                             rating = potential_rating
-                    except:
+                    except ValueError:
                         pass
             
-            # Extract review count: look for pattern like "(68)" or "(155)"
-            # Extract review count: look for pattern like "(68)" or "(155)"
+            # Extract review count from text
             if review_count == 0:
-                reviews_match = re.search(r'\((\d+)\)', full_text)
-                if reviews_match:
-                    review_count = int(reviews_match.group(1))
-                else:
-                    # Look for "68 reviews" pattern in text
-                    reviews_text_match = re.search(r'(\d+)\s+reviews', full_text, re.IGNORECASE)
+                # Clean text - normalize whitespace
+                clean_text = ' '.join(full_text.split())
+                
+                # Pattern 1: Parentheses format "(68)" or "(1,234)"
+                paren_match = re.search(r'\(([0-9,]+)\)', clean_text)
+                if paren_match:
+                    review_count = int(paren_match.group(1).replace(',', ''))
+                    print(f"[Parser] Found review count from text (paren): {review_count}")
+                
+                # Pattern 2: "68 reviews" or "1,234 reviews"
+                if review_count == 0:
+                    reviews_text_match = re.search(r'([0-9,]+)\s+reviews?', clean_text, re.IGNORECASE)
                     if reviews_text_match:
-                        review_count = int(reviews_text_match.group(1))
-                    
-                    # Fallback: Look for number immediately following rating "4.8 68"
-                    # Pattern: 4.8 followed by optional space/newline then digits
-                    if rating > 0:
-                        try:
-                            # Sanitize text to remove newlines for better regex matching
-                            clean_text = ' '.join(full_text.split())
-                            loose_match = re.search(fr'{rating}\s*\(?(\d+)\)?', clean_text)
-                            if loose_match:
-                                review_count = int(loose_match.group(1))
-                        except Exception as e:
-                            print(f"[Parser] Regex warning: {e}")
-
-        if review_count == 0:
-             print(f"[Parser] Review extraction failed for '{full_text[:50]}'. HTML snippet:\n{item.prettify()[:1000]}")
+                        review_count = int(reviews_text_match.group(1).replace(',', ''))
+                        print(f"[Parser] Found review count from text (reviews): {review_count}")
+                
+                # Pattern 3: K/M suffix "1.2K reviews" or just "1.2K" after rating
+                if review_count == 0:
+                    km_text_match = re.search(r'([0-9.]+)\s*([KkMm])\s*(?:reviews?)?', clean_text)
+                    if km_text_match:
+                        num = float(km_text_match.group(1))
+                        suffix = km_text_match.group(2).upper()
+                        if suffix == 'K':
+                            review_count = int(num * 1000)
+                        elif suffix == 'M':
+                            review_count = int(num * 1000000)
+                        print(f"[Parser] Found review count from text (K/M): {review_count}")
+                
+                # Pattern 4: Number immediately after rating "4.8 68" or "4.868"
+                if review_count == 0 and rating > 0:
+                    try:
+                        # Look for rating followed by a number
+                        rating_str = str(rating)
+                        # Pattern like "4.8 68" or "4.8(68)"
+                        after_rating_match = re.search(
+                            rf'{re.escape(rating_str)}\s*\(?([0-9,]+)\)?',
+                            clean_text
+                        )
+                        if after_rating_match:
+                            potential_count = int(after_rating_match.group(1).replace(',', ''))
+                            # Sanity check: review count should be reasonable
+                            if potential_count > 0 and potential_count < 1000000:
+                                review_count = potential_count
+                                print(f"[Parser] Found review count after rating: {review_count}")
+                    except Exception as e:
+                        print(f"[Parser] Regex warning: {e}")
         
-        print(f"[Parser] Extracted rating={rating}, reviews={review_count}")
+        # Method 4: Try extracting from aria-label on buttons or links
+        if review_count == 0:
+            review_buttons = item.select('button[aria-label*="review"], a[aria-label*="review"]')
+            for btn in review_buttons:
+                label = btn.get('aria-label', '')
+                count_match = re.search(r'([0-9,]+)\s*reviews?', label, re.IGNORECASE)
+                if count_match:
+                    review_count = int(count_match.group(1).replace(',', ''))
+                    print(f"[Parser] Found review count from button aria-label: {review_count}")
+                    break
+        
+        # Method 5: Look for review count in sibling/child divs with specific patterns
+        if review_count == 0:
+            # Pattern: Find divs containing just a number near rating elements
+            for div in item.select('div, span'):
+                div_text = div.get_text(strip=True)
+                # Match standalone numbers like "68" or "421" or "(68)"
+                standalone_match = re.match(r'^\(?(\d{1,6})\)?$', div_text)
+                if standalone_match:
+                    potential = int(standalone_match.group(1))
+                    # Validate: should be reasonable count and not a year or other number
+                    if 1 <= potential <= 100000 and potential != int(rating * 10):
+                        # Check if there's a rating nearby
+                        parent = div.parent
+                        if parent:
+                            parent_text = parent.get_text()
+                            if re.search(r'\d\.\d', parent_text):
+                                review_count = potential
+                                print(f"[Parser] Found review count from standalone number: {review_count}")
+                                break
+        
+        # Method 6: Search all aria-labels in the item for review patterns
+        if review_count == 0:
+            for elem in item.select('[aria-label]'):
+                label = elem.get('aria-label', '')
+                # Look for patterns like "4.8 stars 68 reviews" or just "68 reviews"
+                count_match = re.search(r'(\d{1,6})\s*(?:Reviews?|ratings?)', label, re.IGNORECASE)
+                if count_match:
+                    review_count = int(count_match.group(1))
+                    print(f"[Parser] Found review count from any aria-label: {review_count}")
+                    break
+        
+        # Method 7: Text pattern - look for number followed by closing paren anywhere
+        if review_count == 0:
+            # Sometimes the format is like "Rating4.8(68)Category" without spaces
+            compact_match = re.search(r'(\d\.\d)\((\d{1,6})\)', full_text)
+            if compact_match:
+                if rating == 0.0:
+                    rating = float(compact_match.group(1))
+                review_count = int(compact_match.group(2))
+                print(f"[Parser] Found review count from compact format: {review_count}")
+        
+        # Debug logging for failed extractions
+        if review_count == 0:
+            print(f"[Parser] ⚠️ Review extraction FAILED for text: '{full_text[:100]}...'")
+            # Log the HTML structure for debugging
+            try:
+                html_snippet = item.prettify()[:500]
+                print(f"[Parser] HTML snippet:\n{html_snippet}")
+            except:
+                pass
+        else:
+            print(f"[Parser] ✅ Extracted rating={rating}, reviews={review_count}")
+        
         return rating, review_count
     
     def _extract_place_id(self, url: str) -> str:
