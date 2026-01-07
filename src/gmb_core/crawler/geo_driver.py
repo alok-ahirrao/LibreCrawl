@@ -496,6 +496,319 @@ class GeoCrawlerDriver:
             finally:
                 browser.close()
     
+    def scan_serp_fast(self, keyword: str, location: str = "United States", 
+                       device: str = "desktop", depth: int = 10, language: str = "en") -> tuple:
+        """
+        Fast SERP scan using requests (no browser overhead).
+        Best for country-level searches without precise geolocation needs.
+        
+        This method supports three modes:
+        1. ScraperAPI - Uses ScraperAPI.com to handle JS rendering (recommended)
+        2. SerpAPI - Uses SerpAPI.com for structured SERP data
+        3. Direct requests - Falls back to direct HTTP (may be blocked by Google)
+        
+        Configure via environment variables:
+        - SERP_API_PROVIDER: 'scraperapi', 'serpapi', or 'none'
+        - SERP_API_KEY: Your API key
+        
+        Args:
+            keyword: Search query
+            location: Location name (country or city)
+            device: 'desktop' or 'mobile'
+            depth: Number of results to request (10, 20, 50, 100)
+            language: Language code (e.g., 'en', 'es')
+            
+        Returns:
+            Tuple of (HTML content, final_url, success_flag)
+        """
+        import requests
+        from urllib.parse import quote_plus
+        from ..config import config
+        
+        print(f"[SerpFast] Starting fast SERP scan for '{keyword}' in '{location}'")
+        
+        # Check if a SERP API provider is configured
+        api_provider = config.SERP_API_PROVIDER
+        api_key = config.SERP_API_KEY
+        
+        if api_provider != 'none' and api_key:
+            print(f"[SerpFast] Using {api_provider.upper()} for fast mode")
+            return self._scan_serp_via_api(keyword, location, device, depth, language, api_provider, api_key)
+        
+        # Fall back to direct requests (may be blocked)
+        print(f"[SerpFast] No SERP API configured, attempting direct request...")
+        
+        
+        # Map location to Google's gl parameter (country code)
+        LOCATION_MAP = {
+            'united states': 'us',
+            'usa': 'us',
+            'united kingdom': 'gb',
+            'uk': 'gb',
+            'canada': 'ca',
+            'australia': 'au',
+            'germany': 'de',
+            'france': 'fr',
+            'india': 'in',
+            'brazil': 'br',
+            'mexico': 'mx',
+            'spain': 'es',
+            'italy': 'it',
+            'netherlands': 'nl',
+            'japan': 'jp',
+            'singapore': 'sg',
+            'new zealand': 'nz',
+            'ireland': 'ie',
+            'south africa': 'za',
+            'uae': 'ae',
+            'united arab emirates': 'ae',
+        }
+        
+        # Google domain mapping
+        GOOGLE_DOMAINS = {
+            'us': 'google.com',
+            'gb': 'google.co.uk',
+            'ca': 'google.ca',
+            'au': 'google.com.au',
+            'de': 'google.de',
+            'fr': 'google.fr',
+            'in': 'google.co.in',
+            'br': 'google.com.br',
+            'mx': 'google.com.mx',
+            'es': 'google.es',
+            'it': 'google.it',
+            'nl': 'google.nl',
+            'jp': 'google.co.jp',
+            'sg': 'google.com.sg',
+            'nz': 'google.co.nz',
+            'ie': 'google.ie',
+            'za': 'google.co.za',
+            'ae': 'google.ae',
+        }
+        
+        # Determine GL code
+        cleaned_loc = location.lower().strip()
+        gl_code = LOCATION_MAP.get(cleaned_loc, 'us')
+        google_domain = GOOGLE_DOMAINS.get(gl_code, 'google.com')
+        
+        # Generate UULE for more specific locations (cities)
+        uule = ""
+        if cleaned_loc not in LOCATION_MAP:
+            # It's a city or specific location, generate UULE
+            uule = self._generate_uule(location)
+            print(f"[SerpFast] Generated UULE for '{location}'")
+        
+        # Device-specific user agents
+        if device.lower() == 'mobile':
+            user_agents = [
+                'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1',
+                'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36',
+                'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1',
+            ]
+        else:
+            user_agents = [
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0',
+                'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            ]
+        
+        # Select random user agent
+        import random
+        user_agent = random.choice(user_agents)
+        
+        # Build headers to mimic real browser
+        headers = {
+            'User-Agent': user_agent,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': f'{language}-{gl_code.upper()},{language};q=0.9,en;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
+            'sec-ch-ua': '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            'sec-ch-ua-mobile': '?1' if device.lower() == 'mobile' else '?0',
+            'sec-ch-ua-platform': '"Android"' if device.lower() == 'mobile' else '"Windows"',
+        }
+        
+        # Build search URL
+        search_url = f'https://www.{google_domain}/search?q={quote_plus(keyword)}&hl={language}&num={depth}'
+        
+        if gl_code:
+            search_url += f'&gl={gl_code}'
+        
+        if uule:
+            search_url += f'&uule={uule}'
+        
+        print(f"[SerpFast] Fetching: {search_url}")
+        
+        # Configure session with proxy if available
+        session = requests.Session()
+        session.headers.update(headers)
+        
+        proxies = None
+        if self.proxy_url:
+            proxies = {
+                'http': self.proxy_url,
+                'https': self.proxy_url
+            }
+            print(f"[SerpFast] Using proxy: {self.proxy_url[:30]}...")
+        
+        # Add cookies that indicate a real browser session
+        # This can help bypass some JavaScript requirement checks
+        session.cookies.set('CONSENT', 'YES+', domain='.google.com')
+        session.cookies.set('SOCS', 'CAISHAgBEhJnd3NfMjAyNDAxMDktMF9SQzEaAmVuIAEaBgiA_K6tBg', domain='.google.com')
+        
+        try:
+            # Make the request
+            response = session.get(
+                search_url,
+                proxies=proxies,
+                timeout=15,
+                allow_redirects=True
+            )
+            
+            print(f"[SerpFast] Response: {response.status_code}, {len(response.text)} bytes")
+            
+            # Check for success
+            if response.status_code != 200:
+                print(f"[SerpFast] Non-200 status code: {response.status_code}")
+                return None, None, False
+            
+            html_content = response.text
+            final_url = response.url
+            
+            # Check for CAPTCHA or blocks
+            captcha_indicators = ['unusual traffic', 'captcha', 'recaptcha', 'verify you', 'not a robot', 'detected unusual traffic']
+            html_lower = html_content[:10000].lower()
+            
+            if any(indicator in html_lower for indicator in captcha_indicators):
+                print("[SerpFast] ⚠️ CAPTCHA/Block detected - falling back to browser mode")
+                return None, None, False
+            
+            # Check for JavaScript-required page (Google's JS gate)
+            js_required_indicators = ['please click', 'enable javascript', 'javascript is required', 'enablejs']
+            if any(indicator in html_lower for indicator in js_required_indicators):
+                print("[SerpFast] ⚠️ JavaScript required page - falling back to browser mode")
+                return None, None, False
+            
+            # Check for valid search results - look for actual result containers
+            has_results = any([
+                'id="rso"' in html_content,
+                "id='rso'" in html_content,
+                'class="g"' in html_content,
+                'data-hveid=' in html_content,
+                'data-sokoban' in html_content,  # Modern Google result attribute
+                '<cite' in html_content,  # URLs in results
+            ])
+            
+            if not has_results:
+                print("[SerpFast] ⚠️ No search results found in response - may be blocked")
+                return None, None, False
+            
+            print(f"[SerpFast] ✓ Successfully fetched SERP ({len(html_content)} bytes)")
+            return html_content, final_url, True
+            
+        except requests.exceptions.Timeout:
+            print("[SerpFast] ⚠️ Request timed out")
+            return None, None, False
+        except requests.exceptions.ConnectionError as e:
+            print(f"[SerpFast] ⚠️ Connection error: {e}")
+            return None, None, False
+        except Exception as e:
+            print(f"[SerpFast] ⚠️ Error: {e}")
+            return None, None, False
+    
+    def _scan_serp_via_api(self, keyword: str, location: str, device: str, 
+                            depth: int, language: str, provider: str, api_key: str) -> tuple:
+        """
+        Fetch SERP using a third-party API service.
+        
+        Supported providers:
+        - scraperapi: ScraperAPI.com - Renders JS and returns HTML
+        - serpapi: SerpAPI.com - Returns structured JSON (converted to HTML-like format)
+        """
+        import requests
+        from urllib.parse import quote_plus
+        
+        # Map location to country code for APIs
+        LOCATION_MAP = {
+            'united states': 'us', 'usa': 'us',
+            'united kingdom': 'gb', 'uk': 'gb',
+            'canada': 'ca', 'australia': 'au', 'germany': 'de',
+            'france': 'fr', 'india': 'in', 'brazil': 'br',
+            'mexico': 'mx', 'spain': 'es', 'italy': 'it',
+            'netherlands': 'nl', 'japan': 'jp',
+        }
+        
+        cleaned_loc = location.lower().strip()
+        country_code = LOCATION_MAP.get(cleaned_loc, 'us')
+        
+        try:
+            if provider == 'scraperapi':
+                # ScraperAPI - Returns rendered HTML
+                # https://www.scraperapi.com/documentation/
+                target_url = f"https://www.google.com/search?q={quote_plus(keyword)}&hl={language}&gl={country_code}&num={depth}"
+                
+                api_url = f"http://api.scraperapi.com?api_key={api_key}&url={quote_plus(target_url)}&render=true"
+                
+                if device.lower() == 'mobile':
+                    api_url += "&device_type=mobile"
+                
+                print(f"[SerpAPI] Fetching via ScraperAPI...")
+                response = requests.get(api_url, timeout=60)
+                
+                if response.status_code == 200:
+                    html_content = response.text
+                    print(f"[SerpAPI] ✓ ScraperAPI returned {len(html_content)} bytes")
+                    return html_content, target_url, True
+                else:
+                    print(f"[SerpAPI] ⚠️ ScraperAPI returned status {response.status_code}")
+                    return None, None, False
+                    
+            elif provider == 'serpapi':
+                # SerpAPI - Returns structured JSON
+                # https://serpapi.com/search-api
+                api_url = "https://serpapi.com/search"
+                params = {
+                    'api_key': api_key,
+                    'q': keyword,
+                    'hl': language,
+                    'gl': country_code,
+                    'num': depth,
+                    'engine': 'google',
+                    'output': 'html'  # Get HTML instead of JSON for compatibility
+                }
+                
+                if device.lower() == 'mobile':
+                    params['device'] = 'mobile'
+                
+                print(f"[SerpAPI] Fetching via SerpAPI...")
+                response = requests.get(api_url, params=params, timeout=60)
+                
+                if response.status_code == 200:
+                    html_content = response.text
+                    print(f"[SerpAPI] ✓ SerpAPI returned {len(html_content)} bytes")
+                    return html_content, f"https://www.google.com/search?q={quote_plus(keyword)}", True
+                else:
+                    print(f"[SerpAPI] ⚠️ SerpAPI returned status {response.status_code}: {response.text[:200]}")
+                    return None, None, False
+            
+            else:
+                print(f"[SerpAPI] ⚠️ Unknown provider: {provider}")
+                return None, None, False
+                
+        except requests.exceptions.Timeout:
+            print(f"[SerpAPI] ⚠️ API request timed out")
+            return None, None, False
+        except Exception as e:
+            print(f"[SerpAPI] ⚠️ Error: {e}")
+            return None, None, False
+    
     def scan_serp(self, keyword: str, location: str = "United States", 
                   device: str = "desktop", depth: int = 10, language: str = "en",
                   lat: float = None, lng: float = None) -> tuple:
@@ -644,6 +957,7 @@ class GeoCrawlerDriver:
             # ... (launch args omitted for brevity in replace block if unchanged, but I need to include context to replace correctly)
             # Actually I should target the lines before context creation
             
+            # [OPTIMIZED] Enhanced launch args for better stealth and performance
             launch_args = [
                 '--disable-blink-features=AutomationControlled',
                 '--disable-dev-shm-usage',
@@ -653,6 +967,24 @@ class GeoCrawlerDriver:
                 '--disable-gpu',
                 '--no-first-run',
                 '--no-default-browser-check',
+                # [NEW] Additional stealth flags
+                '--disable-extensions',
+                '--disable-background-networking',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-component-update',
+                '--disable-hang-monitor',
+                '--disable-ipc-flooding-protection',
+                '--disable-popup-blocking',
+                '--disable-prompt-on-repost',
+                '--disable-renderer-backgrounding',
+                '--disable-sync',
+                '--metrics-recording-only',
+                '--password-store=basic',
+                '--use-mock-keychain',
+                # Performance optimization
+                '--disable-features=TranslateUI',
+                '--disable-features=BlinkGenPropertyTrees',
             ]
             
             # Prepare context options
@@ -665,6 +997,10 @@ class GeoCrawlerDriver:
                 'java_script_enabled': True,
                 'bypass_csp': True,
                 'ignore_https_errors': True,
+                # [NEW] Additional stealth settings
+                'color_scheme': 'light',
+                'reduced_motion': 'no-preference',
+                'has_touch': device.lower() == 'mobile',
             }
             
             # Helper to get timezone (simple approximation or default)
@@ -696,72 +1032,137 @@ class GeoCrawlerDriver:
             # Launch persistent context
             context = p.chromium.launch_persistent_context(**context_args)
 
-            # Enhanced stealth scripts
+            # [OPTIMIZED] Enhanced stealth scripts for human-like behavior
             context.add_init_script("""
-                // Remove webdriver property
+                // === CORE WEBDRIVER HIDING ===
                 Object.defineProperty(navigator, 'webdriver', {
                     get: () => undefined,
                     configurable: true
                 });
                 
-                // Realistic plugins array
+                // Delete automation indicators
+                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+                
+                // === PLUGINS (Realistic) ===
                 Object.defineProperty(navigator, 'plugins', {
                     get: () => {
                         const plugins = [
-                            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer' },
-                            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai' },
-                            { name: 'Native Client', filename: 'internal-nacl-plugin' }
+                            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 },
+                            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: 'Portable Document Format', length: 1 },
+                            { name: 'Native Client', filename: 'internal-nacl-plugin', description: '', length: 2 },
+                            { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', length: 1 }
                         ];
                         plugins.item = (i) => plugins[i];
                         plugins.namedItem = (name) => plugins.find(p => p.name === name);
                         plugins.refresh = () => {};
+                        Object.setPrototypeOf(plugins, PluginArray.prototype);
                         return plugins;
                     }
                 });
                 
-                // Languages
+                // === LANGUAGES ===
                 Object.defineProperty(navigator, 'languages', {
-                    get: () => ['en-US', 'en', 'es']
+                    get: () => ['en-US', 'en']
                 });
                 
-                // Platform matching user agent
+                // === PLATFORM ===
                 Object.defineProperty(navigator, 'platform', {
                     get: () => 'Win32'
                 });
                 
-                // Hardware concurrency (realistic value)
-                Object.defineProperty(navigator, 'hardwareConcurrency', {
-                    get: () => 8
-                });
+                // === HARDWARE VALUES (Randomized realistic) ===
+                const cores = [4, 6, 8, 12, 16][Math.floor(Math.random() * 5)];
+                const memory = [4, 8, 16, 32][Math.floor(Math.random() * 4)];
+                Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => cores });
+                Object.defineProperty(navigator, 'deviceMemory', { get: () => memory });
                 
-                // Device memory (realistic value)
-                Object.defineProperty(navigator, 'deviceMemory', {
-                    get: () => 8
-                });
-                
-                // Chrome object
+                // === CHROME OBJECT ===
                 window.chrome = {
-                    runtime: {},
-                    loadTimes: function() {},
-                    csi: function() { return {}; },
-                    app: {}
+                    runtime: {
+                        connect: () => ({}),
+                        sendMessage: () => {},
+                        onMessage: { addListener: () => {} }
+                    },
+                    loadTimes: function() {
+                        return {
+                            requestTime: Date.now() / 1000 - Math.random() * 10,
+                            startLoadTime: Date.now() / 1000 - Math.random() * 5,
+                            firstPaintTime: Date.now() / 1000 - Math.random() * 3,
+                            finishDocumentLoadTime: Date.now() / 1000 - Math.random() * 2,
+                            finishLoadTime: Date.now() / 1000 - Math.random(),
+                            navigationType: 'Other'
+                        };
+                    },
+                    csi: function() { return { pageT: Date.now(), startE: Date.now() - Math.random() * 1000 }; },
+                    app: { isInstalled: false, getDetails: () => null, getIsInstalled: () => false, installState: () => 'not_installed' }
                 };
                 
-                // Permissions API
+                // === PERMISSIONS API ===
                 const originalQuery = window.navigator.permissions.query;
-                window.navigator.permissions.query = (parameters) => (
-                    parameters.name === 'notifications' ?
-                    Promise.resolve({ state: Notification.permission }) :
-                    originalQuery(parameters)
-                );
+                window.navigator.permissions.query = (parameters) => {
+                    if (parameters.name === 'notifications') {
+                        return Promise.resolve({ state: 'default', onchange: null });
+                    }
+                    return originalQuery.call(window.navigator.permissions, parameters);
+                };
                 
-                // WebGL vendor/renderer
+                // === WEBGL FINGERPRINT ===
                 const getParameter = WebGLRenderingContext.prototype.getParameter;
                 WebGLRenderingContext.prototype.getParameter = function(parameter) {
                     if (parameter === 37445) return 'Intel Inc.';
                     if (parameter === 37446) return 'Intel Iris OpenGL Engine';
+                    if (parameter === 7937) return 'WebKit WebGL';
                     return getParameter.apply(this, arguments);
                 };
+                
+                // === CANVAS FINGERPRINT PROTECTION ===
+                const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+                HTMLCanvasElement.prototype.toDataURL = function(type) {
+                    if (this.width === 16 && this.height === 16) {
+                        // Likely fingerprinting, add noise
+                        const context = this.getContext('2d');
+                        if (context) {
+                            const imageData = context.getImageData(0, 0, this.width, this.height);
+                            for (let i = 0; i < imageData.data.length; i += 4) {
+                                imageData.data[i] ^= (Math.random() * 2) | 0;
+                            }
+                            context.putImageData(imageData, 0, 0);
+                        }
+                    }
+                    return originalToDataURL.apply(this, arguments);
+                };
+                
+                // === WEB AUDIO FINGERPRINT ===
+                const originalGetChannelData = AudioBuffer.prototype.getChannelData;
+                AudioBuffer.prototype.getChannelData = function(channel) {
+                    const array = originalGetChannelData.call(this, channel);
+                    for (let i = 0; i < array.length; i += 100) {
+                        array[i] += (Math.random() * 0.0001);
+                    }
+                    return array;
+                };
+                
+                // === CONNECTION INFO ===
+                Object.defineProperty(navigator, 'connection', {
+                    get: () => ({
+                        effectiveType: '4g',
+                        rtt: 50,
+                        downlink: 10,
+                        saveData: false
+                    })
+                });
+                
+                // === BATTERY API (Deprecated but checked) ===
+                if ('getBattery' in navigator) {
+                    navigator.getBattery = () => Promise.resolve({
+                        charging: true,
+                        chargingTime: 0,
+                        dischargingTime: Infinity,
+                        level: 0.99
+                    });
+                }
             """)
             
             page = context.new_page()
@@ -804,17 +1205,134 @@ class GeoCrawlerDriver:
                     search_url += f'&uule={uule}'
                     
                 print(f"[SerpScan] fast-nav -> {search_url}")
-                page.goto(search_url, wait_until='domcontentloaded', timeout=30000)
+                # [OPTIMIZED] Faster page loading with smart wait
+                try:
+                    page.goto(search_url, wait_until='domcontentloaded', timeout=20000)
+                except Exception as nav_err:
+                    print(f"[SerpScan] Navigation warning: {nav_err}")
                 
-                # Wait for results
+                # [OPTIMIZED] Smart wait - check for content before fixed delay
                 print(f"[SerpScan] Waiting for search results (depth={depth})...")
-                time.sleep(random.uniform(3.0, 5.0))
+                try:
+                    # Wait for search results container (max 3s, usually much faster)
+                    page.wait_for_selector('#rso, #search, .g', timeout=3000)
+                except:
+                    pass  # Continue anyway
                 
-                # Check for CAPTCHA and wait for manual solving if detected
-                def check_and_wait_for_captcha(pg, max_wait=120):
-                    """Check for CAPTCHA and wait for user to solve it."""
+                # [OPTIMIZED] Reduced fixed wait (human-like micro-delay)
+                time.sleep(random.uniform(0.5, 1.2))
+                
+                # [NEW] Simulate human-like mouse movement to avoid detection
+                try:
+                    page.mouse.move(
+                        random.randint(100, 400),
+                        random.randint(200, 500),
+                        steps=random.randint(3, 8)
+                    )
+                except:
+                    pass
+                
+                # [ENHANCED] Check for CAPTCHA and handle automatically or wait for manual solving
+                def solve_captcha_via_api(site_key: str, page_url: str) -> str:
+                    """Attempt to solve reCAPTCHA using 2captcha or anticaptcha API."""
+                    from ..config import config
+                    import requests
+                    
+                    if config.CAPTCHA_PROVIDER == 'none' or not config.CAPTCHA_API_KEY:
+                        return None
+                    
+                    api_key = config.CAPTCHA_API_KEY
+                    
                     try:
-                        html_preview = pg.content()[:5000].lower()
+                        if config.CAPTCHA_PROVIDER == '2captcha':
+                            # Submit CAPTCHA to 2captcha
+                            print(f"[CAPTCHA] Submitting to 2captcha...")
+                            submit_url = "http://2captcha.com/in.php"
+                            submit_data = {
+                                'key': api_key,
+                                'method': 'userrecaptcha',
+                                'googlekey': site_key,
+                                'pageurl': page_url,
+                                'json': 1
+                            }
+                            resp = requests.post(submit_url, data=submit_data, timeout=30)
+                            result = resp.json()
+                            
+                            if result.get('status') != 1:
+                                print(f"[CAPTCHA] 2captcha error: {result.get('error_text', 'Unknown error')}")
+                                return None
+                            
+                            captcha_id = result.get('request')
+                            print(f"[CAPTCHA] 2captcha submitted, ID: {captcha_id}")
+                            
+                            # Poll for result
+                            for attempt in range(60):  # Max 3 minutes
+                                time.sleep(3)
+                                check_url = f"http://2captcha.com/res.php?key={api_key}&action=get&id={captcha_id}&json=1"
+                                check_resp = requests.get(check_url, timeout=30)
+                                check_result = check_resp.json()
+                                
+                                if check_result.get('status') == 1:
+                                    token = check_result.get('request')
+                                    print(f"[CAPTCHA] ✓ 2captcha solved!")
+                                    return token
+                                elif 'CAPCHA_NOT_READY' not in check_result.get('request', ''):
+                                    print(f"[CAPTCHA] 2captcha error: {check_result.get('request')}")
+                                    return None
+                                    
+                                if attempt % 10 == 0:
+                                    print(f"[CAPTCHA] Waiting for 2captcha... ({attempt * 3}s)")
+                        
+                        elif config.CAPTCHA_PROVIDER == 'anticaptcha':
+                            # Submit CAPTCHA to antiCaptcha
+                            print(f"[CAPTCHA] Submitting to antiCaptcha...")
+                            submit_url = "https://api.anti-captcha.com/createTask"
+                            submit_data = {
+                                "clientKey": api_key,
+                                "task": {
+                                    "type": "RecaptchaV2TaskProxyless",
+                                    "websiteURL": page_url,
+                                    "websiteKey": site_key
+                                }
+                            }
+                            resp = requests.post(submit_url, json=submit_data, timeout=30)
+                            result = resp.json()
+                            
+                            if result.get('errorId') != 0:
+                                print(f"[CAPTCHA] antiCaptcha error: {result.get('errorDescription', 'Unknown error')}")
+                                return None
+                            
+                            task_id = result.get('taskId')
+                            print(f"[CAPTCHA] antiCaptcha submitted, ID: {task_id}")
+                            
+                            # Poll for result
+                            for attempt in range(60):
+                                time.sleep(3)
+                                check_url = "https://api.anti-captcha.com/getTaskResult"
+                                check_data = {"clientKey": api_key, "taskId": task_id}
+                                check_resp = requests.post(check_url, json=check_data, timeout=30)
+                                check_result = check_resp.json()
+                                
+                                if check_result.get('status') == 'ready':
+                                    token = check_result.get('solution', {}).get('gRecaptchaResponse')
+                                    print(f"[CAPTCHA] ✓ antiCaptcha solved!")
+                                    return token
+                                elif check_result.get('status') == 'processing':
+                                    if attempt % 10 == 0:
+                                        print(f"[CAPTCHA] Waiting for antiCaptcha... ({attempt * 3}s)")
+                                else:
+                                    print(f"[CAPTCHA] antiCaptcha error: {check_result.get('errorDescription')}")
+                                    return None
+                        
+                    except Exception as e:
+                        print(f"[CAPTCHA] API error: {e}")
+                    
+                    return None
+                
+                def check_and_wait_for_captcha(pg, max_wait=120):
+                    """Check for CAPTCHA and attempt automatic or manual solving."""
+                    try:
+                        html_preview = pg.content()[:10000].lower()
                     except Exception as e:
                         print(f"[SerpScan] Warning: Could not check for CAPTCHA (page navigating?): {e}")
                         time.sleep(2)
@@ -823,24 +1341,59 @@ class GeoCrawlerDriver:
                     captcha_indicators = ['unusual traffic', 'captcha', 'recaptcha', 'verify you', 'not a robot']
                     
                     if any(indicator in html_preview for indicator in captcha_indicators):
-                        print("[SerpScan] ⚠️ CAPTCHA detected! Please solve it in the browser window...")
-                        print(f"[SerpScan] Waiting up to {max_wait} seconds for CAPTCHA to be solved...")
+                        print("[SerpScan] ⚠️ CAPTCHA detected!")
                         
-                        # Wait for CAPTCHA to be solved (check every 3 seconds)
-                        for wait_count in range(max_wait // 3):
-                            time.sleep(3)
+                        # Try to extract reCAPTCHA site key for automatic solving
+                        site_key = None
+                        try:
+                            import re
+                            site_key_match = re.search(r'data-sitekey=["\']([^"\']+)["\']', pg.content())
+                            if site_key_match:
+                                site_key = site_key_match.group(1)
+                                print(f"[CAPTCHA] Found site key: {site_key[:20]}...")
+                        except:
+                            pass
+                        
+                        # Attempt automatic solving if configured
+                        from ..config import config
+                        if site_key and config.CAPTCHA_PROVIDER != 'none' and config.CAPTCHA_API_KEY:
+                            token = solve_captcha_via_api(site_key, pg.url)
+                            if token:
+                                # Inject token and submit
+                                try:
+                                    pg.evaluate(f"""
+                                        document.getElementById('g-recaptcha-response').innerHTML = '{token}';
+                                        document.getElementById('g-recaptcha-response').style.display = 'block';
+                                        // Try to submit the form
+                                        const form = document.querySelector('form');
+                                        if (form) form.submit();
+                                    """)
+                                    time.sleep(3)
+                                    
+                                    # Check if solved
+                                    new_html = pg.content()[:5000].lower()
+                                    if not any(ind in new_html for ind in captcha_indicators):
+                                        print("[CAPTCHA] ✓ Automatic CAPTCHA solving succeeded!")
+                                        return True
+                                except Exception as e:
+                                    print(f"[CAPTCHA] Token injection error: {e}")
+                        
+                        # Fall back to manual solving
+                        print(f"[SerpScan] Waiting up to {max_wait} seconds for manual CAPTCHA solve...")
+                        
+                        for wait_count in range(max_wait // 2):
+                            time.sleep(2)  # Check more frequently
                             try:
                                 current_html = pg.content()[:5000].lower()
                             except Exception:
-                                continue # Ignore errors during check (navigation/reload)
+                                continue
 
-                            # Check if CAPTCHA is gone (search results appeared)
                             if 'search' in current_html and not any(ind in current_html for ind in captcha_indicators):
                                 print("[SerpScan] ✓ CAPTCHA solved! Continuing...")
-                                time.sleep(2)  # Wait a bit more for page to fully load
+                                time.sleep(1)
                                 return True
-                            if wait_count % 5 == 0:
-                                print(f"[SerpScan] Still waiting for CAPTCHA... ({(wait_count + 1) * 3}s)")
+                            if wait_count % 10 == 0:
+                                print(f"[SerpScan] Still waiting for CAPTCHA... ({wait_count * 2}s)")
                         
                         print("[SerpScan] ⚠️ Timeout waiting for CAPTCHA. Results may be incomplete.")
                         return False
@@ -867,17 +1420,14 @@ class GeoCrawlerDriver:
                         if page_num >= pages_needed - 1:
                             break
                         
-                        # Scroll to bottom to find "More results" or "Next"
-                        for _ in range(3):
-                            page.keyboard.press('End')
-                            time.sleep(random.uniform(0.3, 0.5))
-                        
-                        time.sleep(random.uniform(1.0, 2.0))
+                        # [OPTIMIZED] Faster scroll to bottom
+                        page.keyboard.press('End')
+                        time.sleep(random.uniform(0.2, 0.4))
                         
                         # Try to click "More results" button
                         more_results_selectors = [
+                            '#pnnext',  # Traditional next page (most common)
                             'a:has-text("More results")',
-                            '#pnnext',  # Traditional next page
                             'a[aria-label="More results"]',
                             'a[aria-label="Next page"]',
                             'span:has-text("Next") >> xpath=ancestor::a',
@@ -887,11 +1437,16 @@ class GeoCrawlerDriver:
                         for selector in more_results_selectors:
                             try:
                                 more_btn = page.locator(selector).first
-                                if more_btn.is_visible(timeout=2000):
+                                if more_btn.is_visible(timeout=1500):
                                     more_btn.click()
                                     print(f"[SerpScan] Moving to page {page_num + 2}...")
                                     clicked = True
-                                    time.sleep(random.uniform(2.5, 4.0))
+                                    # [OPTIMIZED] Wait for next page to load
+                                    try:
+                                        page.wait_for_selector('#rso, #search', timeout=5000)
+                                    except:
+                                        time.sleep(1)
+                                    time.sleep(random.uniform(0.3, 0.6))
                                     break
                             except:
                                 continue
@@ -1031,6 +1586,27 @@ class GeoCrawlerDriver:
                                     print(f"[SerpScan] Found VALID 'More places' URL: {local_url}")
                                     print("[SerpScan] Navigating to Local Finder...")
                                     page.goto(local_url, wait_until='domcontentloaded', timeout=20000)
+                                    
+                                    # [FIX] Wait for lazy-loaded content (Phone, Timings)
+                                    try:
+                                        # 1. Wait for connection to stabilize
+                                        page.wait_for_load_state('networkidle', timeout=5000)
+                                    except: pass
+                                    
+                                    time.sleep(2.0)
+                                    
+                                    # 2. Trigger lazy load by scrolling
+                                    try:
+                                        print("[SerpScan] Triggering lazy load via scroll...")
+                                        page.mouse.wheel(0, 500)
+                                        time.sleep(0.5)
+                                        page.mouse.wheel(0, 1000)
+                                        time.sleep(1.0)
+                                        page.mouse.wheel(0, -1500) # Scroll back up for top results
+                                        time.sleep(1.0)
+                                    except Exception as e:
+                                        print(f"[SerpScan] Scroll/Wait warning: {e}")
+
                                 else:
                                     print(f"[SerpScan] SKIPPING: URL looks like video/image: {local_url}")
                             else:

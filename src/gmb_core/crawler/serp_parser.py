@@ -597,62 +597,200 @@ class GoogleSerpParser:
         return ''
     
     def _extract_local_pack(self, soup) -> list:
-        """Extract businesses from the local pack / map results."""
+        """Extract businesses from the local pack / map results with detailed info."""
         local_results = []
         
         try:
-            # Local pack container selectors
+            # Local pack container selectors - try multiple approaches
             local_selectors = [
                 'div.VkpGBb',  # Local result item
                 'div[data-local-attribute]',
+                'div.rllt__wrapped',  # Wrapped local result
             ]
             
+            items = []
             for selector in local_selectors:
                 items = soup.select(selector)
-                
-                for idx, item in enumerate(items[:3], 1):  # Usually 3 local results
-                    try:
-                        # Business name
-                        name_elem = item.select_one('div.dbg0pd') or item.select_one('span.OSrXXb')
-                        name = name_elem.get_text(strip=True) if name_elem else ''
-                        
-                        # Rating
-                        rating_elem = item.select_one('span.yi40Hd')
-                        rating = rating_elem.get_text(strip=True) if rating_elem else ''
-                        
-                        # Reviews count
-                        reviews_elem = item.select_one('span.RDApEe')
-                        reviews = reviews_elem.get_text(strip=True) if reviews_elem else ''
-                        
-                        # Category/type
-                        category_elem = item.select_one('div.rllt__details span:first-child')
-                        category = category_elem.get_text(strip=True) if category_elem else ''
-                        
-                        # [NEW] Detect if this is a sponsored/ad listing
-                        is_ad = False
-                        item_text = item.get_text().lower()
-                        if 'sponsored' in item_text or 'ad' in item.get('class', []):
-                            is_ad = True
-                        # Also check for "Sponsored" in any span
-                        sponsored_elem = item.find(lambda tag: tag.name == 'span' and 'Sponsored' in tag.get_text())
-                        if sponsored_elem:
-                            is_ad = True
-                        
-                        if name:
-                            local_results.append({
-                                'rank': idx,
-                                'name': name,
-                                'rating': rating,
-                                'reviews': reviews,
-                                'category': category,
-                                'is_ad': is_ad,  # [NEW] Add ad flag
-                            })
-                            
-                    except Exception as e:
-                        continue
-                
-                if local_results:
+                if items:
                     break
+            
+            # If still no items, try a broader search
+            if not items:
+                # Look for containers with business names
+                items = soup.select('div.dbg0pd, span.OSrXXb')
+                items = [item.find_parent('div', class_=lambda x: x and 'VkpGBb' in str(x)) or item.parent.parent for item in items if item]
+            
+            seen_names = set()
+            
+            for idx, item in enumerate(items[:20], 1):  # Limit to 20 results
+                try:
+                    if item is None:
+                        continue
+                    
+                    # === BUSINESS NAME ===
+                    name_elem = item.select_one('div.dbg0pd') or item.select_one('span.OSrXXb') or item.select_one('div[role="heading"]')
+                    name = name_elem.get_text(strip=True) if name_elem else ''
+                    
+                    # === CLEAN NAME ===
+                    if name.endswith("My Ad Center"):
+                        name = name.replace("My Ad Center", "").strip()
+                    if name.endswith("Sponsored"):
+                        name = name.replace("Sponsored", "").strip()
+                    
+                    if not name or name in seen_names:
+                        continue
+                    seen_names.add(name)
+                    
+                    # === RATING ===
+                    rating = ''
+                    rating_elem = item.select_one('span.yi40Hd') or item.select_one('span.MW4etd')
+                    if rating_elem:
+                        rating = rating_elem.get_text(strip=True)
+                    else:
+                        # Try aria-label
+                        star_elem = item.select_one('span[aria-label*="star"]')
+                        if star_elem:
+                            import re
+                            match = re.search(r'(\d+\.?\d*)\s*star', star_elem.get('aria-label', ''))
+                            if match:
+                                rating = match.group(1)
+                    
+                    # === REVIEWS COUNT ===
+                    reviews = ''
+                    reviews_elem = item.select_one('span.RDApEe') or item.select_one('span.UY7F9')
+                    if reviews_elem:
+                        reviews = reviews_elem.get_text(strip=True)
+                        reviews = reviews.replace('(', '').replace(')', '').replace(',', '')
+                    else:
+                        # Try aria-label
+                        review_elem = item.select_one('span[aria-label*="review"]')
+                        if review_elem:
+                            import re
+                            match = re.search(r'([\d,]+)\s*review', review_elem.get('aria-label', ''))
+                            if match:
+                                reviews = match.group(1).replace(',', '')
+                    
+                    # === CATEGORY ===
+                    category = ''
+                    details_div = item.select_one('div.rllt__details') or item.select_one('div.rllt__wrapped')
+                    if details_div:
+                        # Category is often the first span or text
+                        spans = details_div.select('span')
+                        for span in spans:
+                            text = span.get_text(strip=True)
+                            # Skip ratings, hours, etc
+                            if text and not text.startswith('(') and '·' not in text and len(text) < 50:
+                                if not any(c.isdigit() for c in text[:3]):  # Skip if starts with numbers (like phone)
+                                    category = text
+                                    break
+                    
+                    # === ADDRESS (Short) ===
+                    address = ''
+                    # Look for address patterns in full text if specific element fails
+                    full_text = item.get_text(separator=' | ')
+                    clean_text = item.get_text(separator=' ').replace('\n', ' ')
+                    
+                    # Try to find address element first (specific class)
+                    address_elem = item.select_one('span.AcEdkd') or item.select_one('div.rllt__details span:nth-of-type(2)')
+                    if address_elem:
+                        address = address_elem.get_text(strip=True)
+                    else:
+                        # Fallback: Parse from full text
+                        parts = full_text.split('|')
+                        for part in parts:
+                            part = part.strip()
+                            if not part or part == name or part == category: continue
+                            
+                            # Address patterns: contains comma OR ends with Rd/St/Ave etc OR has numbers
+                            if ',' in part or re.search(r'\b(Rd|St|Ave|Dr|Blvd|Ln|Way|Cir|Pl|Hwy)\b', part, re.I):
+                                if len(part) < 100 and "Open" not in part and "Closed" not in part:
+                                    # Ensure it's not a review count or similar
+                                    if not re.search(r'\d+\s*(review|year)', part, re.I):
+                                        address = part
+                                        break
+                    
+                    # === PHONE ===
+                    phone = ''
+                    phone_elem = item.select_one('span[data-dtype="d3ph"]') or item.select_one('a[href^="tel:"]')
+                    if phone_elem:
+                        phone = phone_elem.get_text(strip=True)
+                    else:
+                        # Extract phone from text using regex
+                        phone_matches = re.findall(r'(?:(?:\+|00)91[\s.-]?)?(?:0?[6-9]\d{4}[\s.-]?\d{5}|(?:\(\d{3}\)|\d{3})[\s.-]?\d{3}[\s.-]?\d{4})', clean_text)
+                        if not phone_matches:
+                             phone_matches = re.findall(r'\b0\d{5}\s\d{5}\b', clean_text)
+                        
+                        if phone_matches:
+                            phone = phone_matches[0]
+                    
+                    # === TIMINGS (Open/Closed status) ===
+                    timings = ''
+                    status_match = re.search(r'\b(Open|Closed|Closes soon)\b(?:[ ·•-]*)(?:Closes|Opens)?\s*(?:24 hours|\d{1,2}(?::\d{2})?\s*(?:am|pm|AM|PM|noon|midnight)?)', clean_text)
+                    if status_match:
+                        timings = status_match.group(0).replace('·', '').strip()
+                        timings = re.sub(r'\s+', ' ', timings)
+                    
+                    # === HIGHLIGHTS/FEATURES ===
+                    highlights = []
+                    # Look for special features
+                    feature_patterns = [
+                        r'(In-store shopping|Dine-in|Takeout|Delivery|Curbside pickup)',
+                        r'(Free Wi-Fi|WiFi|Wheelchair accessible)',
+                        r'(MDS|Gold Medalist|Specialist|Board Certified)',
+                        r'(\d+\+?\s*(?:years|implants|patients|reviews|locations))',
+                        r'\b(Available for new patients)\b',
+                    ]
+                    for pattern in feature_patterns:
+                        matches = re.findall(pattern, full_text, re.I)
+                        highlights.extend(matches)
+                    
+                    # Quotes for reviews
+                    quote_matches = re.findall(r'"([^"]{10,60})"', clean_text)
+                    for q in quote_matches:
+                        if q not in highlights:
+                             highlights.append(f'"{q}"')
+                    
+                    # Also check for service tags/chips
+                    tags = item.select('span.hGz87c, span.LrzXr, span.YhemCb')
+                    for tag in tags:
+                        tag_text = tag.get_text(strip=True)
+                        if tag_text and len(tag_text) < 50:
+                            highlights.append(tag_text)
+                    
+                    # Dedupe highlights
+                    highlights = list(dict.fromkeys(highlights))[:5]  # Keep max 5
+                    
+                    # === WEBSITE URL ===
+                    website = ''
+                    web_link = item.select_one('a[href^="http"]:not([href*="google."])')
+                    if web_link:
+                        website = web_link.get('href', '')
+                    
+                    # === IS AD ===
+                    is_ad = False
+                    item_html = str(item).lower()
+                    if 'sponsored' in item_html or 'data-text-ad' in item_html:
+                        is_ad = True
+                    sponsored_elem = item.find(lambda tag: tag.name == 'span' and 'Sponsored' in tag.get_text())
+                    if sponsored_elem:
+                        is_ad = True
+                    
+                    local_results.append({
+                        'rank': len(local_results) + 1,
+                        'name': name,
+                        'rating': rating,
+                        'reviews': reviews,
+                        'category': category,
+                        'address': address,
+                        'phone': phone,
+                        'timings': timings,
+                        'highlights': ', '.join(highlights) if highlights else '',
+                        'website': website,
+                        'is_ad': is_ad,
+                    })
+                            
+                except Exception as e:
+                    continue
                     
         except Exception as e:
             print(f"[SerpParser] Error extracting local pack: {e}")
@@ -665,12 +803,12 @@ class GoogleSerpParser:
         
         try:
             # Local Finder / Maps list items
-            # Usually div[jscontroller="AtSb"] or div.rl_item inside a specific container
             items = soup.select('div[jscontroller="AtSb"]') or soup.select('div.rl_item')
             
             if not items:
-                # Try finding by class if jscontroller is missing
                 items = soup.select('div.VkpGBb')
+            
+            seen_names = set()
             
             for idx, item in enumerate(items, 1):
                 try:
@@ -678,60 +816,181 @@ class GoogleSerpParser:
                     name_elem = item.select_one('div.dbg0pd') or item.select_one('span.OSrXXb') or item.select_one('div[role="heading"]')
                     name = name_elem.get_text(strip=True) if name_elem else ''
                     
-                    if not name:
+                    # Full text for parsing additional fields - use pipe separator for better delimiting
+                    full_text = item.get_text(separator=' | ')
+                    clean_text = item.get_text(separator=' ').replace('\n', ' ')
+                    
+                    # === CLEAN NAME ===
+                    # User reported "NameMy Ad Center". Clean this specific artifact.
+                    if name.endswith("My Ad Center"):
+                        name = name.replace("My Ad Center", "").strip()
+                    if name.endswith("Sponsored"):
+                        name = name.replace("Sponsored", "").strip()
+
+                    if not name or name in seen_names:
                          continue
+                    seen_names.add(name)
 
                     # Rating
+                    rating = ''
                     rating_elem = item.select_one('span.yi40Hd') or item.select_one('span.MW4etd')
-                    rating = rating_elem.get_text(strip=True) if rating_elem else ''
+                    if rating_elem:
+                        rating = rating_elem.get_text(strip=True)
                     
                     # Reviews count
+                    reviews = ''
                     reviews_elem = item.select_one('span.RDApEe') or item.select_one('span.UY7F9')
-                    reviews = reviews_elem.get_text(strip=True) if reviews_elem else ''
-                    if reviews:
+                    if reviews_elem:
+                        reviews = reviews_elem.get_text(strip=True)
                         reviews = reviews.replace('(', '').replace(')', '').replace(',', '')
                     
                     # Category
                     category = ''
                     details_div = item.select_one('div.rllt__details')
                     if details_div:
-                        # Category is often the first text node or span
                         cat_span = details_div.select_one('span')
                         if cat_span:
                             category = cat_span.get_text(strip=True)
+
+                    # === PHONE ===
+                    phone = ''
+                    # Priority 1: Link with tel: - Extract from HREF not text
+                    phone_link = item.select_one('a[href^="tel:"]')
+                    if phone_link:
+                        href = phone_link.get('href', '')
+                        if href.startswith('tel:'):
+                            phone = href.replace('tel:', '').strip()
+                        else:
+                            phone = phone_link.get_text(strip=True)
+                    
+                    if not phone or len(phone) < 7: # If phone is "Call" or empty
+                        # Priority 2: Text regex - Relaxed & Localized
+                        import re
+                        # Clean text for phone extraction
+                        # 1. Indian/International: +91 97134 35111, 097134 35111
+                        # 2. US: (617) 555-0199, 617-555-0199
+                        
+                        # Match Indian patterns first
+                        phone_matches = re.findall(r'(?:(?:\+|00)91[\s.-]?)?(?:0?[6-9]\d{4}[\s.-]?\d{5})', clean_text)
+                        
+                        if not phone_matches:
+                            # Match US/Standard patterns
+                            # (ddd) ddd-dddd or ddd-ddd-dddd
+                            phone_matches = re.findall(r'(?:\(\d{3}\)|\d{3})[\s.-]\d{3}[\s.-]\d{4}', clean_text)
+                        
+                        if not phone_matches:
+                             # Fallback: specific "0xxxxx xxxxx" 
+                             phone_matches = re.findall(r'\b0\d{5}\s\d{5}\b', clean_text)
+
+                        if phone_matches:
+                            phone = phone_matches[0]
+
+                    # === TIMINGS ===
+                    timings = ''
+                    # Pattern: "Open · Closes 9 pm", "Open 24 hours"
+                    # We match "Open" or "Closed" or "Closes"
+                    status_match = re.search(r'\b(Open|Closed|Closes soon|Opens soon)\b(?:.*?)((?:Closes|Opens)\s.*?(?:AM|PM|am|pm|24 hours|\d{1,2}(?::\d{2})?)?)', clean_text)
+                    if status_match:
+                         # Use the whole match but clean it
+                         raw = status_match.group(0)
+                         # Validate it looks like time
+                         if re.search(r'\d|Open|Closed', raw):
+                              timings = raw.replace('·', '').replace('  ', ' ').strip()
+                              if len(timings) > 40: timings = timings[:40] + "..."
+
+                    # === ADDRESS ===
+                    address = ''
+                    parts = full_text.split('|')
+                    for part in parts:
+                        part = part.strip()
+                        if not part or part == name or part == category or (phone and phone in part and len(part) < len(phone)+5): continue
+                        if part == rating or part == reviews: continue
+                        if timings and part in timings: continue
+                        
+                        # Check if part contains the phone we found? "Address · Phone"
+                        if phone and (phone in part or re.search(r'\d{3}[-]\d{4}', part)):
+                             # Split by dot/bullet
+                             subparts = re.split(r'[·•]', part)
+                             for sp in subparts:
+                                 sp = sp.strip()
+                                 # Take the part that is NOT the phone and looks like address
+                                 if len(sp) > 5 and not re.search(r'\d{3}[-]\d{4}', sp) and phone not in sp:
+                                     # Not "Open", not "Reviews"
+                                     if "Open" not in sp and "review" not in sp.lower():
+                                         address = sp
+                                         break
+                             if address: break
+
+                        # Heuristic-based
+                        street_suffixes = r'\b(St|Rd|Ave|Blvd|Ln|Dr|Way|Ct|Pl|Terr|Circle|Sq|Pkwy|Hwy|Street|Road|Avenue|Lane|Drive|Marg|Chowk|Nagar|Colony|Society|Complex|Plaza|Heights|Apartment|Floor|Suite|Ste)\b'
+                        if ',' in part or re.search(street_suffixes, part, re.I):
+                             if "review" not in part.lower() and " mi" not in part and len(part) < 120 and "Open" not in part:
+                                 address = part
+                                 break
+
+                    # === HIGHLIGHTS ===
+                    highlights = []
+                    # 1. Known attributes regex
+                    feature_patterns = [
+                        r'\b(In-store shopping)\b',
+                        r'\b(In-store pickup)\b', 
+                        r'\b(Curbside pickup)\b',
+                        r'\b(Delivery)\b',
+                        r'\b(Dine-in)\b',
+                        r'\b(Takeaway)\b',
+                        r'\b(No-contact delivery)\b',
+                        r'\b(Online appointments)\b',
+                        r'\b(On-site services)\b',
+                        r'\b(Available for new patients)\b',
+                    ]
+                    for pattern in feature_patterns:
+                        if re.search(pattern, clean_text, re.I):
+                             match = re.search(pattern, clean_text, re.I).group(1)
+                             if match not in highlights:
+                                 highlights.append(match)
+                    
+                    # 2. Quotes (reviews/highlights often in quotes)
+                    quote_matches = re.findall(r'"([^"]{10,60})"', clean_text)
+                    for q in quote_matches:
+                        if q not in highlights:
+                             highlights.append(f'"{q}"')
+
+                    # Service tags (chips) - usually in specific spans
+                    tags = item.select('span.hGz87c, span.LrzXr, div.I9NHl')
+                    for tag in tags:
+                        tag_text = tag.get_text(strip=True)
+                        if tag_text and len(tag_text) < 40 and tag_text not in highlights and tag_text != category:
+                             # Filter out junk
+                             if "Open" not in tag_text and "Closes" not in tag_text and "review" not in tag_text:
+                                highlights.append(tag_text)
+                            
+                    highlights = list(dict.fromkeys(highlights))[:4]
                             
                     # Website URL
                     website = ''
-                    # Look for explicit website action button
                     web_btn = item.select_one('a[aria-label="Website"]') or item.select_one('a:contains("Website")')
                     if web_btn:
                         website = web_btn.get('href', '')
                     else:
-                        # Heuristic: Find first non-Google link
                         links = item.select('a[href^="http"]')
                         for link in links:
                             href = link.get('href', '')
-                            # Skip Google Maps, Search, etc.
-                            if 'google.com' in href or 'google.co' in href:
-                                continue
-                            
-                            # Skip likely junk
-                            if 'search?' in href:
-                                continue
-                                
-                            # If it's an external link, it's likely the website
-                            website = href
-                            break
-                            
-                    # Address/Phone (sometimes extracted)
+                            if 'google.com' not in href and 'google.co' not in href and 'search?' not in href:
+                                website = href
+                                break
                     
                     local_results.append({
-                        'rank': idx,
+                        'rank': len(local_results) + 1,
                         'name': name,
                         'rating': rating,
                         'reviews': reviews,
                         'category': category,
+                        'address': address,
+                        'phone': phone,
+                        'timings': timings,
+                        'highlights': ', '.join(highlights) if highlights else '',
                         'website': website,
+                        'is_ad': False,
                         'type': 'extended'
                     })
                             

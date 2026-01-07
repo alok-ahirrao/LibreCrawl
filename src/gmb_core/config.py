@@ -61,6 +61,17 @@ class Config:
     CRAWLER_FAST_MODE = os.getenv('GMB_CRAWLER_FAST_MODE', 'true').lower() == 'true'
     CRAWLER_WORKERS = int(os.getenv('GMB_CRAWLER_WORKERS', '5'))  # Increased default for fast mode
     
+    # SERP API Configuration (for fast mode without browser)
+    # Supports ScraperAPI, SerpAPI, or similar services
+    # Set SERP_API_PROVIDER to 'scraperapi', 'serpapi', or 'none' (default: none - use browser)
+    SERP_API_PROVIDER = os.getenv('SERP_API_PROVIDER', 'none').lower()
+    SERP_API_KEY = os.getenv('SERP_API_KEY', '')  # API key for the SERP service
+    
+    # Anti-CAPTCHA Configuration (for automatic CAPTCHA solving)
+    # Supports 2captcha, anticaptcha, or 'none' (default: manual solving)
+    CAPTCHA_PROVIDER = os.getenv('CAPTCHA_PROVIDER', 'none').lower()
+    CAPTCHA_API_KEY = os.getenv('CAPTCHA_API_KEY', '')  # API key for CAPTCHA service
+    
     # Database
     DATABASE_FILE = os.getenv('GMB_DATABASE_FILE', 'users.db')
     

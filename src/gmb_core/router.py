@@ -822,6 +822,9 @@ def check_serp_ranking():
     depth = data.get('depth', 10)
     language = data.get('language', 'en')
     
+    # [NEW] Fast mode option - uses requests instead of Playwright (default: True)
+    fast_mode = data.get('fast_mode', True)
+    
     # [NEW] Optional lat/lng for accurate geo-context
     lat = data.get('lat')
     lng = data.get('lng')
@@ -880,7 +883,7 @@ def check_serp_ranking():
     if depth not in valid_depths:
         depth = 10
     
-    print(f"[SerpCheck] Keyword='{keyword}', Location='{location}' (Lat/Lng: {lat}, {lng}), Domain='{domain}'")
+    print(f"[SerpCheck] Keyword='{keyword}', Location='{location}' (Lat/Lng: {lat}, {lng}), Domain='{domain}', FastMode={fast_mode}")
     
     try:
         from .crawler.geo_driver import GeoCrawlerDriver
@@ -892,16 +895,57 @@ def check_serp_ranking():
             proxy_url=config.PROXY_URL if config.PROXY_ENABLED else None
         )
         
-        # Perform SERP scan
-        html, final_url = driver.scan_serp(
-            keyword=keyword,
-            location=location,
-            device=device,
-            depth=depth,
-            language=language,
-            lat=float(lat) if lat is not None else None,
-            lng=float(lng) if lng is not None else None
+        # [NEW] Determine if query requires full browser mode
+        # Local intent keywords that need geolocation spoofing
+        local_intent_keywords = ['near me', 'nearby', 'local', 'closest', 'around me', 'in my area']
+        has_local_intent = any(k in keyword.lower() for k in local_intent_keywords)
+        has_explicit_coords = lat is not None and lng is not None
+        needs_deep_crawl = depth > 10  # Multi-page crawling needs browser
+        
+        # Force browser mode if:
+        # 1. User explicitly disabled fast mode
+        # 2. Query has local intent (requires geolocation)
+        # 3. Depth > 10 (requires pagination via browser)
+        needs_browser = (
+            fast_mode == False or
+            has_local_intent or
+            needs_deep_crawl
         )
+        
+        html = None
+        final_url = None
+        used_fast_mode = False
+        
+        if not needs_browser:
+            # Try fast mode first
+            print(f"[SerpCheck] Attempting fast mode (requests-based)...")
+            html, final_url, success = driver.scan_serp_fast(
+                keyword=keyword,
+                location=location,
+                device=device,
+                depth=depth,
+                language=language
+            )
+            
+            if success and html:
+                used_fast_mode = True
+                print(f"[SerpCheck] ✓ Fast mode succeeded!")
+            else:
+                print(f"[SerpCheck] Fast mode failed, falling back to browser...")
+                html = None  # Reset for browser attempt
+        
+        # Fallback to browser mode if needed
+        if not html:
+            print(f"[SerpCheck] Using browser mode (Playwright)...")
+            html, final_url = driver.scan_serp(
+                keyword=keyword,
+                location=location,
+                device=device,
+                depth=depth,
+                language=language,
+                lat=float(lat) if lat is not None else None,
+                lng=float(lng) if lng is not None else None
+            )
         
         if not html:
             return jsonify({
