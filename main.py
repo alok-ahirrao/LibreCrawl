@@ -52,6 +52,10 @@ app.register_blueprint(gmb_bp)
 from src.competitor.routes import competitor_bp
 app.register_blueprint(competitor_bp)
 
+# [NEW] Register Keyword Research Blueprint
+from src.keyword.routes import keyword_bp
+app.register_blueprint(keyword_bp)
+
 def generate_random_password(length=16):
     """Generate a random password with letters, digits, and symbols"""
     alphabet = string.ascii_letters + string.digits + string.punctuation

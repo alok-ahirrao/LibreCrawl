@@ -10,3 +10,5 @@ psutil
 bcrypt==4.1.2
 markdown
 python-dotenv
+pytrends>=4.9.0
+google-generativeai
