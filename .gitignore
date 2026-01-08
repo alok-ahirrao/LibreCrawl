@@ -5,4 +5,3 @@ users.db
 browser_profile/
 
 .env
-.env.example

@@ -563,20 +563,55 @@ def discover_keywords():
                 'error': 'seed_keywords must be a non-empty list'
             }), 400
         
-        geo = data.get('geo', data.get('location', ''))
+        geo = data.get('geo', data.get('region', ''))
         niche = data.get('niche', '')
+        location = data.get('location', '')  # New: specific location for local SEO
         include_trends = data.get('include_trends', True)
         include_questions = data.get('include_questions', True)
+        include_niche_patterns = data.get('include_niche_patterns', True)
+        include_competitor_templates = data.get('include_competitor_templates', True)
         
-        # Get keyword data from external sources
+        # Use ENHANCED keyword discovery with all sources
         data_service = get_keyword_data_service(geo)
-        discovery_result = data_service.discover_keywords(
+        discovery_result = data_service.discover_keywords_enhanced(
             seed_keywords=seed_keywords,
             geo=geo,
+            niche=niche,
+            location=location,
             include_trends=include_trends,
             include_autocomplete=True,
-            include_questions=include_questions
+            include_questions=include_questions,
+            include_niche_patterns=include_niche_patterns and bool(niche),
+            include_competitor_templates=include_competitor_templates
         )
+        
+        # Generate long-tail keywords for the first seed keyword
+        long_tail_keywords = []
+        if seed_keywords:
+            try:
+                # Use patterns only for speed (skip alphabet soup to avoid rate limits on first load)
+                long_tail_keywords = data_service.generate_long_tail_keywords(
+                    seed_keyword=seed_keywords[0],
+                    include_alphabet_soup=False,  # Skip for speed
+                    include_patterns=True,
+                    include_modifiers=True
+                )
+            except Exception as e:
+                logger.warning(f"Long-tail generation failed: {e}")
+        
+        # Get People Also Ask questions
+        paa_questions = []
+        if seed_keywords:
+            try:
+                paa_questions = data_service.get_people_also_ask(seed_keywords[0])
+            except Exception as e:
+                logger.warning(f"PAA fetch failed: {e}")
+        
+        # Merge PAA questions with existing questions
+        all_questions = discovery_result.get('questions', []) + paa_questions
+        
+        # Combine all discovered keywords
+        all_discovered = discovery_result.get('discovered_keywords', []) + long_tail_keywords
         
         # Enhance with AI suggestions if available
         ai_service = get_ai_service()
@@ -593,28 +628,73 @@ def discover_keywords():
             except Exception as e:
                 logger.warning(f"AI suggestions failed: {e}")
                 ai_suggestions = {'keywords': [], 'error': str(e)}
+            
+            # Add opportunity scores to all keywords
+            try:
+                all_discovered = ai_service.enrich_keywords_with_scores(all_discovered)
+                all_questions = ai_service.enrich_keywords_with_scores(all_questions)
+            except Exception as e:
+                logger.warning(f"Opportunity scoring failed: {e}")
         
         response_data = {
             'seed_keywords': seed_keywords,
             'geo': geo,
-            'discovered_keywords': discovery_result.get('discovered_keywords', []),
+            'niche': niche,
+            'location': location,
+            'discovered_keywords': all_discovered,
             'trending_keywords': discovery_result.get('trending_keywords', []),
             'autocomplete_suggestions': discovery_result.get('autocomplete_suggestions', []),
-            'questions': discovery_result.get('questions', []),
+            'questions': all_questions,
+            'long_tail_keywords': long_tail_keywords + discovery_result.get('long_tail_keywords', []),
+            'niche_keywords': discovery_result.get('niche_keywords', []),
+            'local_keywords': discovery_result.get('local_keywords', []),
+            'competitor_keywords': discovery_result.get('competitor_keywords', []),
             'interest_data': discovery_result.get('interest_data', []),
             'ai_suggestions': ai_suggestions.get('keywords', []),
             'strategy_summary': ai_suggestions.get('strategy_summary', ''),
             'quick_wins': ai_suggestions.get('quick_wins', []),
             'high_value_targets': ai_suggestions.get('high_value_targets', []),
-            'total_discovered': discovery_result.get('total_discovered', 0)
+            'sources_used': discovery_result.get('sources_used', []),
+            'stats': discovery_result.get('stats', {}),
+            'total_discovered': len(all_discovered)
         }
 
         # DEBUG LOGGING to verify data presence
-        logger.info(f"Discovery complete. Stats: "
+        stats = discovery_result.get('stats', {})
+        logger.info(f"Enhanced Discovery complete. Stats: "
+                    f"Total={stats.get('total_unique', 0)}, "
                     f"Questions={len(response_data['questions'])}, "
-                    f"AI_Suggestions={len(response_data['ai_suggestions'])}, "
+                    f"NicheKWs={len(response_data['niche_keywords'])}, "
+                    f"LocalKWs={len(response_data['local_keywords'])}, "
+                    f"CompetitorKWs={len(response_data['competitor_keywords'])}, "
                     f"Trending={len(response_data['trending_keywords'])}, "
-                    f"Autocomplete={len(response_data['autocomplete_suggestions'])}")
+                    f"HighOpportunity={stats.get('high_opportunity', 0)}")
+        
+        # =====================================================================
+        # GENERATE AI ACTIONABLE INSIGHTS
+        # =====================================================================
+        # This provides strategic recommendations focused on bookings/revenue
+        actionable_insights = {}
+        business_goal = data.get('business_goal', 'bookings')
+        
+        if ai_service.is_available():
+            try:
+                actionable_insights = run_async(ai_service.generate_actionable_insights(
+                    keyword_data=discovery_result,
+                    business_goal=business_goal,
+                    business_type=niche,
+                    monthly_budget=data.get('monthly_budget')
+                ))
+                logger.info(f"AI Insights generated: {len(actionable_insights.get('quick_wins', []))} quick wins")
+            except Exception as e:
+                logger.warning(f"AI insights generation failed, using fallback: {e}")
+                actionable_insights = ai_service._generate_fallback_insights(discovery_result, business_goal)
+        else:
+            # Use rule-based fallback
+            actionable_insights = ai_service._generate_fallback_insights(discovery_result, business_goal)
+        
+        response_data['actionable_insights'] = actionable_insights
+        response_data['ai_insights_available'] = ai_service.is_available()
         
         return jsonify({
             'success': True,
@@ -719,6 +799,98 @@ def get_autocomplete():
         
     except Exception as e:
         logger.error(f"Autocomplete fetch failed: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@keyword_bp.route('/longtail', methods=['POST'])
+def get_long_tail_keywords():
+    """
+    Generate long-tail keyword variations using multiple techniques.
+    
+    Request body:
+    {
+        "keyword": "dental implants",
+        "include_alphabet_soup": true,  // Optional, default true
+        "include_patterns": true,       // Optional, default true
+        "include_modifiers": true       // Optional, default true
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+        
+        keyword = data.get('keyword', '')
+        if not keyword:
+            return jsonify({'success': False, 'error': 'keyword is required'}), 400
+        
+        include_alphabet_soup = data.get('include_alphabet_soup', True)
+        include_patterns = data.get('include_patterns', True)
+        include_modifiers = data.get('include_modifiers', True)
+        
+        data_service = get_keyword_data_service()
+        long_tails = data_service.generate_long_tail_keywords(
+            seed_keyword=keyword,
+            include_alphabet_soup=include_alphabet_soup,
+            include_patterns=include_patterns,
+            include_modifiers=include_modifiers
+        )
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'seed_keyword': keyword,
+                'long_tail_keywords': long_tails,
+                'total': len(long_tails)
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Long-tail keyword generation failed: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@keyword_bp.route('/paa', methods=['POST'])
+def get_people_also_ask():
+    """
+    Get 'People Also Ask' questions from Google SERP.
+    
+    Request body:
+    {
+        "keyword": "dental implants"
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+        
+        keyword = data.get('keyword', '')
+        if not keyword:
+            return jsonify({'success': False, 'error': 'keyword is required'}), 400
+        
+        data_service = get_keyword_data_service()
+        questions = data_service.get_people_also_ask(keyword)
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'keyword': keyword,
+                'questions': questions,
+                'total': len(questions)
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"People Also Ask fetch failed: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
@@ -882,6 +1054,104 @@ def enrich_keywords_with_data():
         
     except Exception as e:
         logger.error(f"Keyword enrichment failed: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@keyword_bp.route('/actionable-insights', methods=['POST'])
+def get_actionable_insights():
+    """
+    Generate AI-powered actionable insights from keyword discovery data.
+    Focuses on easy-to-rank keywords that will increase bookings/revenue.
+    
+    Request body:
+    {
+        "keyword_data": { ... discovery results ... },  // Optional, will fetch if not provided
+        "seed_keywords": ["dental", "insurance"],       // Required if keyword_data not provided
+        "geo": "US",
+        "niche": "dental",
+        "location": "Boston",
+        "business_goal": "bookings",      // bookings, revenue, traffic, brand_awareness
+        "business_type": "dental clinic", // Optional
+        "monthly_budget": "medium"        // Optional: low, medium, high
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+        
+        # Get or generate keyword data
+        keyword_data = data.get('keyword_data')
+        
+        if not keyword_data:
+            # Need to discover keywords first
+            seed_keywords = data.get('seed_keywords', data.get('keywords', []))
+            if not seed_keywords:
+                return jsonify({
+                    'success': False, 
+                    'error': 'Either keyword_data or seed_keywords is required'
+                }), 400
+            
+            geo = data.get('geo', '')
+            niche = data.get('niche', '')
+            location = data.get('location', '')
+            
+            # Discover keywords using enhanced method
+            data_service = get_keyword_data_service(geo)
+            keyword_data = data_service.discover_keywords_enhanced(
+                seed_keywords=seed_keywords,
+                geo=geo,
+                niche=niche,
+                location=location,
+                include_trends=True,
+                include_autocomplete=True,
+                include_questions=True,
+                include_niche_patterns=bool(niche),
+                include_competitor_templates=True
+            )
+        
+        # Get AI insights
+        business_goal = data.get('business_goal', 'bookings')
+        business_type = data.get('business_type', data.get('niche', ''))
+        monthly_budget = data.get('monthly_budget')
+        
+        ai_service = get_ai_service()
+        if not ai_service.is_available():
+            # Return rule-based fallback
+            insights = ai_service._generate_fallback_insights(keyword_data, business_goal)
+            return jsonify({
+                'success': True,
+                'data': {
+                    'insights': insights,
+                    'ai_available': False,
+                    'message': 'Using rule-based analysis. Set GEMINI_API_KEY for AI-powered insights.'
+                }
+            })
+        
+        # Generate AI insights
+        insights = run_async(ai_service.generate_actionable_insights(
+            keyword_data=keyword_data,
+            business_goal=business_goal,
+            business_type=business_type,
+            monthly_budget=monthly_budget
+        ))
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'insights': insights,
+                'ai_available': True,
+                'keyword_stats': keyword_data.get('stats', {}),
+                'total_keywords_analyzed': keyword_data.get('total_discovered', 0)
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Actionable insights generation failed: {e}")
         return jsonify({
             'success': False,
             'error': str(e)

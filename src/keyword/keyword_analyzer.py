@@ -335,6 +335,244 @@ class KeywordDensityAnalyzer:
             kw['in_headings'] = kw['keyword'] in heading_text
         return keywords
     
+    def analyze_keyword_placement(
+        self,
+        body_text: str,
+        keywords: List[dict],
+        meta_description: str = ""
+    ) -> List[dict]:
+        """
+        Analyze keyword placement in different sections of content.
+        
+        Args:
+            body_text: Full body text
+            keywords: List of keyword dicts
+            meta_description: Meta description text
+            
+        Returns:
+            Keywords with placement and prominence data
+        """
+        # Get first 200 words as "first paragraph"
+        words = body_text.split()
+        first_paragraph = ' '.join(words[:200]).lower() if len(words) > 200 else body_text.lower()
+        last_section = ' '.join(words[-100:]).lower() if len(words) > 100 else body_text.lower()
+        meta_lower = meta_description.lower()
+        
+        for kw in keywords:
+            keyword = kw['keyword'].lower()
+            
+            # Check placement locations
+            kw['in_first_paragraph'] = keyword in first_paragraph
+            kw['in_meta'] = keyword in meta_lower
+            kw['in_conclusion'] = keyword in last_section
+            
+            # Calculate prominence score (0-100)
+            prominence = 0
+            if kw.get('in_title', False):
+                prominence += 30
+            if kw.get('in_headings', False):
+                prominence += 25
+            if kw.get('in_first_paragraph', False):
+                prominence += 20
+            if kw.get('in_meta', False):
+                prominence += 15
+            if kw.get('in_conclusion', False):
+                prominence += 10
+            
+            kw['prominence_score'] = min(prominence, 100)
+            
+        return keywords
+    
+    def calculate_content_quality(
+        self,
+        body_text: str,
+        headings: List[dict],
+        title: str,
+        meta_description: str
+    ) -> dict:
+        """
+        Calculate content quality metrics.
+        
+        Returns:
+            Dict with quality metrics
+        """
+        words = body_text.split()
+        word_count = len(words)
+        
+        # Sentence count (rough estimate)
+        sentences = re.split(r'[.!?]+', body_text)
+        sentence_count = len([s for s in sentences if s.strip()])
+        
+        # Average sentence length
+        avg_sentence_length = word_count / max(sentence_count, 1)
+        
+        # Heading structure analysis
+        h1_count = sum(1 for h in headings if h['level'] == 1)
+        h2_count = sum(1 for h in headings if h['level'] == 2)
+        h3_count = sum(1 for h in headings if h['level'] == 3)
+        
+        # Calculate readability score (simplified Flesch-Kincaid estimate)
+        avg_word_length = sum(len(w) for w in words) / max(word_count, 1)
+        readability = max(0, min(100, 206.835 - (1.015 * avg_sentence_length) - (84.6 * (avg_word_length / 5))))
+        
+        # Content length assessment
+        if word_count < 300:
+            length_assessment = 'too_short'
+        elif word_count < 600:
+            length_assessment = 'short'
+        elif word_count < 1500:
+            length_assessment = 'optimal'
+        elif word_count < 3000:
+            length_assessment = 'long'
+        else:
+            length_assessment = 'very_long'
+        
+        # Title and meta analysis
+        title_length = len(title)
+        meta_length = len(meta_description)
+        
+        title_status = 'good' if 30 <= title_length <= 60 else ('too_short' if title_length < 30 else 'too_long')
+        meta_status = 'good' if 120 <= meta_length <= 160 else ('too_short' if meta_length < 120 else 'too_long')
+        
+        return {
+            'word_count': word_count,
+            'sentence_count': sentence_count,
+            'avg_sentence_length': round(avg_sentence_length, 1),
+            'readability_score': round(readability, 1),
+            'length_assessment': length_assessment,
+            'heading_structure': {
+                'h1_count': h1_count,
+                'h2_count': h2_count,
+                'h3_count': h3_count,
+                'total_headings': len(headings),
+                'has_proper_h1': h1_count == 1,
+                'has_subheadings': h2_count > 0
+            },
+            'title_analysis': {
+                'length': title_length,
+                'status': title_status
+            },
+            'meta_analysis': {
+                'length': meta_length,
+                'status': meta_status
+            }
+        }
+    
+    def generate_seo_recommendations(
+        self,
+        keywords: List[dict],
+        content_quality: dict,
+        title: str,
+        h1: str
+    ) -> List[dict]:
+        """
+        Generate actionable SEO recommendations.
+        
+        Returns:
+            List of recommendation dicts with priority
+        """
+        recommendations = []
+        
+        # Check for keyword stuffing
+        overstuffed = [kw for kw in keywords if kw['density'] > 3]
+        if overstuffed:
+            recommendations.append({
+                'type': 'warning',
+                'priority': 'high',
+                'category': 'keyword_stuffing',
+                'message': f"Reduce density for: {', '.join(kw['keyword'] for kw in overstuffed[:3])}",
+                'details': f"{len(overstuffed)} keywords exceed 3% density threshold"
+            })
+        
+        # Check for optimal keywords
+        optimal = [kw for kw in keywords if 1 <= kw['density'] <= 3]
+        if len(optimal) < 3:
+            recommendations.append({
+                'type': 'suggestion',
+                'priority': 'medium',
+                'category': 'keyword_optimization',
+                'message': "Add more keywords in the 1-3% optimal density range",
+                'details': f"Currently only {len(optimal)} keywords in optimal range"
+            })
+        
+        # Content length check
+        if content_quality['length_assessment'] == 'too_short':
+            recommendations.append({
+                'type': 'warning',
+                'priority': 'high',
+                'category': 'content_length',
+                'message': "Content is too short for good SEO",
+                'details': f"Aim for at least 600 words. Current: {content_quality['word_count']}"
+            })
+        
+        # Heading structure
+        if not content_quality['heading_structure']['has_proper_h1']:
+            recommendations.append({
+                'type': 'warning',
+                'priority': 'high',
+                'category': 'heading_structure',
+                'message': "Page should have exactly one H1 tag",
+                'details': f"Found {content_quality['heading_structure']['h1_count']} H1 tags"
+            })
+        
+        if not content_quality['heading_structure']['has_subheadings']:
+            recommendations.append({
+                'type': 'suggestion',
+                'priority': 'medium',
+                'category': 'heading_structure',
+                'message': "Add H2 subheadings to break up content",
+                'details': "Subheadings improve readability and SEO"
+            })
+        
+        # Title analysis
+        if content_quality['title_analysis']['status'] != 'good':
+            recommendations.append({
+                'type': 'suggestion',
+                'priority': 'medium',
+                'category': 'meta_tags',
+                'message': f"Title tag is {content_quality['title_analysis']['status'].replace('_', ' ')}",
+                'details': f"Ideal length is 30-60 characters. Current: {content_quality['title_analysis']['length']}"
+            })
+        
+        # Meta description
+        if content_quality['meta_analysis']['status'] == 'too_short':
+            recommendations.append({
+                'type': 'suggestion',
+                'priority': 'medium',
+                'category': 'meta_tags',
+                'message': "Meta description is too short",
+                'details': f"Aim for 120-160 characters. Current: {content_quality['meta_analysis']['length']}"
+            })
+        
+        # Readability
+        if content_quality['readability_score'] < 40:
+            recommendations.append({
+                'type': 'suggestion',
+                'priority': 'low',
+                'category': 'readability',
+                'message': "Content may be difficult to read",
+                'details': "Consider shorter sentences and simpler words"
+            })
+        
+        # Check for top keyword prominence
+        top_keywords = keywords[:5]
+        low_prominence = [kw for kw in top_keywords if kw.get('prominence_score', 0) < 30]
+        if low_prominence:
+            recommendations.append({
+                'type': 'suggestion',
+                'priority': 'medium',
+                'category': 'keyword_placement',
+                'message': "Top keywords have low prominence",
+                'details': f"Consider adding '{low_prominence[0]['keyword']}' to title, headings, or first paragraph"
+            })
+        
+        # Sort by priority
+        priority_order = {'high': 0, 'medium': 1, 'low': 2}
+        recommendations.sort(key=lambda x: priority_order.get(x['priority'], 3))
+        
+        return recommendations
+
+    
     async def analyze_page(
         self, 
         url: str, 
@@ -375,6 +613,29 @@ class KeywordDensityAnalyzer:
             # Check heading presence
             keywords = self.analyze_heading_keywords(extracted['headings'], keywords)
             
+            # NEW: Analyze keyword placement and prominence
+            keywords = self.analyze_keyword_placement(
+                extracted['body_text'],
+                keywords,
+                extracted['meta_description']
+            )
+            
+            # NEW: Calculate content quality metrics
+            content_quality = self.calculate_content_quality(
+                extracted['body_text'],
+                extracted['headings'],
+                extracted['title'],
+                extracted['meta_description']
+            )
+            
+            # NEW: Generate SEO recommendations
+            seo_recommendations = self.generate_seo_recommendations(
+                keywords,
+                content_quality,
+                extracted['title'],
+                extracted['h1']
+            )
+            
             result = {
                 'url': url,
                 'title': extracted['title'],
@@ -384,6 +645,9 @@ class KeywordDensityAnalyzer:
                 'unique_keywords': len(keywords),
                 'keywords': keywords,
                 'headings_count': len(extracted['headings']),
+                'headings': extracted['headings'],  # Include full heading data
+                'content_quality': content_quality,  # NEW
+                'seo_recommendations': seo_recommendations,  # NEW
                 'ai_analysis': None
             }
             

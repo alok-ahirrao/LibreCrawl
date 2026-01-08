@@ -108,13 +108,9 @@ class GeminiKeywordAI:
         if self.use_rest_api:
             # Try multiple models in order of preference (updated for 2026 availability)
             rest_models = [
-                'gemini-2.5-flash', 
-                'gemini-2.5-pro', 
-                'gemini-flash-latest', 
-                'gemini-pro-latest',
-                'gemini-2.0-flash',
-                'gemini-1.5-flash',  # Fallback
-                'gemini-pro'
+                'gemini-1.5-flash',
+                'gemini-1.5-pro',
+                'gemini-1.0-pro'
             ]
             
             for model in rest_models:
@@ -544,3 +540,379 @@ Provide detailed analysis. Return ONLY valid JSON:
         except Exception as e:
             logger.error(f"Keyword opportunity analysis failed: {e}")
             return {"error": str(e)}
+    
+    def calculate_opportunity_score(
+        self,
+        keyword: Dict,
+        traffic_weight: float = 0.35,
+        competition_weight: float = 0.30,
+        intent_weight: float = 0.20,
+        trend_weight: float = 0.15
+    ) -> int:
+        """
+        Calculate a composite opportunity score for a keyword.
+        
+        Formula:
+        Score = (Traffic × 0.35) + (1 - Competition × 0.30) + (Intent × 0.20) + (Trend × 0.15)
+        
+        Args:
+            keyword: Keyword dict with traffic_potential, competition, intent, etc.
+            
+        Returns:
+            Integer score from 0-100
+        """
+        # Traffic potential mapping (higher is better)
+        traffic_map = {
+            'very_high': 100,
+            'high': 80,
+            'medium': 50,
+            'low': 25,
+            'very_low': 10
+        }
+        
+        # Competition mapping (lower is better for opportunity)
+        competition_map = {
+            'very_low': 100,
+            'low': 75,
+            'medium': 50,
+            'high': 25,
+            'very_high': 10
+        }
+        
+        # Intent value mapping (transactional = higher commercial value)
+        intent_map = {
+            'transactional': 100,
+            'commercial': 85,
+            'comparison': 70,
+            'local': 65,
+            'informational': 50,
+            'navigational': 30,
+            'question': 55
+        }
+        
+        # Get scores (with defaults)
+        traffic = keyword.get('traffic_potential', 'medium')
+        competition = keyword.get('competition', 'medium')
+        intent = keyword.get('intent', keyword.get('type', 'related'))
+        is_trending = keyword.get('is_breakout', False) or keyword.get('growth', '')
+        
+        traffic_score = traffic_map.get(traffic, 50)
+        competition_score = competition_map.get(competition, 50)
+        intent_score = intent_map.get(intent, 50)
+        trend_score = 100 if is_trending else 50
+        
+        # Calculate weighted score
+        final_score = (
+            traffic_score * traffic_weight +
+            competition_score * competition_weight +
+            intent_score * intent_weight +
+            trend_score * trend_weight
+        )
+        
+        return min(100, max(0, int(final_score)))
+    
+    def enrich_keywords_with_scores(self, keywords: List[Dict]) -> List[Dict]:
+        """
+        Add opportunity scores to a list of keywords.
+        
+        Args:
+            keywords: List of keyword dicts
+            
+        Returns:
+            Same list with 'opportunity_score' field added
+        """
+        for kw in keywords:
+            kw['opportunity_score'] = self.calculate_opportunity_score(kw)
+        
+        # Sort by opportunity score (highest first)
+        return sorted(keywords, key=lambda x: x.get('opportunity_score', 0), reverse=True)
+
+    async def generate_actionable_insights(
+        self,
+        keyword_data: Dict,
+        business_goal: str = "bookings",
+        business_type: str = None,
+        monthly_budget: str = None
+    ) -> Dict:
+        """
+        Generate AI-powered actionable insights from keyword discovery data.
+        
+        This method analyzes all discovered keywords and provides:
+        - Quick wins (easy to rank, high conversion potential)
+        - High-value targets (worth the effort despite competition)
+        - Keywords to avoid (high authority competition, low ROI)
+        - Strategic recommendations for increasing bookings/revenue
+        - Prioritized action plan with difficulty and impact scores
+        
+        Args:
+            keyword_data: Full keyword discovery results dict
+            business_goal: Primary goal - 'bookings', 'revenue', 'traffic', 'brand_awareness'
+            business_type: Type of business (e.g., 'dental clinic', 'law firm')
+            monthly_budget: Optional budget context (e.g., 'low', 'medium', 'high')
+            
+        Returns:
+            Comprehensive actionable insights with prioritized recommendations
+        """
+        # If AI is not available, use rule-based fallback
+        if not self.is_available():
+            return self._generate_fallback_insights(keyword_data, business_goal)
+        
+        # Extract key data for analysis
+        all_keywords = keyword_data.get('discovered_keywords', [])[:50]
+        trending = keyword_data.get('trending_keywords', [])[:15]
+        questions = keyword_data.get('questions', [])[:15]
+        local_kws = keyword_data.get('local_keywords', [])[:15]
+        niche_kws = keyword_data.get('niche_keywords', [])[:15]
+        competitor_kws = keyword_data.get('competitor_keywords', [])[:15]
+        stats = keyword_data.get('stats', {})
+        
+        # Build context
+        context_parts = []
+        if business_type:
+            context_parts.append(f"Business Type: {business_type}")
+        if monthly_budget:
+            context_parts.append(f"SEO Budget Level: {monthly_budget}")
+        context_parts.append(f"Primary Goal: {business_goal.upper()}")
+        context = "\n".join(context_parts)
+        
+        prompt = f"""You are a senior SEO strategist and conversion optimization expert. 
+Your task is to analyze keyword data and provide ACTIONABLE INSIGHTS that will directly increase {business_goal}.
+
+{context}
+
+=== KEYWORD DATA ===
+Total Keywords Discovered: {stats.get('total_unique', len(all_keywords))}
+High Opportunity Keywords (Score 70+): {stats.get('high_opportunity', 0)}
+
+Top 20 Keywords (by opportunity score):
+{json.dumps([{'keyword': k.get('keyword'), 'score': k.get('opportunity_score', 0), 'type': k.get('type'), 'intent': k.get('intent', 'unknown'), 'source': k.get('source')} for k in all_keywords[:20]], indent=2)}
+
+Trending/Rising Keywords:
+{json.dumps([k.get('keyword') for k in trending[:10]])}
+
+Question Keywords (Content Opportunities):
+{json.dumps([k.get('keyword') for k in questions[:10]])}
+
+Local SEO Keywords:
+{json.dumps([k.get('keyword') for k in local_kws[:10]])}
+
+Niche-Specific Keywords:
+{json.dumps([k.get('keyword') for k in niche_kws[:10]])}
+
+Competitor-Style Keywords:
+{json.dumps([k.get('keyword') for k in competitor_kws[:10]])}
+
+=== YOUR ANALYSIS TASK ===
+Provide strategic recommendations focusing on:
+1. QUICK WINS - Keywords that are easy to rank for (low competition) AND have high booking/conversion potential
+2. HIGH-VALUE TARGETS - Keywords worth investing in despite higher competition (high revenue potential)
+3. AVOID LIST - Keywords dominated by high-authority sites (waste of resources)
+4. CONTENT STRATEGY - What type of content to create for each keyword category
+5. PRIORITIZED ACTION PLAN - Step-by-step actions ranked by impact and effort
+
+For each recommendation, assess:
+- Difficulty (1-10, where 1 is easiest)
+- Impact on {business_goal} (1-10, where 10 is highest impact)
+- Estimated time to see results
+- Specific action to take
+
+Return ONLY valid JSON:
+{{
+    "summary": "2-3 sentence strategic summary focused on {business_goal}",
+    
+    "quick_wins": [
+        {{
+            "keyword": "example easy keyword",
+            "difficulty": 3,
+            "impact": 8,
+            "action": "Create a dedicated landing page with clear CTA",
+            "content_type": "service page",
+            "time_to_rank": "2-4 weeks",
+            "why": "Low competition in local market, high booking intent"
+        }}
+    ],
+    
+    "high_value_targets": [
+        {{
+            "keyword": "example competitive keyword",
+            "difficulty": 7,
+            "impact": 9,
+            "action": "Create comprehensive pillar content with backlink strategy",
+            "content_type": "ultimate guide",
+            "time_to_rank": "3-6 months",
+            "why": "High search volume, strong commercial intent",
+            "investment_required": "Medium - requires quality backlinks"
+        }}
+    ],
+    
+    "avoid_keywords": [
+        {{
+            "keyword": "example hard keyword",
+            "reason": "Dominated by WebMD, Mayo Clinic - unrealistic to compete",
+            "alternative": "Focus on local variant instead"
+        }}
+    ],
+    
+    "content_strategy": [
+        {{
+            "priority": 1,
+            "content_type": "Service landing pages",
+            "target_keywords": ["keyword1", "keyword2"],
+            "description": "Create conversion-optimized service pages for local keywords",
+            "expected_impact": "Direct {business_goal} increase"
+        }}
+    ],
+    
+    "action_plan": [
+        {{
+            "week": "Week 1-2",
+            "priority": "HIGH",
+            "action": "Create 3 quick-win landing pages",
+            "target_keywords": ["keyword1", "keyword2", "keyword3"],
+            "expected_outcome": "Quick visibility for low-competition terms"
+        }}
+    ],
+    
+    "metrics_to_track": [
+        "Ranking position for quick-win keywords",
+        "Organic traffic to service pages",
+        "Conversion rate from organic traffic"
+    ],
+    
+    "overall_difficulty_assessment": "Medium - Good opportunities exist for local and long-tail terms",
+    
+    "booking_conversion_tips": [
+        "Add clear CTAs to all landing pages",
+        "Include phone number prominently for local searches",
+        "Add booking forms above the fold"
+    ],
+    
+    "estimated_results_timeline": {{
+        "quick_wins": "2-4 weeks for initial rankings",
+        "moderate_terms": "2-3 months for page 1",
+        "competitive_terms": "4-6+ months with consistent effort"
+    }}
+}}"""
+
+        try:
+            response_text = await self._generate_content(prompt)
+            result = self._parse_json_response(response_text)
+            
+            if not result or not result.get('quick_wins'):
+                logger.warning("AI insights response was empty or malformed, providing fallback")
+                return self._generate_fallback_insights(keyword_data, business_goal)
+            
+            # Add metadata
+            result['generated_at'] = 'AI Analysis'
+            result['business_goal'] = business_goal
+            result['keywords_analyzed'] = len(all_keywords)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Actionable insights generation failed: {e}")
+            return self._generate_fallback_insights(keyword_data, business_goal)
+    
+    def _generate_fallback_insights(self, keyword_data: Dict, business_goal: str) -> Dict:
+        """Generate rule-based fallback insights when AI is unavailable."""
+        try:
+            # Safer defaults
+            if not keyword_data:
+                keyword_data = {}
+                
+            all_keywords = keyword_data.get('discovered_keywords', []) or []
+            local_kws = keyword_data.get('local_keywords', []) or []
+            questions = keyword_data.get('questions', []) or []
+            
+            # Ensure lists contain dicts
+            all_keywords = [k for k in all_keywords if isinstance(k, dict)]
+            local_kws = [k for k in local_kws if isinstance(k, dict)]
+        
+            # Simple rule-based categorization
+            quick_wins = []
+            high_value = []
+            
+            for kw in all_keywords[:30]:
+                score = kw.get('opportunity_score', 0)
+                kw_type = kw.get('type', '')
+                intent = kw.get('intent', '')
+                
+                # Quick wins: high score + local or transactional
+                if score >= 75 and (kw_type == 'local' or intent == 'transactional'):
+                    quick_wins.append({
+                        'keyword': kw.get('keyword'),
+                        'difficulty': 3,
+                        'impact': 8,
+                        'action': 'Create targeted landing page',
+                        'content_type': 'service page',
+                        'time_to_rank': '2-4 weeks',
+                        'why': 'High opportunity score with commercial intent'
+                    })
+                # High value: good score + trending or high traffic potential
+                elif score >= 60 and kw.get('traffic_potential') in ['high', 'very_high']:
+                    high_value.append({
+                        'keyword': kw.get('keyword'),
+                        'difficulty': 6,
+                        'impact': 8,
+                        'action': 'Create comprehensive content',
+                        'content_type': 'guide',
+                        'time_to_rank': '2-3 months',
+                        'why': 'Strong traffic potential'
+                    })
+            
+            return {
+                'summary': f'Based on {len(all_keywords)} keywords analyzed, focus on local and transactional keywords for fastest {business_goal} impact.',
+                'quick_wins': quick_wins[:5],
+                'high_value_targets': high_value[:5],
+                'avoid_keywords': [],
+                'content_strategy': [
+                    {
+                        'priority': 1,
+                        'content_type': 'Local landing pages',
+                        'target_keywords': [k['keyword'] for k in local_kws[:3]],
+                        'description': 'Create location-specific service pages',
+                        'expected_impact': f'Direct {business_goal} increase'
+                    }
+                ],
+                'action_plan': [
+                    {
+                        'week': 'Week 1-2',
+                        'priority': 'HIGH',
+                        'action': 'Create pages for top 3 quick-win keywords',
+                        'target_keywords': [k['keyword'] for k in quick_wins[:3]],
+                        'expected_outcome': 'Quick visibility gains'
+                    }
+                ],
+                'metrics_to_track': [
+                    'Keyword ranking positions',
+                    'Organic traffic growth',
+                    f'{business_goal.capitalize()} from organic search'
+                ],
+                'overall_difficulty_assessment': 'Moderate - Focus on local and long-tail keywords first',
+                'booking_conversion_tips': [
+                    'Add clear call-to-action buttons',
+                    'Include contact forms on all pages',
+                    'Display phone number prominently'
+                ],
+                'estimated_results_timeline': {
+                    'quick_wins': '2-4 weeks',
+                    'moderate_terms': '2-3 months',
+                    'competitive_terms': '4-6 months'
+                },
+                'generated_at': 'Rule-Based Fallback',
+                'business_goal': business_goal,
+                'keywords_analyzed': len(all_keywords)
+            }
+        except Exception as e:
+            logger.error(f"Fallback generation failed: {e}")
+            return {
+                'summary': f"Could not generate insights for '{business_goal}'. Please try exploring keywords manually.",
+                'quick_wins': [],
+                'high_value_targets': [],
+                'avoid_keywords': [],
+                'content_strategy': [],
+                'action_plan': [],
+                'metrics_to_track': [],
+                'generated_at': 'Error Fallback',
+                'error': str(e)
+            }
