@@ -239,13 +239,13 @@ class KeywordDataService:
             try:
                 logger.info(f"Using pytrends for seed-keyword related data: {keywords}")
                 
-                # Create a fresh client
+                # Create a fresh client with better retry logic
                 pytrends = TrendReq(
                     hl='en-US', 
                     tz=360, 
                     timeout=(10, 25), 
-                    retries=0, 
-                    backoff_factor=0.1
+                    retries=3, 
+                    backoff_factor=1
                 )
                 
                 # Helper to build payload with fallbacks
@@ -259,28 +259,37 @@ class KeywordDataService:
                 
                 # Robust Multi-Stage Fallback Strategy (Silent)
                 payload_success = False
-                try:
-                    fetch_trends(pytrends, timeframe, region)
-                    payload_success = True
-                except Exception:
+                
+                # Helper to attempt fetch with delay
+                def try_fetch(tf, g, single_kw=False):
                     try:
-                        fetch_trends(pytrends, 'now 7-d', region)
-                        payload_success = True
+                        time.sleep(1) # Add delay between attempts
+                        if single_kw and len(keywords) > 0:
+                            pytrends.build_payload(kw_list=[keywords[0]], timeframe=tf, geo=g)
+                        else:
+                            fetch_trends(pytrends, tf, g)
+                        return True
                     except Exception:
-                        try:
-                            fetch_trends(pytrends, timeframe, '')
-                            payload_success = True
-                        except Exception:
-                            try:
-                                if len(keywords) > 1:
-                                    pytrends.build_payload(
-                                        kw_list=[keywords[0]],
-                                        timeframe=timeframe,
-                                        geo=region
-                                    )
-                                    payload_success = True
-                            except Exception:
-                                logger.info("pytrends fallback exhausted")
+                        return False
+
+                # 1. Try exact request
+                if try_fetch(timeframe, region):
+                    payload_success = True
+                
+                # 2. Try shorter timeframe (often fixes "not enough data")
+                elif try_fetch('now 7-d', region):
+                    payload_success = True
+                    
+                # 3. Try broader geo (worldwide)
+                elif try_fetch(timeframe, ''):
+                    payload_success = True
+                    
+                # 4. Try single keyword (less likely to unrelated-term error)
+                elif try_fetch(timeframe, region, single_kw=True):
+                    payload_success = True
+                    
+                else:
+                    logger.info("pytrends fallback exhausted")
                 
                 if payload_success:
                     # Get related queries
@@ -732,17 +741,29 @@ class KeywordDataService:
             try:
                 trends = self.get_trending_keywords(seed_keywords, geo=region)
                 
-                # Add related queries
+                # Build seed word set for relevance filtering
+                seed_words = set()
+                for seed in seed_keywords:
+                    seed_words.update(seed.lower().split())
+                # Remove common stop words
+                seed_words -= {'the', 'a', 'an', 'in', 'on', 'at', 'for', 'to', 'of', 'and', 'or', 'near', 'me', 'best', 'top'}
+                
+                def is_relevant(keyword: str) -> bool:
+                    """Check if keyword has at least 1 word overlap with seeds."""
+                    kw_words = set(keyword.lower().split())
+                    return len(kw_words.intersection(seed_words)) >= 1
+                
+                # Add related queries (filtered for relevance)
                 for q in trends.get('related_queries', []):
                     kw = q['keyword']
-                    if kw.lower() not in all_keywords:
+                    if kw.lower() not in all_keywords and is_relevant(kw):
                         all_keywords.add(kw.lower())
                         result['trending_keywords'].append(q)
                 
-                # Add rising queries with high priority
+                # Add rising queries with high priority (filtered for relevance)
                 for q in trends.get('rising_queries', []):
                     kw = q['keyword']
-                    if kw.lower() not in all_keywords:
+                    if kw.lower() not in all_keywords and is_relevant(kw):
                         all_keywords.add(kw.lower())
                         q['priority'] = 'high'  # Rising queries are high priority
                         result['trending_keywords'].append(q)

@@ -3,7 +3,7 @@ Keyword Research API Routes
 Provides endpoints for keyword density analysis and competitor keyword research.
 """
 
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, session
 import asyncio
 import logging
 import threading
@@ -12,6 +12,7 @@ from .ai_service import GeminiKeywordAI
 from .keyword_analyzer import KeywordDensityAnalyzer
 from .competitor_keywords import CompetitorKeywordResearcher
 from .keyword_data import KeywordDataService
+from .keyword_db import save_keyword_history, get_keyword_history, get_keyword_history_item, delete_keyword_history
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +120,6 @@ def analyze_keyword_density():
         
         analyzer = get_analyzer()
         
-        # Run async analysis
         result = run_async(analyzer.analyze_page(url, use_ai=use_ai, top_n=top_n))
         
         if 'error' in result and result.get('error'):
@@ -128,6 +128,18 @@ def analyze_keyword_density():
                 'error': result['error']
             }), 400
         
+        # Save to history
+        try:
+            user_id = session.get('user_id')
+            save_keyword_history(
+                type='density',
+                input_params={'url': url, 'use_ai': use_ai, 'top_n': top_n},
+                results=result,
+                user_id=user_id
+            )
+        except Exception as e:
+            logger.error(f"Failed to save density history: {e}")
+
         return jsonify({
             'success': True,
             'data': result
@@ -217,6 +229,18 @@ def competitor_research():
             competitor_url=competitor_url,
             use_ai=use_ai
         ))
+        
+        # Save to history
+        try:
+            user_id = session.get('user_id')
+            save_keyword_history(
+                type='competitor',
+                input_params={'your_url': your_url, 'competitor_url': competitor_url, 'use_ai': use_ai},
+                results=result,
+                user_id=user_id
+            )
+        except Exception as e:
+            logger.error(f"Failed to save competitor history: {e}")
         
         return jsonify({
             'success': True,
@@ -696,6 +720,23 @@ def discover_keywords():
         response_data['actionable_insights'] = actionable_insights
         response_data['ai_insights_available'] = ai_service.is_available()
         
+        # Save to history
+        try:
+            user_id = session.get('user_id')
+            save_keyword_history(
+                type='discovery',
+                input_params={
+                    'seed_keywords': seed_keywords,
+                    'geo': geo,
+                    'niche': niche,
+                    'location': location
+                },
+                results=response_data,
+                user_id=user_id
+            )
+        except Exception as e:
+            logger.error(f"Failed to save discovery history: {e}")
+        
         return jsonify({
             'success': True,
             'data': response_data
@@ -1157,3 +1198,356 @@ def get_actionable_insights():
             'error': str(e)
         }), 500
 
+
+# =============================================================================
+# HISTORY ENDPOINTS
+# =============================================================================
+
+@keyword_bp.route('/history', methods=['GET'])
+def history_list():
+    """Get keyword research history"""
+    try:
+        user_id = session.get('user_id')
+        type_filter = request.args.get('type')
+        limit = request.args.get('limit', 50, type=int)
+        
+        history = get_keyword_history(user_id, type_filter, limit)
+        return jsonify({'success': True, 'data': history})
+    except Exception as e:
+        logger.error(f"Failed to fetch history: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@keyword_bp.route('/history/<int:id>', methods=['GET'])
+def history_item(id):
+    """Get specific history item data"""
+    try:
+        user_id = session.get('user_id')
+        item = get_keyword_history_item(id, user_id)
+        
+        if not item:
+            return jsonify({'success': False, 'error': 'History item not found'}), 404
+            
+        return jsonify({'success': True, 'data': item})
+    except Exception as e:
+        logger.error(f"Failed to fetch history item: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@keyword_bp.route('/history/<int:id>', methods=['DELETE'])
+def delete_history_item(id):
+    """Delete history item"""
+    try:
+        user_id = session.get('user_id')
+        success = delete_keyword_history(id, user_id)
+        return jsonify({'success': success})
+    except Exception as e:
+        logger.error(f"Failed to delete history item: {e}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# =============================================================================
+# FULL KEYWORD RESEARCH WORKFLOW ENDPOINTS
+# =============================================================================
+
+@keyword_bp.route('/research/full-workflow', methods=['POST'])
+def run_full_research_workflow():
+    """
+    Run the complete 9-step keyword research workflow.
+    
+    Request body:
+    {
+        "business_type": "dental clinic",
+        "services": ["dental implants", "teeth whitening", "root canal"],
+        "location": "Boston, MA",       // Optional
+        "domain": "example.com",        // Optional, for cannibalization check
+        "business_goal": "traffic",     // traffic, conversions, or authority
+        "geo": "US"                     // Optional, region code
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+        
+        business_type = data.get('business_type')
+        services = data.get('services', [])
+        
+        if not business_type:
+            return jsonify({'success': False, 'error': 'business_type is required'}), 400
+        if not services or not isinstance(services, list):
+            return jsonify({'success': False, 'error': 'services must be a non-empty list'}), 400
+        
+        location = data.get('location')
+        domain = data.get('domain')
+        business_goal = data.get('business_goal', 'traffic')
+        geo = data.get('geo', '')
+        max_keywords = data.get('max_keywords', 100)
+        
+        # Import workflow module
+        from .research_workflow import KeywordResearchWorkflow
+        
+        workflow = KeywordResearchWorkflow(geo=geo)
+        
+        result = run_async(workflow.run_full_workflow(
+            business_type=business_type,
+            services=services,
+            location=location,
+            domain=domain,
+            business_goal=business_goal,
+            max_keywords=max_keywords
+        ))
+        
+        # Save to history
+        try:
+            user_id = session.get('user_id')
+            save_keyword_history(
+                type='workflow',
+                input_params={
+                    'business_type': business_type,
+                    'services': services,
+                    'location': location,
+                    'domain': domain,
+                    'business_goal': business_goal
+                },
+                results=result,
+                user_id=user_id
+            )
+        except Exception as e:
+            logger.error(f"Failed to save workflow history: {e}")
+        
+        return jsonify({
+            'success': True,
+            'data': result
+        })
+        
+    except Exception as e:
+        logger.error(f"Full research workflow failed: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@keyword_bp.route('/cannibalization', methods=['POST'])
+def check_cannibalization():
+    """
+    Check for keyword cannibalization on a domain.
+    
+    Request body:
+    {
+        "domain": "example.com",
+        "urls": ["https://example.com/page1", "https://example.com/page2"],  // Optional
+        "max_pages": 30,        // Optional
+        "min_density": 0.5      // Optional
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+        
+        domain = data.get('domain')
+        
+        if not domain:
+            return jsonify({'success': False, 'error': 'domain is required'}), 400
+        
+        urls = data.get('urls')
+        max_pages = data.get('max_pages', 30)
+        min_density = data.get('min_density', 0.5)
+        
+        # Import cannibalization module
+        from .cannibalization import KeywordCannibalizationDetector
+        
+        detector = KeywordCannibalizationDetector(get_ai_service())
+        
+        result = run_async(detector.analyze_domain(
+            domain=domain,
+            urls=urls,
+            max_pages=max_pages,
+            min_density=min_density
+        ))
+        
+        # Save to history
+        try:
+            user_id = session.get('user_id')
+            save_keyword_history(
+                type='cannibalization',
+                input_params={
+                    'domain': domain,
+                    'max_pages': max_pages,
+                    'min_density': min_density
+                },
+                results=result,
+                user_id=user_id
+            )
+        except Exception as e:
+            logger.error(f"Failed to save cannibalization history: {e}")
+        
+        return jsonify({
+            'success': True,
+            'data': result
+        })
+        
+    except Exception as e:
+        logger.error(f"Cannibalization check failed: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@keyword_bp.route('/content-mapping', methods=['POST'])
+def map_content():
+    """
+    Map keyword clusters to content types.
+    
+    Request body:
+    {
+        "clusters": [
+            {"topic": "Dental Implants", "keywords": ["dental implants", "implant cost"]},
+            {"topic": "Teeth Whitening", "keywords": ["teeth whitening", "white teeth"]}
+        ],
+        "intent_data": {              // Optional
+            "transactional": ["buy implants"],
+            "informational": ["what is implant"]
+        },
+        "business_goal": "traffic"    // Optional: traffic, conversions, authority
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+        
+        clusters = data.get('clusters', [])
+        
+        if not clusters or not isinstance(clusters, list):
+            return jsonify({'success': False, 'error': 'clusters must be a non-empty list'}), 400
+        
+        intent_data = data.get('intent_data', {})
+        business_goal = data.get('business_goal', 'traffic')
+        
+        # Import content mapper
+        from .content_mapper import ContentMapper
+        
+        mapper = ContentMapper(get_ai_service())
+        
+        # Map clusters to content types
+        mappings = mapper.map_clusters_to_content(clusters, intent_data)
+        
+        # Prioritize content creation
+        prioritized = mapper.prioritize_content_creation(mappings, business_goal)
+        
+        # Create content calendar
+        calendar = mapper.create_content_calendar(prioritized[:12], posts_per_week=2)
+        
+        # Generate briefs for top 3 priorities
+        briefs = []
+        for gap in prioritized[:3]:
+            brief = mapper.generate_content_brief(gap)
+            briefs.append(brief)
+        
+        result_data = {
+            'mappings': mappings,
+            'prioritized_gaps': prioritized,
+            'content_calendar': calendar,
+            'sample_briefs': briefs,
+            'summary': {
+                'total_mappings': len(mappings),
+                'gaps_identified': len(prioritized),
+                'weeks_of_content': len(calendar) // 2 if calendar else 0
+            }
+        }
+        
+        # Save to history
+        try:
+            user_id = session.get('user_id')
+            save_keyword_history(
+                type='content_map',
+                input_params={
+                    'clusters': clusters,
+                    'business_goal': business_goal
+                },
+                results=result_data,
+                user_id=user_id
+            )
+        except Exception as e:
+            logger.error(f"Failed to save content_map history: {e}")
+        
+        return jsonify({
+            'success': True,
+            'data': result_data
+        })
+        
+    except Exception as e:
+        logger.error(f"Content mapping failed: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@keyword_bp.route('/content-brief', methods=['POST'])
+def generate_content_brief():
+    """
+    Generate a content brief for a specific keyword cluster.
+    
+    Request body:
+    {
+        "cluster_topic": "Dental Implants",
+        "primary_keyword": "dental implants cost",
+        "secondary_keywords": ["implant price", "how much do implants cost"],
+        "intent": "commercial",
+        "recommended_content_type": "service_page"  // Optional, will be auto-detected
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+        
+        primary_keyword = data.get('primary_keyword')
+        
+        if not primary_keyword:
+            return jsonify({'success': False, 'error': 'primary_keyword is required'}), 400
+        
+        # Build mapping dict for brief generation
+        from .content_mapper import ContentMapper
+        
+        mapper = ContentMapper(get_ai_service())
+        
+        # If content type not provided, detect it
+        content_type = data.get('recommended_content_type')
+        if not content_type:
+            classified = mapper.classify_content_type(
+                primary_keyword,
+                intent=data.get('intent'),
+                cluster_keywords=data.get('secondary_keywords', [])
+            )
+            content_type = classified['content_type']
+        
+        mapping = {
+            'cluster_topic': data.get('cluster_topic', primary_keyword.title()),
+            'primary_keyword': primary_keyword,
+            'secondary_keywords': data.get('secondary_keywords', []),
+            'intent': data.get('intent', 'informational'),
+            'recommended_content_type': content_type,
+            'content_type_name': mapper.content_types.get(content_type, {}).get('name', 'Blog Post')
+        }
+        
+        brief = mapper.generate_content_brief(mapping)
+        
+        return jsonify({
+            'success': True,
+            'data': brief
+        })
+        
+    except Exception as e:
+        logger.error(f"Content brief generation failed: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500

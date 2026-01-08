@@ -43,6 +43,8 @@ Compress(app)
 
 # Initialize database on startup
 init_db()
+from src.keyword.keyword_db import init_keyword_tables
+init_keyword_tables()
 
 # [NEW] Register GMB Blueprint
 from src.gmb_core.router import gmb_bp

@@ -39,176 +39,96 @@ class GeminiKeywordAI:
     - SEO recommendations
     """
     
+    # Global rate limiting state
+    _global_semaphore = asyncio.Semaphore(1)  # Limit to 1 concurrent request
+    _circuit_open_until = 0
+    _consecutive_errors = 0
+    
     def __init__(self, api_key: Optional[str] = None):
         """
         Initialize Gemini AI service.
-        
         Args:
-            api_key: Google Gemini API key. If not provided, reads from GEMINI_API_KEY env var.
+            api_key: Google Gemini API key.
         """
         self.api_key = api_key or os.getenv('GEMINI_API_KEY')
-        self.model = None
-        self.model_name = None
-        self.available = False
-        self.use_legacy_api = False
-        self.use_rest_api = False
+        self.available = bool(self.api_key)
+        self.use_rest_api = True # Force REST API for stability
         
-        # Note: We rely on requests for REST API, which is a standard dependency
+        # Hardcoded specific model as requested
+        self.model_name = 'gemini-2.5-flash-lite'
         
         if not self.api_key:
             logger.warning("Gemini AI not available - GEMINI_API_KEY not set")
-            return
-        
-        try:
-            # OPTION 1: Try new library API (GenerativeModel)
-            if GEMINI_AVAILABLE and genai:
-                try:
-                    genai.configure(api_key=self.api_key)
-                    if hasattr(genai, 'GenerativeModel'):
-                        logger.info("GenerativeModel class found - using library API")
-                        model_names = ['gemini-1.5-flash', 'gemini-pro']
-                        for model_name in model_names:
-                            try:
-                                self.model = genai.GenerativeModel(model_name)
-                                self.model_name = model_name
-                                self.available = True
-                                logger.info(f"Gemini AI initialized with GenerativeModel: {model_name}")
-                                break
-                            except Exception as e:
-                                logger.debug(f"Model {model_name} failed: {e}")
-                                continue
-                except Exception as e:
-                    logger.warning(f"Library initialization failed: {e}")
-            
-            # OPTION 2: Fallback to REST API (Bypasses library issues)
-            if not self.available:
-                logger.info("Falling back to REST API (requests)")
-                self.use_rest_api = True
-                self.available = True
-                
-        except Exception as e:
-            logger.error(f"Failed to initialize Gemini AI: {e}")
-            # Last ditch attempt - still try REST
-            self.use_rest_api = True
-            self.available = True
-    
+
     def is_available(self) -> bool:
-        """Check if Gemini AI is available and configured."""
-        return self.available
+        """Check if Gemini AI is available and not circuit-broken."""
+        if not self.available:
+            return False
+            
+        import time
+        # Check circuit breaker
+        if time.time() < GeminiKeywordAI._circuit_open_until:
+            return False
+            
+        return True
     
     async def _generate_content(self, prompt: str) -> str:
-        """Generate content using appropriate API (Python 3.8 compatible)."""
-        import functools
-        import requests
-        
-        loop = asyncio.get_event_loop()
-        
-        # Method 1: REST API (Most robust fallback)
-        # Method 1: REST API (Most robust fallback)
-        if self.use_rest_api:
-            # Try multiple models in order of preference (updated for 2026 availability)
-            rest_models = [
-                'gemini-1.5-flash',
-                'gemini-1.5-pro',
-                'gemini-1.0-pro'
-            ]
-            
-            for model in rest_models:
-                try:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.api_key}"
-                    headers = {'Content-Type': 'application/json'}
-                    data = {
-                        "contents": [{
-                            "parts": [{"text": prompt}]
-                        }]
-                    }
-                    
-                    def call_rest(u, d):
-                        response = requests.post(u, headers=headers, json=d, timeout=60)
-                        # If 404, raise specific error to try next model
-                        if response.status_code == 404:
-                            raise ValueError(f"Model {model} not found (404)")
-                        if response.status_code == 429:
-                             raise ValueError(f"Model {model} rate limited (429)")
-                        response.raise_for_status()
-                        return response.json()
-                    
-                    result = await loop.run_in_executor(None, functools.partial(call_rest, url, data))
-                    
-                    # Parse response
-                    try:
-                        return result['candidates'][0]['content']['parts'][0]['text']
-                    except (KeyError, IndexError):
-                        logger.warning(f"Unexpected REST API response format from {model}: {result}")
-                        continue # Try next model if response format is weird
-                        
-                except Exception as e:
-                    logger.warning(f"REST API call failed for {model}: {e}")
-                    import time
-                    time.sleep(1) # Short delay before failing over to next model
-                    continue
-            
-            # If all models failed, try to list available models found via REST to debug
-            try:
-                list_url = f"https://generativelanguage.googleapis.com/v1beta/models?key={self.api_key}"
-                list_response = requests.get(list_url, timeout=10)
-                if list_response.status_code == 200:
-                    available = list_response.json().get('models', [])
-                    model_names = [m['name'] for m in available]
-                    logger.error(f"All specific models failed. Available models for this key: {model_names}")
-                    
-                    # Try to use the first available generateContent model (excluding embedding/imagen)
-                    for m in available:
-                        m_name = m['name']
-                        # Loose check for generation capabilities if supportedGenerationMethods is missing or strict
-                        methods = m.get('supportedGenerationMethods', [])
-                        
-                        is_generative = 'generateContent' in methods
-                        # Fallback heuristic: name suggests it's a text model and not embedding/image-only
-                        if not is_generative and ('flash' in m_name or 'pro' in m_name or 'ultra' in m_name):
-                             if 'embedding' not in m_name and 'imagen' not in m_name and 'veo' not in m_name:
-                                 is_generative = True
-                                 
-                        if is_generative:
-                            model_name = m_name.replace('models/', '')
-                            logger.info(f"Attempting auto-discovered model: {model_name}")
-                            try:
-                                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={self.api_key}"
-                                headers = {'Content-Type': 'application/json'}
-                                data = {
-                                    "contents": [{"parts": [{"text": prompt}]}]
-                                }
-                                response = requests.post(url, headers=headers, json=data, timeout=30)
-                                response.raise_for_status()
-                                result = response.json()
-                                return result['candidates'][0]['content']['parts'][0]['text']
-                            except Exception as e:
-                                logger.error(f"Auto-discovered model {model_name} failed: {e}")
-                else:
-                    logger.error(f"Could not list models via REST: {list_response.status_code} {list_response.text}")
-            except Exception as e:
-                logger.error(f"Failed to list models via REST: {e}")
+        """Generate content using REST API with strict rate limiting."""
+        if not self.is_available():
+             return ""
 
-            logger.error("All REST API models failed")
+        import requests
+        import time
+        
+        # Acquire semaphore to limit concurrency
+        async with GeminiKeywordAI._global_semaphore:
+            # Re-check circuit breaker after acquiring lock
+            if time.time() < GeminiKeywordAI._circuit_open_until:
+                logger.warning("Circuit breaker is open, skipping request")
+                return ""
+
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={self.api_key}"
+                headers = {'Content-Type': 'application/json'}
+                data = {"contents": [{"parts": [{"text": prompt}]}]}
+                
+                # Simple retries for network blips, NOT for rate limits
+                for attempt in range(2):
+                    try:
+                        loop = asyncio.get_event_loop()
+                        func = functools.partial(requests.post, url, headers=headers, json=data, timeout=30)
+                        response = await loop.run_in_executor(None, func)
+                        
+                        if response.status_code == 429:
+                            GeminiKeywordAI._consecutive_errors += 1
+                            logger.warning(f"Rate limit hit ({GeminiKeywordAI._consecutive_errors}/3)")
+                            
+                            if GeminiKeywordAI._consecutive_errors >= 3:
+                                logger.error("Circuit breaker ACTIVATED: Pausing AI for 60s")
+                                GeminiKeywordAI._circuit_open_until = time.time() + 60
+                                GeminiKeywordAI._consecutive_errors = 0
+                                return ""
+                                
+                            # Short exponential backoff for expected rate limits
+                            await asyncio.sleep(2 ** (attempt + 1)) 
+                            continue
+                            
+                        if response.status_code == 200:
+                            GeminiKeywordAI._consecutive_errors = 0 # Success resets counter
+                            result = response.json()
+                            return result['candidates'][0]['content']['parts'][0]['text']
+                            
+                        response.raise_for_status()
+                        
+                    except Exception as e:
+                        if attempt == 1: raise e
+                        await asyncio.sleep(1)
+                        
+            except Exception as e:
+                logger.error(f"AI Generation failed: {e}")
+                
             return ""
 
-        # Method 2: Legacy Library API (generate_text)
-        elif self.use_legacy_api:
-            # ... existing legacy code ...
-            func = functools.partial(
-                genai.generate_text,
-                model=self.model_name,
-                prompt=prompt
-            )
-            response = await loop.run_in_executor(None, func)
-            return response.result if response and response.result else ""
-
-        # Method 3: New Library API (GenerativeModel)
-        else:
-            func = functools.partial(self.model.generate_content, prompt)
-            response = await loop.run_in_executor(None, func)
-            return response.text if response else ""
-    
     def _parse_json_response(self, text: str) -> dict:
         """Parse JSON from Gemini response, handling markdown code blocks."""
         text = text.strip()
@@ -230,80 +150,125 @@ class GeminiKeywordAI:
                 except:
                     pass
             return {}
-    
-    async def expand_keywords(self, seed_keywords: List[str], count: int = 20) -> dict:
-        """Expand seed keywords with AI suggestions."""
-        if not self.is_available():
-            return {"keywords": [], "error": "Gemini AI not available"}
-        
-        prompt = f"""You are an SEO keyword research expert.
-Given these seed keywords: {json.dumps(seed_keywords)}
 
-Suggest {count} additional related keywords that:
-1. Are semantically related
-2. Include long-tail variations (3-5 word phrases)
-3. Cover different search intents
-4. Include question-based keywords
-
-Return ONLY valid JSON:
-{{
-    "keywords": [
-        {{"keyword": "example keyword", "type": "long-tail", "intent": "informational"}}
-    ]
-}}"""
-        
-        try:
-            response_text = await self._generate_content(prompt)
-            result = self._parse_json_response(response_text)
-            return result if result.get("keywords") else {"keywords": []}
-        except Exception as e:
-            logger.error(f"Keyword expansion failed: {e}")
-            return {"keywords": [], "error": str(e)}
-    
     async def classify_intent(self, keywords: List[str]) -> dict:
-        """Classify keywords by search intent."""
-        if not self.is_available():
-            return {"error": "Gemini AI not available"}
+        """
+        Classify keywords using RULE-BASED logic (No AI cost).
+        """
+        results = {
+            "informational": [],
+            "transactional": [],
+            "commercial": [],
+            "navigational": [],
+            "local": []
+        }
         
-        prompt = f"""Classify these keywords by search intent:
-Keywords: {json.dumps(keywords)}
+        # Regex patterns for intent
+        patterns = {
+            "transactional": [
+                r"\b(buy|price|cost|lease|rent|order|purchase|cheap|affordable|discount|deal|coupon|sale)\b",
+                r"\b(hire|book|schedule|appointment|reserve)\b"
+            ],
+            "commercial": [
+                r"\b(best|top|review|vs|versus|compare|comparison|benefit|review)\b",
+                r"\b(guide|list|ranking)\b"
+            ],
+            "local": [
+                r"\b(near me|nearby|in [a-z\s]+|locat|address|map|directions)\b"
+            ],
+            "informational": [
+                r"\b(what|how|why|when|where|who|guide|tips|tutorial|definition|meaning|example)\b",
+                r"\b(ideas|strategies|ways to|learn)\b"
+            ]
+        }
+        
+        import re
+        for kw in keywords:
+            kw_lower = kw.lower()
+            classified = False
+            
+            # Check transactional first (highest value)
+            for p in patterns["transactional"]:
+                if re.search(p, kw_lower):
+                    results["transactional"].append(kw)
+                    classified = True
+                    break
+            if classified: continue
+            
+            # Check local
+            for p in patterns["local"]:
+                if re.search(p, kw_lower):
+                    results["local"].append(kw)
+                    classified = True
+                    break
+            if classified: continue
 
-Return ONLY valid JSON:
-{{
-    "informational": ["keyword1"],
-    "transactional": ["keyword2"],
-    "commercial": ["keyword3"],
-    "navigational": ["keyword4"]
-}}"""
-        
-        try:
-            response_text = await self._generate_content(prompt)
-            return self._parse_json_response(response_text)
-        except Exception as e:
-            logger.error(f"Intent classification failed: {e}")
-            return {"error": str(e)}
-    
+            # Check commercial
+            for p in patterns["commercial"]:
+                if re.search(p, kw_lower):
+                    results["commercial"].append(kw)
+                    classified = True
+                    break
+            if classified: continue
+            
+            # Default to informational
+            results["informational"].append(kw)
+            
+        return results
+
     async def group_keywords(self, keywords: List[str]) -> dict:
-        """Group keywords into topic clusters."""
-        if not self.is_available():
-            return {"groups": [], "error": "Gemini AI not available"}
+        """
+        Group keywords using STRING SIMILARITY (No AI cost).
+        Improved to avoid single-word brand-name clusters.
+        """
+        groups = {}
+        processed = set()
         
-        prompt = f"""Group these keywords into topic clusters:
-Keywords: {json.dumps(keywords)}
+        # Filter out very short or likely brand-name keywords for cluster leaders
+        # Prefer multi-word keywords as cluster seeds
+        multi_word = [kw for kw in keywords if len(kw.split()) >= 2]
+        single_word = [kw for kw in keywords if len(kw.split()) == 1]
+        
+        # Process multi-word keywords first (better cluster leaders)
+        sorted_kws = sorted(multi_word, key=len) + sorted(single_word, key=len)
+        
+        for kw in sorted_kws:
+            if kw in processed: continue
+            
+            # This keyword becomes a new group leader
+            cluster_name = kw.title()
+            groups[cluster_name] = [kw]
+            processed.add(kw)
+            
+            # Find similar keywords
+            kw_parts = set(kw.lower().split())
+            
+            for potential in sorted_kws:
+                if potential in processed: continue
+                
+                pot_parts = set(potential.lower().split())
+                
+                # Jaccard similarity or strict substring match
+                # Require at least 1 word overlap (was 2, too strict)
+                if kw.lower() in potential.lower() or len(kw_parts.intersection(pot_parts)) >= 1:
+                    groups[cluster_name].append(potential)
+                    processed.add(potential)
+        
+        # Filter: Keep only clusters with 2+ keywords
+        # This removes single-entry brand-name clusters
+        filtered_groups = {k: v for k, v in groups.items() if len(v) >= 2}
+        
+        # If filtering removed too many, include single-entry multi-word topics
+        if len(filtered_groups) < 3:
+            for k, v in groups.items():
+                if len(v) == 1 and len(k.split()) >= 2:
+                    filtered_groups[k] = v
+        
+        # Format as requested JSON structure
+        return {
+            "groups": [{"topic": k, "keywords": v} for k, v in filtered_groups.items()]
+        }
 
-Return ONLY valid JSON:
-{{
-    "groups": [
-        {{"topic": "Group Name", "keywords": ["kw1", "kw2"]}}
-    ]
-}}"""
-        
-        try:
-            response_text = await self._generate_content(prompt)
-            return self._parse_json_response(response_text)
-        except Exception as e:
-            logger.error(f"Keyword grouping failed: {e}")
-            return {"groups": [], "error": str(e)}
     
     async def estimate_difficulty(self, keyword: str, serp_data: dict = None) -> dict:
         """Estimate keyword difficulty."""
@@ -553,7 +518,7 @@ Provide detailed analysis. Return ONLY valid JSON:
         Calculate a composite opportunity score for a keyword.
         
         Formula:
-        Score = (Traffic × 0.35) + (1 - Competition × 0.30) + (Intent × 0.20) + (Trend × 0.15)
+        Score = (Traffic × 0.35) + (1 - Competition × 0.30) + (Intent × 0.20) + (Trend × 0.15) + Bonuses
         
         Args:
             keyword: Keyword dict with traffic_potential, competition, intent, etc.
@@ -584,30 +549,57 @@ Provide detailed analysis. Return ONLY valid JSON:
             'transactional': 100,
             'commercial': 85,
             'comparison': 70,
-            'local': 65,
+            'local': 75,  # Boosted local intent
             'informational': 50,
             'navigational': 30,
-            'question': 55
+            'question': 60  # Boosted question type
         }
         
-        # Get scores (with defaults)
+        # Get keyword text for analysis
+        kw_text = keyword.get('keyword', '')
+        word_count = len(kw_text.split())
+        
+        # Get scores (with smarter defaults)
         traffic = keyword.get('traffic_potential', 'medium')
-        competition = keyword.get('competition', 'medium')
         intent = keyword.get('intent', keyword.get('type', 'related'))
         is_trending = keyword.get('is_breakout', False) or keyword.get('growth', '')
+        
+        # Competition: Default to 'low' for long-tail (>3 words), else 'medium'
+        competition = keyword.get('competition')
+        if not competition:
+            competition = 'low' if word_count > 3 else 'medium'
         
         traffic_score = traffic_map.get(traffic, 50)
         competition_score = competition_map.get(competition, 50)
         intent_score = intent_map.get(intent, 50)
         trend_score = 100 if is_trending else 50
         
-        # Calculate weighted score
-        final_score = (
+        # Calculate base weighted score
+        base_score = (
             traffic_score * traffic_weight +
             competition_score * competition_weight +
             intent_score * intent_weight +
             trend_score * trend_weight
         )
+        
+        # === BONUSES ===
+        bonus = 0
+        
+        # Long-tail bonus: keywords with 4+ words are easier to rank
+        if word_count >= 4:
+            bonus += 10
+        elif word_count >= 3:
+            bonus += 5
+        
+        # Question keyword bonus: users want answers
+        if any(q in kw_text.lower() for q in ['how', 'what', 'why', 'where', 'when', 'can', 'does', 'is']):
+            bonus += 8
+        
+        # Local intent bonus
+        if 'near me' in kw_text.lower() or intent == 'local':
+            bonus += 5
+        
+        final_score = base_score + bonus
         
         return min(100, max(0, int(final_score)))
     
