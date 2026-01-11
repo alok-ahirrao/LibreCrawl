@@ -12,7 +12,11 @@ from .ai_service import GeminiKeywordAI
 from .keyword_analyzer import KeywordDensityAnalyzer
 from .competitor_keywords import CompetitorKeywordResearcher
 from .keyword_data import KeywordDataService
-from .keyword_db import save_keyword_history, get_keyword_history, get_keyword_history_item, delete_keyword_history
+from .keyword_db import (
+    save_keyword_history, get_keyword_history, get_keyword_history_item, delete_keyword_history,
+    save_content_item, get_content_items, get_content_item, update_content_item, 
+    delete_content_item, bulk_save_content_items
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1428,6 +1432,8 @@ def map_content():
         
         intent_data = data.get('intent_data', {})
         business_goal = data.get('business_goal', 'traffic')
+        campaign_title = data.get('campaign_title')
+        website_url = data.get('website_url')
         
         # Import content mapper
         from .content_mapper import ContentMapper
@@ -1440,8 +1446,16 @@ def map_content():
         # Prioritize content creation
         prioritized = mapper.prioritize_content_creation(mappings, business_goal)
         
+        # Prepare schedule config
+        schedule_config = data.get('schedule_config', {})
+        schedule_config.update({
+            'campaign_title': campaign_title,
+            'website_url': website_url,
+            'client_id': data.get('client_id')
+        })
+
         # Create content calendar
-        calendar = mapper.create_content_calendar(prioritized[:12], posts_per_week=2)
+        calendar = mapper.create_content_calendar(prioritized[:12], schedule_config=schedule_config)
         
         # Generate briefs for top 3 priorities
         briefs = []
@@ -1468,7 +1482,9 @@ def map_content():
                 type='content_map',
                 input_params={
                     'clusters': clusters,
-                    'business_goal': business_goal
+                    'business_goal': business_goal,
+                    'campaign_title': campaign_title,
+                    'website_url': website_url
                 },
                 results=result_data,
                 user_id=user_id
@@ -1547,6 +1563,237 @@ def generate_content_brief():
         
     except Exception as e:
         logger.error(f"Content brief generation failed: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+# =============================================================================
+# CONTENT ITEMS CRUD ENDPOINTS
+# =============================================================================
+
+@keyword_bp.route('/content-items', methods=['GET'])
+def list_content_items():
+    """
+    List all content items with optional filtering.
+    
+    Query params:
+    - client_id: Filter by client/organization ID
+    - status: Filter by status (draft, scheduled, in_progress, published)
+    - limit: Max items to return (default 100)
+    - offset: Pagination offset
+    """
+    try:
+        user_id = session.get('user_id')
+        client_id = request.args.get('client_id')
+        status_filter = request.args.get('status')
+        limit = request.args.get('limit', 100, type=int)
+        offset = request.args.get('offset', 0, type=int)
+        
+        items = get_content_items(
+            user_id=user_id,
+            client_id=client_id,
+            status_filter=status_filter,
+            limit=limit,
+            offset=offset
+        )
+        
+        return jsonify({
+            'success': True,
+            'data': items,
+            'count': len(items)
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to list content items: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@keyword_bp.route('/content-items', methods=['POST'])
+def create_content_item():
+    """
+    Create a new content item.
+    
+    Request body:
+    {
+        "cluster_topic": "Dental Implants",
+        "primary_keyword": "dental implants cost",
+        "secondary_keywords": ["implant price", "how much"],
+        "content_type": "service_page",
+        "content_type_name": "Service Page",
+        "intent": "transactional",
+        "confidence": 85,
+        "status": "draft",
+        "priority_tier": "A",
+        "priority_score": 100,
+        "scheduled_date": "2026-01-20",
+        "week_number": 2,
+        "notes": "Focus on pricing transparency",
+        "brief": { ... }
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+        
+        if not data.get('primary_keyword'):
+            return jsonify({'success': False, 'error': 'primary_keyword is required'}), 400
+        
+        user_id = session.get('user_id')
+        item_id = save_content_item(data, user_id)
+        
+        if item_id:
+            return jsonify({
+                'success': True,
+                'data': {'id': item_id},
+                'message': 'Content item created'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Failed to save content item'
+            }), 500
+            
+    except Exception as e:
+        logger.error(f"Failed to create content item: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@keyword_bp.route('/content-items/bulk', methods=['POST'])
+def bulk_create_content_items():
+    """
+    Create multiple content items at once.
+    
+    Request body:
+    {
+        "items": [
+            { ... item data ... },
+            { ... item data ... }
+        ]
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data or not data.get('items'):
+            return jsonify({'success': False, 'error': 'items array is required'}), 400
+        
+        items = data.get('items', [])
+        user_id = session.get('user_id')
+        
+        saved_ids = bulk_save_content_items(items, user_id)
+        
+        return jsonify({
+            'success': True,
+            'data': {
+                'saved_count': len(saved_ids),
+                'ids': saved_ids
+            }
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to bulk create content items: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@keyword_bp.route('/content-items/<int:item_id>', methods=['GET'])
+def get_single_content_item(item_id):
+    """Get a single content item by ID."""
+    try:
+        user_id = session.get('user_id')
+        item = get_content_item(item_id, user_id)
+        
+        if not item:
+            return jsonify({'success': False, 'error': 'Content item not found'}), 404
+            
+        return jsonify({
+            'success': True,
+            'data': item
+        })
+        
+    except Exception as e:
+        logger.error(f"Failed to get content item: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@keyword_bp.route('/content-items/<int:item_id>', methods=['PUT', 'PATCH'])
+def update_single_content_item(item_id):
+    """
+    Update a content item.
+    
+    Request body (partial updates supported):
+    {
+        "status": "in_progress",
+        "scheduled_date": "2026-01-25",
+        "notes": "Updated notes"
+    }
+    """
+    try:
+        data = request.get_json()
+        
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+        
+        user_id = session.get('user_id')
+        success = update_content_item(item_id, data, user_id)
+        
+        if success:
+            # Fetch updated item
+            updated = get_content_item(item_id, user_id)
+            return jsonify({
+                'success': True,
+                'data': updated,
+                'message': 'Content item updated'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Item not found or no changes made'
+            }), 404
+            
+    except Exception as e:
+        logger.error(f"Failed to update content item: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@keyword_bp.route('/content-items/<int:item_id>', methods=['DELETE'])
+def delete_single_content_item(item_id):
+    """Delete a content item."""
+    try:
+        user_id = session.get('user_id')
+        success = delete_content_item(item_id, user_id)
+        
+        if success:
+            return jsonify({
+                'success': True,
+                'message': 'Content item deleted'
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'Item not found'
+            }), 404
+            
+    except Exception as e:
+        logger.error(f"Failed to delete content item: {e}")
         return jsonify({
             'success': False,
             'error': str(e)

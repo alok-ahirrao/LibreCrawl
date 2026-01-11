@@ -239,16 +239,32 @@ class KeywordDataService:
             try:
                 logger.info(f"Using pytrends for seed-keyword related data: {keywords}")
                 
-                # Create a fresh client with better retry logic
+                # Add random delay before starting to avoid rate limits
+                import random
+                time.sleep(random.uniform(2, 4))
+                
+                # Create pytrends client with browser-like headers
+                requests_args = {
+                    'headers': {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                        'Accept-Language': 'en-US,en;q=0.5',
+                        'Accept-Encoding': 'gzip, deflate',
+                        'Connection': 'keep-alive',
+                        'Upgrade-Insecure-Requests': '1',
+                    }
+                }
+                
                 pytrends = TrendReq(
                     hl='en-US', 
                     tz=360, 
-                    timeout=(10, 25), 
-                    retries=3, 
-                    backoff_factor=1
+                    timeout=(15, 30), 
+                    retries=2, 
+                    backoff_factor=2,
+                    requests_args=requests_args
                 )
                 
-                # Helper to build payload with fallbacks
+                # Helper to build payload
                 def fetch_trends(pt_client, tf, g):
                     pt_client.build_payload(
                         kw_list=keywords,
@@ -260,16 +276,17 @@ class KeywordDataService:
                 # Robust Multi-Stage Fallback Strategy (Silent)
                 payload_success = False
                 
-                # Helper to attempt fetch with delay
+                # Helper to attempt fetch with longer delay
                 def try_fetch(tf, g, single_kw=False):
                     try:
-                        time.sleep(1) # Add delay between attempts
+                        time.sleep(random.uniform(2, 5))  # Longer random delay
                         if single_kw and len(keywords) > 0:
                             pytrends.build_payload(kw_list=[keywords[0]], timeframe=tf, geo=g)
                         else:
                             fetch_trends(pytrends, tf, g)
                         return True
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"pytrends attempt failed ({tf}, {g}): {e}")
                         return False
 
                 # 1. Try exact request
@@ -289,7 +306,8 @@ class KeywordDataService:
                     payload_success = True
                     
                 else:
-                    logger.info("pytrends fallback exhausted")
+                    logger.info("pytrends fallback exhausted - Google may be rate limiting")
+
                 
                 if payload_success:
                     # Get related queries
@@ -369,7 +387,14 @@ class KeywordDataService:
             logger.info("No trends library available, skipping trends fetch")
             result['error'] = "No trends library available. Install: pip install trendspyg"
         
+        # Summary logging
+        logger.info(f"get_trending_keywords result: related={len(result['related_queries'])}, "
+                    f"rising={len(result['rising_queries'])}, "
+                    f"trending_now={len(result['trending_now'])}, "
+                    f"interest={len(result['interest_over_time'])}")
+        
         return result
+
     
     def _traffic_to_potential(self, traffic: str) -> str:
         """Convert trendspyg traffic string to potential label."""
@@ -416,6 +441,41 @@ class KeywordDataService:
         elif score >= 10:
             return 'low'
         return 'very_low'
+    
+    def classify_trend(self, interest_data: List[float]) -> str:
+        """
+        Classify trend direction from interest-over-time data.
+        
+        Compares first half average vs second half average to determine trend.
+        
+        Args:
+            interest_data: List of interest values over time
+            
+        Returns:
+            Trend classification: '📈 Growing', '➖ Stable', '📉 Declining', or '❓ Insufficient Data'
+        """
+        if not interest_data or len(interest_data) < 4:
+            return "❓ Insufficient Data"
+        
+        mid = len(interest_data) // 2
+        first_half = interest_data[:mid]
+        second_half = interest_data[mid:]
+        
+        first_avg = sum(first_half) / len(first_half) if first_half else 0
+        second_avg = sum(second_half) / len(second_half) if second_half else 0
+        
+        # Avoid division by zero
+        if first_avg == 0:
+            return "📈 Growing" if second_avg > 0 else "➖ Stable"
+        
+        change_percent = ((second_avg - first_avg) / first_avg) * 100
+        
+        if change_percent > 15:
+            return "📈 Growing"
+        elif change_percent < -15:
+            return "📉 Declining"
+        else:
+            return "➖ Stable"
     
     def generate_long_tail_keywords(
         self, 
@@ -741,37 +801,69 @@ class KeywordDataService:
             try:
                 trends = self.get_trending_keywords(seed_keywords, geo=region)
                 
-                # Build seed word set for relevance filtering
+                # Log what we got from trends
+                related_count = len(trends.get('related_queries', []))
+                rising_count = len(trends.get('rising_queries', []))
+                logger.info(f"Trends API returned: {related_count} related, {rising_count} rising queries")
+                
+                # Build seed word set for relevance filtering (more permissive)
                 seed_words = set()
                 for seed in seed_keywords:
                     seed_words.update(seed.lower().split())
+                    # Also add partial stems (first 4+ chars of each word)
+                    for word in seed.lower().split():
+                        if len(word) >= 4:
+                            seed_words.add(word[:4])  # Stem prefix
                 # Remove common stop words
                 seed_words -= {'the', 'a', 'an', 'in', 'on', 'at', 'for', 'to', 'of', 'and', 'or', 'near', 'me', 'best', 'top'}
                 
                 def is_relevant(keyword: str) -> bool:
-                    """Check if keyword has at least 1 word overlap with seeds."""
-                    kw_words = set(keyword.lower().split())
-                    return len(kw_words.intersection(seed_words)) >= 1
+                    """Check if keyword has word/stem overlap OR substring match with seeds."""
+                    kw_lower = keyword.lower()
+                    kw_words = set(kw_lower.split())
+                    
+                    # Word overlap
+                    if len(kw_words.intersection(seed_words)) >= 1:
+                        return True
+                    
+                    # Substring match (any seed word appears in keyword)
+                    for seed in seed_keywords:
+                        seed_lower = seed.lower()
+                        if seed_lower in kw_lower or kw_lower in seed_lower:
+                            return True
+                        # Check individual seed words
+                        for word in seed_lower.split():
+                            if len(word) >= 3 and word in kw_lower:
+                                return True
+                    
+                    return False
                 
                 # Add related queries (filtered for relevance)
+                added_related = 0
                 for q in trends.get('related_queries', []):
                     kw = q['keyword']
                     if kw.lower() not in all_keywords and is_relevant(kw):
                         all_keywords.add(kw.lower())
                         result['trending_keywords'].append(q)
+                        added_related += 1
                 
                 # Add rising queries with high priority (filtered for relevance)
+                added_rising = 0
                 for q in trends.get('rising_queries', []):
                     kw = q['keyword']
                     if kw.lower() not in all_keywords and is_relevant(kw):
                         all_keywords.add(kw.lower())
                         q['priority'] = 'high'  # Rising queries are high priority
                         result['trending_keywords'].append(q)
+                        added_rising += 1
+                
+                logger.info(f"After relevance filter: {added_related} related + {added_rising} rising = {len(result['trending_keywords'])} trending keywords")
                 
                 # Add interest data
                 result['interest_data'] = trends.get('interest_over_time', [])
             except Exception as e:
                 logger.warning(f"Trends fetch failed, continuing with other sources: {e}")
+
         
         # Generate additional question keywords using question prefixes
         if include_questions:
@@ -1238,7 +1330,7 @@ class KeywordDataService:
             try:
                 trends = self.get_trending_keywords(seed_keywords, geo=region)
                 
-                # Process related queries
+                # Process related queries from pytrends
                 for q in trends.get('related_queries', []):
                     kw = q['keyword']
                     kw_lower = kw.lower()
@@ -1259,11 +1351,17 @@ class KeywordDataService:
                         result['trending_keywords'].append(q)
                         all_discovered.append(q)
                 
+                # Log if no trending keywords found (likely rate limited)
+                if len(result['trending_keywords']) == 0:
+                    logger.warning("No trending keywords found - Google Trends may be rate limiting requests")
+                
                 # Store interest data
                 result['interest_data'] = trends.get('interest_over_time', [])
                 
             except Exception as e:
                 logger.warning(f"Trends fetch failed: {e}")
+
+
         
         # =====================================================================
         # 3. QUESTION-BASED KEYWORDS

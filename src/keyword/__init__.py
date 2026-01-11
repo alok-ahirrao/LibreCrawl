@@ -10,6 +10,14 @@ from .keyword_data import KeywordDataService
 from .cannibalization import KeywordCannibalizationDetector
 from .content_mapper import ContentMapper
 from .research_workflow import KeywordResearchWorkflow, run_keyword_research
+from .normalizer import (
+    normalize,
+    get_word_count,
+    get_length_category,
+    get_keyword_metadata,
+    deduplicate_keywords,
+    batch_normalize
+)
 
 __all__ = [
     'GeminiKeywordAI',
@@ -19,5 +27,12 @@ __all__ = [
     'KeywordCannibalizationDetector',
     'ContentMapper',
     'KeywordResearchWorkflow',
-    'run_keyword_research'
+    'run_keyword_research',
+    # Normalizer utilities
+    'normalize',
+    'get_word_count',
+    'get_length_category',
+    'get_keyword_metadata',
+    'deduplicate_keywords',
+    'batch_normalize'
 ]

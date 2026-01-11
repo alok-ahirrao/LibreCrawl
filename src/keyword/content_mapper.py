@@ -6,6 +6,7 @@ Maps keyword clusters to appropriate content types and pages.
 import logging
 from typing import Optional, List, Dict
 from collections import defaultdict
+from datetime import datetime, timedelta
 
 from .ai_service import GeminiKeywordAI
 
@@ -519,8 +520,8 @@ class ContentMapper:
         Returns:
             Prioritized list of content to create
         """
-        # Filter to gaps only
-        gaps = [m for m in mappings if m['status'] == 'gap']
+        # Filter to gaps only (or new items that haven't been checked against crawl data)
+        gaps = [m for m in mappings if m['status'] in ['gap', 'new']]
         
         # Score based on business goal
         for gap in gaps:
@@ -707,39 +708,93 @@ class ContentMapper:
     def create_content_calendar(
         self,
         prioritized_gaps: List[Dict],
-        posts_per_week: int = 2
+        schedule_config: Dict = None
     ) -> List[Dict]:
         """
-        Create a content calendar from prioritized gaps.
+        Create a content calendar from prioritized gaps with flexible scheduling.
         
         Args:
             prioritized_gaps: Prioritized content gaps
-            posts_per_week: Target posts per week
+            schedule_config: Dict containing:
+                - start_date (str): YYYY-MM-DD
+                - posting_days (List[int]): 0=Mon, 6=Sun
+                - posts_per_week (int): Legacy support
             
         Returns:
-            Content calendar entries
+            Content calendar entries with dates
         """
+        config = schedule_config or {}
+        
+        # Determine start date
+        start_date_str = config.get('start_date')
+        if start_date_str:
+            try:
+                current_date = datetime.strptime(start_date_str, '%Y-%m-%d')
+            except:
+                current_date = datetime.now() + timedelta(days=1)
+        else:
+            # Default to next Monday if no config
+            today = datetime.now()
+            days_until_monday = (7 - today.weekday()) % 7
+            if days_until_monday == 0:
+                days_until_monday = 7
+            current_date = today + timedelta(days=days_until_monday)
+
+        # Determine posting days
+        posting_days = config.get('posting_days')
+        if not posting_days:
+            # Legacy fallback or default
+            ppw = config.get('posts_per_week', 2)
+            if ppw >= 3:
+                posting_days = [0, 2, 4] # Mon, Wed, Fri
+            elif ppw == 2:
+                posting_days = [0, 3] # Mon, Thu
+            else:
+                posting_days = [0] # Mon
+        
         calendar = []
-        week = 1
-        post_in_week = 0
+        gaps_idx = 0
+        total_gaps = len(prioritized_gaps)
+        safety_break = 0
         
-        for gap in prioritized_gaps:
-            if post_in_week >= posts_per_week:
-                week += 1
-                post_in_week = 0
+        while gaps_idx < total_gaps and safety_break < 365:
+            # Check if current day is a posting day
+            if current_date.weekday() in posting_days:
+                gap = prioritized_gaps[gaps_idx]
+                
+                # Determine week number relative to start
+                week_start = current_date - timedelta(days=current_date.weekday())
+                
+                calendar.append({
+                    'week': current_date.isocalendar()[1],
+                    'week_number': current_date.isocalendar()[1],
+                    'position': gaps_idx + 1,
+                    'week_start_date': week_start.strftime('%Y-%m-%d'),
+                    'scheduled_date': current_date.strftime('%Y-%m-%d'),
+                    'week_label': f"Week of {week_start.strftime('%b %d')}",
+                    'topic': gap['cluster_topic'],
+                    'cluster_topic': gap['cluster_topic'],
+                    'primary_keyword': gap['primary_keyword'],
+                    'secondary_keywords': gap.get('secondary_keywords', []),
+                    'content_type': gap.get('recommended_content_type', 'blog_post'),
+                    'content_type_name': gap['content_type_name'],
+                    'intent': gap.get('intent', 'informational'),
+                    'confidence': gap.get('confidence', 50),
+                    'priority_tier': gap.get('priority_tier', 'B'),
+                    'priority_score': gap.get('priority_score', 0),
+                    'estimated_effort': self._estimate_effort(gap['recommended_content_type']),
+                    'status': 'draft',
+                    'client_id': config.get('client_id'),
+                    'campaign_title': config.get('campaign_title'),
+                    'website_url': config.get('website_url')
+                })
+                
+                gaps_idx += 1
             
-            calendar.append({
-                'week': week,
-                'position': post_in_week + 1,
-                'topic': gap['cluster_topic'],
-                'primary_keyword': gap['primary_keyword'],
-                'content_type': gap['content_type_name'],
-                'priority_tier': gap.get('priority_tier', 'B'),
-                'estimated_effort': self._estimate_effort(gap['recommended_content_type'])
-            })
+            # Move to next day
+            current_date += timedelta(days=1)
+            safety_break += 1
             
-            post_in_week += 1
-        
         return calendar
     
     def _estimate_effort(self, content_type: str) -> str:
