@@ -77,9 +77,25 @@ class SitemapParser:
 
         try:
             print(f"Parsing sitemap: {sitemap_url}")
+            
+            # Try with session headers first
             response = self.session.get(sitemap_url, timeout=self.timeout)
 
+            # If 403/401, retry with more browser-like headers
+            if response.status_code in (403, 401, 406):
+                print(f"Sitemap returned {response.status_code}, retrying with browser headers...")
+                browser_headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                }
+                response = self.session.get(sitemap_url, timeout=self.timeout, headers=browser_headers)
+                
             if response.status_code != 200:
+                print(f"Sitemap {sitemap_url} returned status {response.status_code} - skipping")
                 return []
 
             # Handle compressed sitemaps

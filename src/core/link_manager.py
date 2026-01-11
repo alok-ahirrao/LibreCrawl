@@ -43,10 +43,19 @@ class LinkManager:
     def extract_links(self, soup, current_url, depth, should_crawl_callback):
         """Extract links from HTML and add to discovery queue"""
         links = soup.find_all('a', href=True)
+        
+        # Debug counters
+        total_links = len(links)
+        skipped_special = 0
+        skipped_already_seen = 0
+        skipped_trap = 0
+        skipped_callback = 0
+        added = 0
 
         for link in links:
             href = link['href'].strip()
             if not href or href.startswith('#') or href.startswith('mailto:') or href.startswith('tel:'):
+                skipped_special += 1
                 continue
 
             # Convert relative URLs to absolute
@@ -88,6 +97,7 @@ class LinkManager:
                                 'count': 0
                             }
                         self.trap_patterns[signature]['count'] += 1
+                        skipped_trap += 1
                         # SKIP adding
                         continue
 
@@ -98,6 +108,14 @@ class LinkManager:
                         
                         self.all_discovered_urls.add(clean_url)
                         self.discovered_urls.append((clean_url, depth))
+                        added += 1
+                    else:
+                        skipped_callback += 1
+                else:
+                    skipped_already_seen += 1
+        
+        # Log debug info
+        print(f"  [LinkManager] Total <a> tags: {total_links}, Skipped: special={skipped_special}, already_seen={skipped_already_seen}, trap={skipped_trap}, callback_rejected={skipped_callback}, Added to queue: {added}")
 
     def collect_all_links(self, soup, source_url, crawl_results, base_domain=None):
         """

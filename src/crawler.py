@@ -1020,6 +1020,17 @@ class WebCrawler:
             # Only parse HTML content
             if 'text/html' in response.headers.get('content-type', ''):
                 soup = BeautifulSoup(response.content, 'html.parser')
+                
+                # Debug: Check what we received
+                all_links = soup.find_all('a', href=True)
+                html_size = len(response.content)
+                print(f"  [HTML Debug] Size: {html_size} bytes, Links found: {len(all_links)}")
+                if len(all_links) == 0:
+                    # Show a snippet of what we got to diagnose JS-rendered pages
+                    text_content = soup.get_text()[:200].replace('\n', ' ').strip()
+                    print(f"  [HTML Debug] Content preview: {text_content}...")
+                    if 'javascript' in response.text.lower() and ('react' in response.text.lower() or 'vue' in response.text.lower() or 'angular' in response.text.lower() or '__next' in response.text.lower()):
+                        print(f"  [HTML Debug] ⚠️  This appears to be a JavaScript-rendered site! Enable JavaScript mode for proper crawling.")
 
                 # Extract comprehensive data using SEO extractor
                 self.seo_extractor.extract_basic_seo_data(soup, result)
@@ -1051,7 +1062,12 @@ class WebCrawler:
                 )
 
                 if should_extract:
+                    links_before_extract = len(self.link_manager.discovered_urls)
                     self.link_manager.extract_links(soup, url, depth + 1, self._should_crawl_url)
+                    links_after_extract = len(self.link_manager.discovered_urls)
+                    print(f"Link extraction from {url}: found {links_after_extract - links_before_extract} new URLs to crawl (pending queue: {links_after_extract})")
+                else:
+                    print(f"Skipping link extraction: is_internal={is_internal}, depth={depth}, max_depth={self.config['max_depth']}")
 
             # Populate linked_from after all link collection is complete
             result['linked_from'] = self.link_manager.get_source_pages(url)
@@ -1398,6 +1414,12 @@ class WebCrawler:
         else:
             # It is EXTERNAL
             if not self.config['crawl_external']:
+                # Only log first few rejections to avoid spam
+                if not hasattr(self, '_external_reject_count'):
+                    self._external_reject_count = 0
+                if self._external_reject_count < 3:
+                    print(f"  [Rejected] External URL: {url[:80]}... (base_domain={self.base_domain})")
+                    self._external_reject_count += 1
                 return False
                 
         # --- End Domain Policy ---
