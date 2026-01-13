@@ -27,6 +27,7 @@ class GoogleSerpParser:
         'shopping_results': False,
         'sitelinks': False,
         'reviews': False,
+        'ai_overview': False,  # [NEW] AI Overview (SGE)
     }
     
     def parse_serp_results(self, html_content: str, target_domain: str = None) -> dict:
@@ -49,6 +50,7 @@ class GoogleSerpParser:
             'target_rank': None,
             'target_url': None,
             'total_results': None,
+            'ai_overview': None, # [NEW] Structured AI Overview data
         }
         
         # Extract total results count
@@ -56,6 +58,10 @@ class GoogleSerpParser:
         
         # Detect SERP features
         result['serp_features'] = self._detect_serp_features(soup)
+
+        # Extract AI Overview content if detected
+        if result['serp_features']['ai_overview']:
+            result['ai_overview'] = self._extract_ai_overview(soup)
         
         # Extract organic results
         result['organic_results'] = self._extract_organic_results(soup)
@@ -290,10 +296,6 @@ class GoogleSerpParser:
         return None
     
     def _detect_serp_features(self, soup) -> dict:
-        """Detect which SERP features are present on the page."""
-        features = dict(self.SERP_FEATURES)
-        
-    def _detect_serp_features(self, soup) -> dict:
         """Detect which SERP features are present on the page using modern selectors."""
         features = dict(self.SERP_FEATURES)
         
@@ -301,6 +303,27 @@ class GoogleSerpParser:
             # Helper to check text content
             text_content = soup.get_text().lower()
             html_str = str(soup)
+            
+            # --- AI OVERVIEW (SGE) ---
+            # Experimental / New Selectors
+            # --- AI OVERVIEW (SGE) ---
+            # Check for AI Overview using robust text search and class names
+            
+            # 1. Check for common classes/attributes
+            ai_present = False
+            if soup.select_one('div.GenerativeAI') or soup.select_one('div[data-attrid="ai_overview"]'):
+                ai_present = True
+            
+            # 2. Check for text "AI Overview" or "Generative AI" in headers/spans if NOT yet found
+            if not ai_present:
+                 # Look for "AI Overview" in headings or spans
+                 if soup.find(lambda tag: tag.name in ['h1', 'h2', 'span', 'div'] and tag.get_text(strip=True) == "AI Overview"):
+                     ai_present = True
+                 elif soup.find(lambda tag: "Generative AI" in tag.get_text() and tag.name in ['span', 'div']):
+                     ai_present = True
+
+            if ai_present:
+                features['ai_overview'] = True
             
             # --- ADS ---
             # Top/Bottom Ads
@@ -401,11 +424,89 @@ class GoogleSerpParser:
                 
         except Exception as e:
             print(f"[SerpParser] Error detecting features: {e}")
-                
-        except Exception as e:
-            print(f"[SerpParser] Error detecting features: {e}")
         
         return features
+
+    def _extract_ai_overview(self, soup) -> dict:
+        """Extract content from AI Overview (SGE)."""
+        ai_data = {
+            'present': True,
+            'text': '',
+            'citations': [],
+            'has_code': False
+        }
+        
+        try:
+            # Try to find the container
+            # SGE containers are dynamic, but often have 'Generative' in class or specific structure
+            container = None
+            
+            # 1. Look for 'AI Overview' header container
+            header = soup.find(lambda tag: tag.name in ['h1', 'h2', 'span', 'div'] and "AI Overview" == tag.get_text(strip=True))
+            if header:
+                # Walk up to find the main block
+                container = header.find_parent('div', class_=lambda c: c and ('M8OgIe' in c or 'Generative' in c)) or header.parent.parent
+            
+            if not container:
+                # 2. Look for wrapper with data-attrid
+                container = soup.select_one('div[data-attrid="ai_overview"]')
+                
+            if not container:
+                # 3. Fallback: detection found "Generative AI" somewhere else? find that wrapper
+                gen_ai_label = soup.find(lambda tag: "Generative AI" in tag.get_text() and tag.name in ['span', 'div'])
+                if gen_ai_label:
+                     container = gen_ai_label.find_parent('div', class_=lambda c: c and ('M8OgIe' in c)) or gen_ai_label.parent.parent
+
+            if not container:
+                # If we detected it but can't find container, mark as present but empty (user sees "Triggered" but no info)
+                # Or we can return nothing? 
+                # Let's trust detection, but if no container, we can't show text.
+                return ai_data
+                
+            # Extract Text
+            # Usually in paragraph blocks or div with specific class
+            text_blocks = container.select('div[data-attrid="ai_overview"] > div') or container.select('p') or container.select('div.M8OgIe')
+            full_text = []
+            for block in text_blocks:
+                text = block.get_text(strip=True)
+                if len(text) > 20 and "AI Overview" not in text and "Generative AI" not in text: 
+                    full_text.append(text)
+            
+            ai_data['text'] = ' '.join(full_text[:5]) # First few paragraphs
+            
+            # Extract Citations (Links in the AI block)
+            links = container.select('a[href^="http"]')
+            for link in links:
+                href = link.get('href')
+                # Skip Google links
+                if 'google.com' in href: continue
+                
+                title = link.get_text(strip=True)
+                domain = urlparse(href).netloc
+                
+                ai_data['citations'].append({
+                    'url': href,
+                    'title': title,
+                    'domain': domain
+                })
+            
+            # Deduplicate citations
+            unique_citations = []
+            seen_urls = set()
+            for c in ai_data['citations']:
+                if c['url'] not in seen_urls:
+                    seen_urls.add(c['url'])
+                    unique_citations.append(c)
+            ai_data['citations'] = unique_citations
+            
+            # Check for code blocks
+            if container.select('code') or container.select('pre'):
+                ai_data['has_code'] = True
+                
+        except Exception as e:
+            print(f"[SerpParser] Error extracting AI overview: {e}")
+            
+        return ai_data
     
     def _extract_organic_results(self, soup) -> list:
         """Extract organic search results using a link-first approach."""

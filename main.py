@@ -42,7 +42,10 @@ app.config['SESSION_COOKIE_NAME'] = 'librecrawl_session'  # Rename cookie to avo
 Compress(app)
 
 # Initialize database on startup
+# Initialize database on startup
 init_db()
+from src.crawl_db import init_crawl_tables
+init_crawl_tables()
 from src.keyword.keyword_db import init_keyword_tables
 init_keyword_tables()
 
@@ -57,6 +60,10 @@ app.register_blueprint(competitor_bp)
 # [NEW] Register Keyword Research Blueprint
 from src.keyword.routes import keyword_bp
 app.register_blueprint(keyword_bp)
+
+# [NEW] Register Audit Blueprint
+from src.audit.routes import audit_bp
+app.register_blueprint(audit_bp)
 
 def generate_random_password(length=16):
     """Generate a random password with letters, digits, and symbols"""
@@ -722,11 +729,82 @@ def run_pagespeed():
         # Save to database if crawl is persistent
         if crawler.crawl_id and crawler.db_save_enabled:
             crawler._save_batch_to_db(force=True)
+        elif not crawler.crawl_id:
+            # [NEW] Create a standalone crawl record for PageSpeed-only run
+            from src.crawl_db import create_crawl, update_crawl_stats, set_crawl_status
+            from urllib.parse import urlparse
+            
+            parsed = urlparse(url)
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+            base_domain = parsed.netloc
+            
+            user_id = session.get('user_id')
+            session_id = session.get('session_id')
+            
+            # Create a "completed" crawl record
+            crawl_id = create_crawl(
+                user_id=user_id,
+                session_id=session_id,
+                base_url=base_url,
+                base_domain=base_domain,
+                config_snapshot=crawler_config
+            )
+            
+            if crawl_id:
+                # Save results immediately
+                crawler.crawl_id = crawl_id
+                crawler.db_save_enabled = True
+                crawler.stats['pagespeed_results'] = results
+                
+                update_crawl_stats(crawl_id, pagespeed_results=results)
+                set_crawl_status(crawl_id, 'completed')
+                
+                print(f"Created ad-hoc crawl record {crawl_id} for PageSpeed analysis")
             
         return jsonify({'success': True, 'results': results})
     except Exception as e:
         print(f"PageSpeed API Error: {e}")
         return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/crawls/<int:crawl_id>')
+@login_required
+def get_crawl_data(crawl_id):
+    """Get full data for a specific crawl"""
+    from src.crawl_db import get_crawl_by_id, load_crawled_urls, load_crawl_links, load_crawl_issues
+    
+    # Check permissions
+    crawl = get_crawl_by_id(crawl_id)
+    if not crawl:
+        return jsonify({'success': False, 'error': 'Crawl not found'}), 404
+        
+    user_id = session.get('user_id')
+    if not LOCAL_MODE and crawl.get('user_id') != user_id:
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 403
+
+    # Load data
+    urls = load_crawled_urls(crawl_id)
+    links = load_crawl_links(crawl_id)
+    issues = load_crawl_issues(crawl_id)
+    
+    
+    # Calculate Hreflang Data
+    from src.core.issue_detector import IssueDetector
+    detector = IssueDetector()
+    hreflang_data = detector.detect_hreflang_issues(urls)
+
+    response_data = {
+        'success': True,
+        'crawl': crawl,
+        'status': crawl['status'],
+        'urls': urls,
+        'links': links,
+        'issues': issues,
+        'sitemap_urls': crawl.get('sitemap_urls', []),
+        'robots_data': crawl.get('robots_data', {'content': None, 'issues': []}),
+        'hreflang_data': hreflang_data
+    }
+    
+    return jsonify(response_data)
 
 @app.route('/api/stop_crawl', methods=['POST'])
 @login_required
@@ -1076,13 +1154,19 @@ def get_crawl(crawl_id):
         links = load_crawl_links(crawl_id)
         issues = load_crawl_issues(crawl_id)
 
+        # Calculate Hreflang Data
+        from src.core.issue_detector import IssueDetector
+        detector = IssueDetector()
+        hreflang_data = detector.detect_hreflang_issues(urls)
+
         return jsonify({
             'success': True,
             'crawl': crawl,
             'urls': urls,
             'links': links,
             'issues': issues,
-            'robots_data': crawl.get('robots_data', {'content': None, 'issues': []})
+            'robots_data': crawl.get('robots_data', {'content': None, 'issues': []}),
+            'hreflang_data': hreflang_data
         })
     except Exception as e:
         import traceback
@@ -1125,6 +1209,13 @@ def load_crawl_into_session(crawl_id):
             crawler.stats['discovered'] = len(urls)
             crawler.base_url = crawl['base_url']
             crawler.base_domain = crawl['base_domain']
+            
+            # [NEW] Restore Robots.txt and PageSpeed data
+            if crawl.get('robots_data'):
+                crawler.robots_data = crawl['robots_data']
+            
+            if crawl.get('pagespeed_results'):
+                crawler.stats['pagespeed_results'] = crawl['pagespeed_results']
 
         # Initialize link_manager if not exists
         if not crawler.link_manager:

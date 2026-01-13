@@ -293,7 +293,7 @@ class KeywordResearchWorkflow:
             # Generate content calendar
             calendar = self.content_mapper.create_content_calendar(
                 prioritized_content[:12],  # Next 12 pieces
-                posts_per_week=2
+                schedule_config={'posts_per_week': 2}
             )
             
             # Count total content gaps across all mappings

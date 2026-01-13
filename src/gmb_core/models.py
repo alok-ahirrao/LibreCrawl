@@ -355,6 +355,14 @@ def _run_migrations(conn):
         print("Migration: Adding q_and_a_count column to gmb_competitors")
         cursor.execute('ALTER TABLE gmb_competitors ADD COLUMN q_and_a_count INTEGER DEFAULT 0')
     
+    # Migration: Add ai_overview_present to serp_searches
+    cursor.execute("PRAGMA table_info(serp_searches)")
+    serp_columns = [col[1] for col in cursor.fetchall()]
+    
+    if 'ai_overview_present' not in serp_columns:
+        print("Migration: Adding ai_overview_present column to serp_searches")
+        cursor.execute('ALTER TABLE serp_searches ADD COLUMN ai_overview_present BOOLEAN DEFAULT 0')
+
     # Migration: Fix competitive_analyses table if it exists with wrong schema
     cursor.execute("PRAGMA table_info(competitive_analyses)")
     ca_columns = [col[1] for col in cursor.fetchall()]
@@ -511,12 +519,15 @@ def save_serp_search(search_data: dict) -> int:
     """Save a SERP search to history."""
     with get_db() as conn:
         cursor = conn.cursor()
+        
+        # Check if columns exist (for safe migration) - actually done in _run_migrations but good for safety
+        
         cursor.execute('''
             INSERT INTO serp_searches (
                 keyword, location, lat, lng, device, language, depth,
                 organic_count, local_pack_count, hotel_count, shopping_count,
-                target_rank, target_url, results_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                target_rank, target_url, results_json, ai_overview_present
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             search_data.get('keyword', ''),
             search_data.get('location', ''),
@@ -531,7 +542,8 @@ def save_serp_search(search_data: dict) -> int:
             search_data.get('shopping_count', 0),
             search_data.get('target_rank'),
             search_data.get('target_url'),
-            json.dumps(search_data.get('results', {}))
+            json.dumps(search_data.get('results', {})),
+            1 if search_data.get('results', {}).get('serp_features', {}).get('ai_overview') else 0
         ))
         return cursor.lastrowid
 

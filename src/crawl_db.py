@@ -197,6 +197,16 @@ def init_crawl_tables():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawl_issues_url ON crawl_issues(crawl_id, url)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawl_issues_category ON crawl_issues(crawl_id, category)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawl_queue_crawl ON crawl_queue(crawl_id)')
+        
+        # Insights table (New)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS audit_insights (
+                crawl_id INTEGER PRIMARY KEY,
+                insights_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (crawl_id) REFERENCES crawls(id) ON DELETE CASCADE
+            )
+        ''')
 
         # Attempt to add pagespeed_results column
         try:
@@ -740,3 +750,32 @@ def get_database_size_mb():
     except Exception as e:
         print(f"Error getting database size: {e}")
         return 0
+
+def save_audit_insights(crawl_id, insights_data):
+    """Save AI insights for a crawl"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO audit_insights (crawl_id, insights_json, created_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+            ''', (crawl_id, json.dumps(insights_data)))
+            print(f"Saved insights for crawl {crawl_id}")
+            return True
+    except Exception as e:
+        print(f"Error saving insights: {e}")
+        return False
+
+def get_audit_insights(crawl_id):
+    """Get AI insights for a crawl"""
+    try:
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT insights_json FROM audit_insights WHERE crawl_id = ?', (crawl_id,))
+            row = cursor.fetchone()
+            if row and row['insights_json']:
+                return json.loads(row['insights_json'])
+            return None
+    except Exception as e:
+        print(f"Error getting insights: {e}")
+        return None
