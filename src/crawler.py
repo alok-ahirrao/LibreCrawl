@@ -22,6 +22,7 @@ from src.core.js_renderer import JavaScriptRenderer
 from src.core.sitemap_parser import SitemapParser
 from src.core.issue_detector import IssueDetector
 from src.core.memory_monitor import MemoryMonitor
+from src.core.llms_parser import LlmsTxtParser
 
 
 class WebCrawler:
@@ -51,6 +52,7 @@ class WebCrawler:
         self.base_url = None
         self.base_domain = None
         self.robots_data = {'content': None, 'issues': []}
+        self.llms_data = {'content': None, 'issues': []}
 
         # Component instances (initialized on demand)
         self.rate_limiter = None
@@ -58,6 +60,7 @@ class WebCrawler:
         self.js_renderer = None
         self.sitemap_parser = None
         self.issue_detector = None
+        self.llms_parser = None
         self.seo_extractor = SEOExtractor()
         self.memory_monitor = MemoryMonitor()
 
@@ -271,6 +274,10 @@ class WebCrawler:
                 self._discover_and_add_sitemap_urls(url)
                 print(f"Sitemap discovery completed. Total discovered URLs: {self.stats['discovered']}")
 
+            # Fetch llms.txt
+            print(f"Fetching llms.txt for {self.base_url}")
+            self.llms_data = self.llms_parser.fetch_and_parse(self.base_url)
+
             # Start auto-save thread if DB enabled
             if self.db_save_enabled:
                 self._start_auto_save_thread()
@@ -304,6 +311,7 @@ class WebCrawler:
         self.rate_limiter = RateLimiter(requests_per_second)
         self.link_manager = LinkManager(self.base_domain, trap_threshold=self.config.get('trap_threshold', 100))
         self.sitemap_parser = SitemapParser(self.session, self.base_domain, self.config['timeout'])
+        self.llms_parser = LlmsTxtParser(self.session)
         self.issue_detector = IssueDetector(self.config.get('issue_exclusion_patterns', []))
 
         # Initialize JS renderer if needed
@@ -593,6 +601,7 @@ class WebCrawler:
             'issues': self.issue_detector.get_issues() if self.issue_detector else [],
             'traps': self.link_manager.get_traps() if self.link_manager else [],
             'robots_data': self.robots_data,
+            'llms_data': self.llms_data,
             'sitemap_urls': self.sitemap_urls,
             'sitemap_health': sitemap_health,
             'hreflang_data': hreflang_data,  # [NEW] Hreflang validation data for matrix
@@ -636,7 +645,8 @@ class WebCrawler:
                 estimated_size_mb=memory_stats.get('estimated_crawl_mb', 0),
                 pagespeed_results=self.stats.get('pagespeed_results'),
                 sitemap_urls=self.sitemap_urls if self.sitemap_urls else None,
-                robots_data=self.robots_data if self.robots_data.get('content') else None
+                robots_data=self.robots_data,
+                llms_data=self.llms_data
             )
 
             self.last_save_time = time.time()

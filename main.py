@@ -801,6 +801,7 @@ def get_crawl_data(crawl_id):
         'issues': issues,
         'sitemap_urls': crawl.get('sitemap_urls', []),
         'robots_data': crawl.get('robots_data', {'content': None, 'issues': []}),
+        'llms_data': crawl.get('llms_data', {'content': None, 'issues': []}),
         'hreflang_data': hreflang_data
     }
     

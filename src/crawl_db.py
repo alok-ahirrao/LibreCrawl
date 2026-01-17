@@ -226,6 +226,12 @@ def init_crawl_tables():
         except:
             pass # Column likely exists
 
+        # Attempt to add llms_data column
+        try:
+            cursor.execute('ALTER TABLE crawls ADD COLUMN llms_data TEXT')
+        except:
+            pass # Column likely exists
+
         # Attempt to add dom_size and dom_depth columns to crawled_urls
         try:
             cursor.execute('ALTER TABLE crawled_urls ADD COLUMN dom_size INTEGER DEFAULT 0')
@@ -275,7 +281,7 @@ def create_crawl(user_id, session_id, base_url, base_domain, config_snapshot):
         print(f"Error creating crawl: {e}")
         return None
 
-def update_crawl_stats(crawl_id, discovered=None, crawled=None, max_depth=None, peak_memory_mb=None, estimated_size_mb=None, pagespeed_results=None, sitemap_urls=None, robots_data=None):
+def update_crawl_stats(crawl_id, discovered=None, crawled=None, max_depth=None, peak_memory_mb=None, estimated_size_mb=None, pagespeed_results=None, sitemap_urls=None, robots_data=None, llms_data=None):
     """Update crawl statistics"""
     try:
         with get_db() as conn:
@@ -308,6 +314,9 @@ def update_crawl_stats(crawl_id, discovered=None, crawled=None, max_depth=None, 
             if robots_data is not None:
                 updates.append("robots_data = ?")
                 params.append(json.dumps(robots_data))
+            if llms_data is not None:
+                updates.append("llms_data = ?")
+                params.append(json.dumps(llms_data))
 
             updates.append("last_saved_at = CURRENT_TIMESTAMP")
             params.append(crawl_id)
@@ -546,6 +555,10 @@ def get_crawl_by_id(crawl_id):
                         crawl['robots_data'] = json.loads(crawl['robots_data'])
                     except:
                         crawl['robots_data'] = {'content': None, 'issues': []}
+                    try:
+                        crawl['llms_data'] = json.loads(crawl['llms_data'])
+                    except:
+                        crawl['llms_data'] = {'content': None, 'issues': []}
                 return crawl
             return None
 
