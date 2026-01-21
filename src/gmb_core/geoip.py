@@ -308,3 +308,118 @@ def geocode_location(location_name: str) -> dict:
     except Exception as e:
         print(f"[Geocode] Unexpected error for '{location_name}': {e}")
         return None
+
+
+def parse_query_location(query: str) -> dict:
+    """
+    Parse a search query to extract the business/keyword and location parts.
+    
+    Handles patterns like:
+    - "Tusk Berry in Boston, Massachusetts" -> {"keyword": "Tusk Berry", "location": "Boston, Massachusetts"}
+    - "pizza near Times Square NYC" -> {"keyword": "pizza", "location": "Times Square NYC"}
+    - "coffee shops at Downtown Seattle" -> {"keyword": "coffee shops", "location": "Downtown Seattle"}
+    - "best restaurants Boston MA" -> {"keyword": "best restaurants", "location": "Boston MA"}
+    
+    Args:
+        query: The full search query string
+        
+    Returns:
+        Dictionary with:
+        {
+            'keyword': 'extracted keyword/business name',
+            'location': 'extracted location' or None,
+            'original_query': 'the original query',
+            'has_location_intent': True/False
+        }
+    """
+    if not query or not query.strip():
+        return {
+            'keyword': query,
+            'location': None,
+            'original_query': query,
+            'has_location_intent': False
+        }
+    
+    original = query.strip()
+    query_lower = original.lower()
+    
+    # Known location patterns with prepositions
+    location_prepositions = [' in ', ' near ', ' at ', ' around ']
+    
+    for prep in location_prepositions:
+        if prep in query_lower:
+            # Split on the preposition (case-insensitive)
+            import re
+            parts = re.split(prep, query_lower, maxsplit=1)
+            if len(parts) == 2:
+                # Find the split index in original query for proper casing
+                split_idx = query_lower.find(prep)
+                keyword = original[:split_idx].strip()
+                location = original[split_idx + len(prep):].strip()
+                
+                if keyword and location:
+                    # Validate that location looks like a real location
+                    # (has city/state patterns or is a known location)
+                    location_result = geocode_location(location)
+                    if location_result and location_result.get('lat'):
+                        print(f"[QueryParser] Extracted: keyword='{keyword}', location='{location}'")
+                        return {
+                            'keyword': keyword,
+                            'location': location,
+                            'original_query': original,
+                            'has_location_intent': True,
+                            'geocoded': location_result
+                        }
+    
+    # Check for state abbreviations at the end (e.g., "restaurants Boston MA")
+    us_state_abbrevs = ['AL', 'AK', 'AZ', 'AR', 'CA', 'CO', 'CT', 'DE', 'FL', 'GA',
+                         'HI', 'ID', 'IL', 'IN', 'IA', 'KS', 'KY', 'LA', 'ME', 'MD',
+                         'MA', 'MI', 'MN', 'MS', 'MO', 'MT', 'NE', 'NV', 'NH', 'NJ',
+                         'NM', 'NY', 'NC', 'ND', 'OH', 'OK', 'OR', 'PA', 'RI', 'SC',
+                         'SD', 'TN', 'TX', 'UT', 'VT', 'VA', 'WA', 'WV', 'WI', 'WY', 'DC']
+    
+    words = original.split()
+    if len(words) >= 2:
+        last_word = words[-1].upper()
+        if last_word in us_state_abbrevs:
+            # Check if second-to-last word could be a city
+            potential_location = ' '.join(words[-2:])  # "Boston MA"
+            location_result = geocode_location(potential_location)
+            if location_result and location_result.get('lat'):
+                keyword = ' '.join(words[:-2]).strip()
+                if keyword:
+                    print(f"[QueryParser] Extracted via state abbrev: keyword='{keyword}', location='{potential_location}'")
+                    return {
+                        'keyword': keyword,
+                        'location': potential_location,
+                        'original_query': original,
+                        'has_location_intent': True,
+                        'geocoded': location_result
+                    }
+    
+    # Check for "near me" patterns
+    near_me_patterns = ['near me', 'nearby', 'close to me', 'around me', 'in my area']
+    for pattern in near_me_patterns:
+        if pattern in query_lower:
+            keyword = query_lower.replace(pattern, '').strip()
+            # Restore original casing for keyword
+            keyword_idx = query_lower.find(keyword)
+            keyword = original[keyword_idx:keyword_idx + len(keyword)].strip()
+            
+            print(f"[QueryParser] 'Near me' query: keyword='{keyword}'")
+            return {
+                'keyword': keyword if keyword else original,
+                'location': None,
+                'original_query': original,
+                'has_location_intent': True,
+                'requires_user_location': True
+            }
+    
+    # No location pattern found
+    return {
+        'keyword': original,
+        'location': None,
+        'original_query': original,
+        'has_location_intent': False
+    }
+

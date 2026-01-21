@@ -829,6 +829,24 @@ def check_serp_ranking():
     lat = data.get('lat')
     lng = data.get('lng')
     
+    # [NEW] Parse complex queries like "Tusk Berry in Boston, Massachusetts"
+    # This extracts the business name as keyword and location separately
+    if keyword and (lat is None or lng is None):
+        from .geoip import parse_query_location
+        parsed = parse_query_location(keyword)
+        
+        if parsed.get('has_location_intent') and parsed.get('location'):
+            # Found location in query - use extracted parts
+            print(f"[SerpCheck] Query parsed: keyword='{parsed['keyword']}', location='{parsed['location']}'")
+            keyword = parsed['keyword']  # Use just the business/keyword part
+            location = parsed['location']  # Override location from query
+            
+            # If geocoding was already done during parsing, use those coords
+            if parsed.get('geocoded') and parsed['geocoded'].get('lat'):
+                lat = parsed['geocoded']['lat']
+                lng = parsed['geocoded']['lng']
+                print(f"[SerpCheck] Using parsed coords: ({lat}, {lng})")
+    
     # [NEW] IP-based location detection
     use_ip_location = data.get('use_ip_location', False)
     detected_location = None
