@@ -59,9 +59,17 @@ class GoogleSerpParser:
         # Detect SERP features
         result['serp_features'] = self._detect_serp_features(soup)
 
-        # Extract AI Overview content if detected
-        if result['serp_features']['ai_overview']:
-            result['ai_overview'] = self._extract_ai_overview(soup)
+        # Extract AI Overview content - check for dedicated HTML section first
+        ai_overview_html = None
+        if '<!-- AI_OVERVIEW_HTML_START -->' in html_content:
+            try:
+                ai_overview_html = html_content.split('<!-- AI_OVERVIEW_HTML_START -->')[1].split('<!-- AI_OVERVIEW_HTML_END -->')[0]
+                print(f"[SerpParser] Found dedicated AI Overview HTML ({len(ai_overview_html)} bytes)")
+            except:
+                pass
+        
+        if result['serp_features']['ai_overview'] or ai_overview_html:
+            result['ai_overview'] = self._extract_ai_overview(soup, ai_overview_html, target_domain)
         
         # Extract organic results
         result['organic_results'] = self._extract_organic_results(soup)
@@ -92,7 +100,20 @@ class GoogleSerpParser:
             except:
                 pass
 
-        # Extract local pack
+        # Check for AI Mode HTML (Labs Feature)
+        ai_mode_html = None
+        if '<!-- AI_MODE_HTML_START -->' in html_content:
+            try:
+                ai_mode_html = html_content.split('<!-- AI_MODE_HTML_START -->')[1].split('<!-- AI_MODE_HTML_END -->')[0]
+                print(f"[SerpParser] Found AI Mode content ({len(ai_mode_html)} bytes)")
+                
+                # Parse AI Mode content specifically
+                ai_mode_data = self._extract_ai_overview(None, ai_overview_html=ai_mode_html, target_domain=target_domain, is_full_page_mode=True)
+                if ai_mode_data['present']:
+                    result['ai_overview'] = ai_mode_data
+            except Exception as e:
+                print(f"[SerpParser] Error parsing AI Mode content: {e}")
+
         if local_finder_html:
             local_soup = BeautifulSoup(local_finder_html, 'html.parser')
             extended_pack = self._extract_extended_local_pack(local_soup)
@@ -427,68 +448,163 @@ class GoogleSerpParser:
         
         return features
 
-    def _extract_ai_overview(self, soup) -> dict:
-        """Extract content from AI Overview (SGE)."""
+    def _extract_ai_overview(self, soup, ai_overview_html: str = None, target_domain: str = None, is_full_page_mode: bool = False) -> dict:
+        """
+        Extract content from AI Overview (SGE) with brand mention and citation tracking.
+        
+        Args:
+            soup: BeautifulSoup of main SERP HTML
+            ai_overview_html: Optional dedicated AI Overview HTML section (or AI Mode full page)
+            target_domain: User's domain to check for mentions/citations
+            is_full_page_mode: If True, parses the full "AI Mode" page structure
+        
+        Returns:
+            Dictionary with AI Overview data including brand tracking
+        """
         ai_data = {
-            'present': True,
+            'present': False,
             'text': '',
+            'text_full': '',
             'citations': [],
-            'has_code': False
+            'has_code': False,
+            'brand_mentioned': False,
+            'brand_cited': False,
+            'brand_mention_count': 0,
+            'brand_citation_details': None
         }
         
+        target_brand = None
+        target_domain_clean = None
+        if target_domain:
+            target_domain_clean = target_domain.lower().replace('www.', '').replace('https://', '').replace('http://', '').strip().rstrip('/')
+            # Extract brand name (e.g., "example.com" -> "example")
+            target_brand = target_domain_clean.split('.')[0]
+            if len(target_brand) < 3: target_brand = None # Safety check for short names
+        
         try:
-            # Try to find the container
-            # SGE containers are dynamic, but often have 'Generative' in class or specific structure
             container = None
-            
-            # 1. Look for 'AI Overview' header container
-            header = soup.find(lambda tag: tag.name in ['h1', 'h2', 'span', 'div'] and "AI Overview" == tag.get_text(strip=True))
-            if header:
-                # Walk up to find the main block
-                container = header.find_parent('div', class_=lambda c: c and ('M8OgIe' in c or 'Generative' in c)) or header.parent.parent
-            
-            if not container:
-                # 2. Look for wrapper with data-attrid
+            if ai_overview_html:
+                container = BeautifulSoup(ai_overview_html, 'html.parser')
+            elif soup:
+                # Find the SGE container in standard SERP
+                # It often has data-attrid="ai_overview" or similar classes
                 container = soup.select_one('div[data-attrid="ai_overview"]')
+                if not container:
+                    # Look for "AI Overview" header container
+                    header = soup.find(lambda tag: tag.name in ['h1', 'h2', 'span', 'div'] and "AI Overview" == tag.get_text(strip=True))
+                    if header:
+                        # Find the parent container
+                        container = header.find_parent('div', class_=lambda c: c and ('M8OgIe' in c or 'Generative' in c))
+                        if not container:
+                            container = header.parent.parent
                 
-            if not container:
-                # 3. Fallback: detection found "Generative AI" somewhere else? find that wrapper
-                gen_ai_label = soup.find(lambda tag: "Generative AI" in tag.get_text() and tag.name in ['span', 'div'])
-                if gen_ai_label:
-                     container = gen_ai_label.find_parent('div', class_=lambda c: c and ('M8OgIe' in c)) or gen_ai_label.parent.parent
+                if not container:
+                    # Fallback: detection found "Generative AI" somewhere else
+                    gen_ai_label = soup.find(lambda tag: "Generative AI" in tag.get_text() and tag.name in ['span', 'div'])
+                    if gen_ai_label:
+                        container = gen_ai_label.find_parent('div', class_=lambda c: c and ('M8OgIe' in c)) or gen_ai_label.parent.parent
 
             if not container:
-                # If we detected it but can't find container, mark as present but empty (user sees "Triggered" but no info)
-                # Or we can return nothing? 
-                # Let's trust detection, but if no container, we can't show text.
                 return ai_data
+            
+            ai_data['present'] = True
+
+            # --- Text Extraction ---
+            all_text_blocks = []
+            
+            if is_full_page_mode:
+                # [AI MODE PARSING]
+                # In full page mode, extract broad content but filter noise
+                # Iterate over significant text containers
+                for tag in container.find_all(['p', 'li', 'div', 'span', 'h1', 'h2', 'h3']):
+                    # Get direct text or simple text
+                    text = tag.get_text(strip=True)
+                    if len(text) > 40:
+                        # Avoid duplicates
+                        if text in all_text_blocks: continue
+                        
+                        # Filter out navigation/footer/UI noise
+                        if any(x == text.lower() for x in ['sign in', 'settings', 'privacy', 'terms', 'images', 'maps', 'shopping', 'videos']):
+                            continue
+                            
+                        all_text_blocks.append(text)
+            else:
+                # [STANDARD AI OVERVIEW PARSING]
+                # Try multiple strategies to capture text from the embedded component
+                text_selectors = [
+                    'div[data-attrid="ai_overview"] > div',
+                    'p',
+                    'div.M8OgIe',
+                    'li',  # List items often contain AI content
+                    'span[data-ved]',
+                ]
                 
-            # Extract Text
-            # Usually in paragraph blocks or div with specific class
-            text_blocks = container.select('div[data-attrid="ai_overview"] > div') or container.select('p') or container.select('div.M8OgIe')
-            full_text = []
-            for block in text_blocks:
-                text = block.get_text(strip=True)
-                if len(text) > 20 and "AI Overview" not in text and "Generative AI" not in text: 
-                    full_text.append(text)
+                seen_texts = set()
+                for selector in text_selectors:
+                    try:
+                        blocks = container.select(selector) if hasattr(container, 'select') else []
+                        for block in blocks:
+                            text = block.get_text(strip=True)
+                            # Filter noise
+                            if (len(text) > 10 and 
+                                text not in seen_texts and
+                                "AI Overview" not in text and 
+                                "Generative AI" not in text and
+                                "Show more" not in text and
+                                "Learn more" not in text):
+                                seen_texts.add(text)
+                                all_text_blocks.append(text)
+                    except:
+                        continue
             
-            ai_data['text'] = ' '.join(full_text[:5]) # First few paragraphs
+            if not all_text_blocks:
+                 # Fallback
+                 all_text_blocks = [container.get_text(separator=' ', strip=True)]
+                 
+            ai_data['text_full'] = ' '.join(all_text_blocks)
+            ai_data['text'] = ' '.join(all_text_blocks[:10])  # Summary (first 10 blocks)
             
-            # Extract Citations (Links in the AI block)
-            links = container.select('a[href^="http"]')
+            # --- Brand Mention Check ---
+            if target_brand and len(target_brand) >= 3:
+                import re
+                full_text_lower = ai_data['text_full'].lower()
+                
+                # Check for brand mentions (case-insensitive)
+                brand_pattern = re.compile(r'\b' + re.escape(target_brand) + r'\b', re.IGNORECASE)
+                brand_matches = brand_pattern.findall(ai_data['text_full'])
+                
+                if brand_matches:
+                    ai_data['brand_mentioned'] = True
+                    ai_data['brand_mention_count'] = len(brand_matches)
+                    print(f"[SerpParser] Brand '{target_brand}' mentioned {len(brand_matches)} times in AI Overview!")
+            
+            # --- Extract & Track Citations ---
+            links = container.select('a[href^="http"]') if hasattr(container, 'select') else []
+            
             for link in links:
-                href = link.get('href')
+                href = link.get('href', '')
                 # Skip Google links
-                if 'google.com' in href: continue
+                if 'google.com' in href or 'google.co' in href:
+                    continue
                 
                 title = link.get_text(strip=True)
-                domain = urlparse(href).netloc
+                domain = urlparse(href).netloc.lower().replace('www.', '')
                 
-                ai_data['citations'].append({
+                citation = {
                     'url': href,
                     'title': title,
-                    'domain': domain
-                })
+                    'domain': domain,
+                    'is_target': False  # Will be set if this is user's domain
+                }
+                
+                # Check if this citation is from user's domain
+                if target_domain_clean and (target_domain_clean in domain or domain in target_domain_clean):
+                    citation['is_target'] = True
+                    ai_data['brand_cited'] = True
+                    ai_data['brand_citation_details'] = citation
+                    print(f"[SerpParser] Target domain CITED in AI Overview: {href}")
+                
+                ai_data['citations'].append(citation)
             
             # Deduplicate citations
             unique_citations = []

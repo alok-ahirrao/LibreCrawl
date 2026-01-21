@@ -924,10 +924,12 @@ def check_serp_ranking():
         # 1. User explicitly disabled fast mode
         # 2. Query has local intent (requires geolocation)
         # 3. Depth > 10 (requires pagination via browser)
+        # 4. [FIX] Explicit coordinates provided (requires browser geolocation API)
         needs_browser = (
             fast_mode == False or
             has_local_intent or
-            needs_deep_crawl
+            needs_deep_crawl or
+            has_explicit_coords
         )
         
         html = None
@@ -1007,7 +1009,8 @@ def check_serp_ranking():
             'target_url': results['target_url'],
             'total_results': results['total_results'],
             'hotel_results': results.get('hotel_results', []),
-            'shopping_results': results.get('shopping_results', [])
+            'shopping_results': results.get('shopping_results', []),
+            'ai_overview': results.get('ai_overview')  # [NEW] AI Overview data
         })
         
     except Exception as e:

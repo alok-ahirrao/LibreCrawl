@@ -1017,9 +1017,11 @@ class GeoCrawlerDriver:
             
             # Add Geolocation if available
             if lat is not None and lng is not None:
-                context_args['geolocation'] = {'latitude': lat, 'longitude': lng, 'accuracy': 100}
+                # [FIX] Use higher accuracy (10m) for better local pack results
+                context_args['geolocation'] = {'latitude': lat, 'longitude': lng, 'accuracy': 10}
                 context_args['permissions'] = ['geolocation']
                 context_args['timezone_id'] = tz_id
+                print(f"[SerpScan] 📍 Geolocation set: ({lat}, {lng}) with 10m accuracy, TZ: {tz_id}")
                 
             # Add Locale
             locale_suffix = gl_code.upper() if gl_code else 'US'
@@ -1499,6 +1501,200 @@ class GeoCrawlerDriver:
                     content = page.content()
                     final_url = page.url
                     print(f"[SerpScan] Captured {len(content)} bytes of HTML")
+
+                # --- AI MODE TAB DETECTION (Labs Feature) ---
+                # Check if "AI Mode" tab exists and capture it
+                ai_mode_html = ""
+                try:
+                    # Look for the tab visually similar to "All", "Maps"
+                    ai_mode_selectors = [
+                        'a:has-text("AI Mode")', 
+                        'div[role="tab"]:has-text("AI Mode")', 
+                        'span:has-text("AI Mode")',
+                        '[data-hveid] a:text("AI Mode")',  # Google-specific
+                        '.q.qs:has-text("AI Mode")',  # Tab class
+                    ]
+                    
+                    ai_mode_tab = None
+                    for sel in ai_mode_selectors:
+                        try:
+                            tab = page.locator(sel).first
+                            if tab.is_visible(timeout=1000):
+                                ai_mode_tab = tab
+                                break
+                        except: continue
+                    
+                    if ai_mode_tab:
+                        print("[SerpScan] Found 'AI Mode' tab! Navigating to AI view...")
+                        ai_mode_tab.click()
+                        
+                        # Wait for the AI interface to load
+                        try:
+                            page.wait_for_load_state('networkidle', timeout=10000)
+                            time.sleep(3.0)  # Extra wait for AI content generation
+                        except: pass
+                        
+                        # ===== CRITICAL: Find and click "Show all" in right sidebar =====
+                        # The sidebar shows "X sites" header with sources, and has a "Show all" button
+                        show_all_clicked = False
+                        
+                        # Multiple selector strategies for the Show all button
+                        show_all_selectors = [
+                            # Text-based selectors
+                            'span:has-text("Show all")',
+                            'button:has-text("Show all")',
+                            'div:has-text("Show all"):not(:has(div))', # Leaf div with text
+                            'a:has-text("Show all")',
+                            
+                            # Container-based (sidebar panel)
+                            '[class*="sidebar"] [role="button"]:has-text("Show all")',
+                            '[class*="panel"] span:has-text("Show all")',
+                            
+                            # Google-specific patterns
+                            'g-inner-card span:has-text("Show all")',
+                            '[data-attrid] span:has-text("Show all")',
+                            '[jscontroller] [jsaction*="click"]:has-text("Show all")',
+                        ]
+                        
+                        for sel in show_all_selectors:
+                            try:
+                                show_all_btn = page.locator(sel).first
+                                if show_all_btn.is_visible(timeout=2000):
+                                    print(f"[SerpScan] Found 'Show all' button via: {sel}")
+                                    
+                                    # Scroll it into view
+                                    show_all_btn.scroll_into_view_if_needed()
+                                    time.sleep(0.5)
+                                    
+                                    # Click it
+                                    show_all_btn.click()
+                                    show_all_clicked = True
+                                    print("[SerpScan] Clicked 'Show all' - waiting for full list to load...")
+                                    
+                                    # Wait for expanded list to fully render
+                                    time.sleep(3.0)
+                                    
+                                    # Try to wait for the list container to populate
+                                    try:
+                                        page.wait_for_selector('[class*="list"] a[href]', timeout=3000)
+                                    except: pass
+                                    
+                                    break
+                            except Exception as e:
+                                continue
+                        
+                        if not show_all_clicked:
+                            print("[SerpScan] Could not find 'Show all' button - capturing visible citations only")
+                            # Try scrolling the sidebar to load more
+                            try:
+                                sidebar = page.locator('[class*="sidebar"], [class*="panel"]').first
+                                if sidebar.is_visible(timeout=2000):
+                                    # Scroll within sidebar to trigger lazy loading
+                                    for _ in range(3):
+                                        sidebar.evaluate('el => el.scrollTop += 500')
+                                        time.sleep(0.5)
+                            except: pass
+                        
+                        # Capture the full AI Mode content including all expanded citations
+                        ai_mode_html = page.content()
+                        print(f"[SerpScan] Captured AI Mode content ({len(ai_mode_html)} bytes)")
+                        
+                except Exception as e:
+                    print(f"[SerpScan] AI Mode check/capture failed: {e}")
+                    
+                if ai_mode_html:
+                    content += f"\n<!-- AI_MODE_HTML_START -->\n{ai_mode_html}\n<!-- AI_MODE_HTML_END -->"
+                
+                # --- AI OVERVIEW EXPANSION ---
+                # Try to expand and capture full AI Overview content
+                ai_overview_html = ""
+                try:
+                    # [FIX] "Wake up" the page to trigger dynamic content loading
+                    # Small scroll often triggers lazy-loaded AI components
+                    page.mouse.wheel(0, 300)
+                    time.sleep(1.0)
+                    page.mouse.wheel(0, -300)
+                    time.sleep(0.5)
+                    
+                    from bs4 import BeautifulSoup
+                    content_check = page.content()
+                    soup_ai = BeautifulSoup(content_check, 'html.parser')
+                    
+                    # Detect AI Overview presence
+                    ai_container = soup_ai.select_one('div[data-attrid="ai_overview"]')
+                    ai_header = soup_ai.find(lambda tag: tag.name in ['h1', 'h2', 'span', 'div'] and tag.get_text(strip=True) == "AI Overview")
+                    
+                    if ai_container or ai_header:
+                        print("[SerpScan] AI Overview detected! Attempting expansion...")
+                        
+                        # Try to click "Show more" or expand button
+                        expand_clicked = False
+                        expand_selectors = [
+                            'div[data-attrid="ai_overview"] button',           # Generic button in AI overview
+                            'div[data-attrid="ai_overview"] [role="button"]', # Role button
+                            'div.GenerativeAI button',                         # Button in GenerativeAI container
+                            'button:has-text("Show more")',                    # Show more button
+                            '[aria-label*="Show more"]',                       # Aria label
+                            'div[jsname] button[data-ved]',                    # Data-ved buttons
+                        ]
+                        
+                        for selector in expand_selectors:
+                            try:
+                                expand_btn = page.locator(selector).first
+                                if expand_btn.is_visible(timeout=1000):
+                                    print(f"[SerpScan] Found AI expand button via: {selector}")
+                                    # Hover first to simulate human interest
+                                    expand_btn.hover()
+                                    time.sleep(random.uniform(0.5, 1.0)) 
+                                    expand_btn.click(timeout=2000)
+                                    expand_clicked = True
+                                    
+                                    # [FIX] Wait longer for generation/expansion (AI can be slow)
+                                    print("[SerpScan] Waiting for AI content to generate...")
+                                    time.sleep(4.0) 
+                                    break
+                            except:
+                                continue
+                        
+                        if expand_clicked:
+                            print("[SerpScan] AI Overview expanded successfully")
+                        else:
+                            print("[SerpScan] AI Overview may already be fully expanded")
+                        
+                        # Re-capture content after expansion
+                        # Wait for network idle to ensure streaming content finishes
+                        try:
+                            page.wait_for_load_state('networkidle', timeout=3000)
+                        except: pass
+                        
+                        ai_content_now = page.content()
+                        soup_ai_expanded = BeautifulSoup(ai_content_now, 'html.parser')
+                        
+                        # Extract AI Overview section HTML
+                        ai_section = soup_ai_expanded.select_one('div[data-attrid="ai_overview"]')
+                        if not ai_section:
+                            # Try alternative containers
+                            ai_header_exp = soup_ai_expanded.find(lambda tag: tag.name in ['h1', 'h2', 'span', 'div'] and "AI Overview" == tag.get_text(strip=True))
+                            if ai_header_exp:
+                                ai_section = ai_header_exp.find_parent('div', class_=lambda c: c and ('M8OgIe' in c or 'Generative' in c))
+                                if not ai_section:
+                                    ai_section = ai_header_exp.parent.parent.parent
+                        
+                        if ai_section:
+                            ai_overview_html = str(ai_section)
+                            print(f"[SerpScan] Captured AI Overview ({len(ai_overview_html)} bytes)")
+                            
+                            # Update main content with expanded version
+                            content = ai_content_now
+                    else:
+                        print("[SerpScan] No AI Overview detected on this SERP")
+                        
+                except Exception as ai_err:
+                    print(f"[SerpScan] AI Overview expansion error: {ai_err}")
+
+                # Append AI Overview HTML with markers if captured
+                if ai_overview_html:
+                    content += f"\n<!-- AI_OVERVIEW_HTML_START -->\n{ai_overview_html}\n<!-- AI_OVERVIEW_HTML_END -->"
                 
                 # --- Extended Local Pack Scan ---
                 # --- Strict Heading-Based Navigation ---
@@ -1573,9 +1769,9 @@ class GeoCrawlerDriver:
                             if local_url.startswith('/'):
                                 local_url = f"https://www.{google_domain}{local_url}"
                             
-                            # [FIX] Append UULE/GL to Local URL to preserve location
-                            if uule and 'uule=' not in local_url:
-                                local_url += f"&uule={uule}"
+                            # [FIX] Do NOT append UULE if we are using coordinates/blue dot
+                            # Appending broad UULE overrides the precise geolocation context
+                            # Only append GL if strictly needed (usually link has it)
                             if gl_code and 'gl=' not in local_url:
                                 local_url += f"&gl={gl_code}"
 
@@ -1622,9 +1818,7 @@ class GeoCrawlerDriver:
                             if hotel_url.startswith('/'):
                                 hotel_url = f"https://www.{google_domain}{hotel_url}"
                             
-                            # [FIX] Append UULE/GL to Hotel URL
-                            if uule and 'uule=' not in hotel_url:
-                                hotel_url += f"&uule={uule}"
+                            # [FIX] Do NOT append UULE to preserve precise geolocation
                             if gl_code and 'gl=' not in hotel_url:
                                 hotel_url += f"&gl={gl_code}"
 
