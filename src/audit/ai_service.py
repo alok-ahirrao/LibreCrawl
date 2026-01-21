@@ -149,13 +149,79 @@ User Question: "{question}"
 
 Answer:"""
 
+    def _validate_audit_data(self, audit_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Validate audit data before sending to AI.
+        Returns error dict if validation fails, None if valid.
+        """
+        stats = audit_data.get('stats', {})
+        issues = audit_data.get('issues', [])
+        urls = audit_data.get('urls', [])
+        
+        # Check 1: Empty crawl (no URLs)
+        if not urls:
+            return {
+                "error": True,
+                "error_code": "NO_DATA",
+                "error_message": "No pages were crawled. The URL may be unreachable or blocked.",
+                "executive_summary": "Analysis failed: No crawl data available.",
+                "site_goal": "Unknown"
+            }
+        
+        # Check 2: All URLs are 4xx/5xx errors
+        error_count = sum(1 for u in urls if u.get('status_code', 0) >= 400 or u.get('status_code', 0) == 0)
+        if error_count == len(urls):
+            return {
+                "error": True,
+                "error_code": "ALL_ERRORS",
+                "error_message": f"All {len(urls)} crawled pages returned errors (4xx/5xx). The site may be down or blocked.",
+                "executive_summary": "Analysis failed: All pages returned HTTP errors.",
+                "site_goal": "Unknown"
+            }
+
+        # Check 3: Check if homepage is a non-HTML file (pdf, image, etc.)
+        first_url = urls[0] if urls else {}
+        content_type = first_url.get('content_type', '').lower() if first_url.get('content_type') else 'text/html'
+        
+        non_html_types = ['application/pdf', 'image/', 'text/plain', 'application/json', 'application/xml']
+        is_non_html = any(nt in content_type for nt in non_html_types)
+        
+        if is_non_html:
+            return {
+                "error": True,
+                "error_code": "FORMAT_NOT_SUPPORTED",
+                "error_message": f"The crawled URL returned a non-HTML content type ({content_type}). SEO analysis requires HTML pages.",
+                "executive_summary": "Analysis failed: Non-HTML content detected.",
+                "site_goal": "Unknown"
+            }
+        
+        # Check 4: Plain HTML placeholder
+        # If we have 0 issues and minimal content, warn about potential plain HTML file
+        if len(issues) == 0 and len(urls) == 1:
+            word_count = first_url.get('word_count', 0)
+            if word_count is None or word_count < 20:
+                return {
+                    "error": True,
+                    "error_code": "THIN_CONTENT", 
+                    "error_message": "The page has very little content (less than 20 words). This may be a placeholder or under-construction page.",
+                    "executive_summary": "Limited analysis available: Page has minimal content.",
+                    "site_goal": "Unknown"
+                }
+        
+        return None  # Validation passed
+
     async def generate_insights(self, audit_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Generate strategic insights from audit data.
         Returns a structured JSON object.
         """
         if not self.is_available():
-            return {"error": "AI service not available"}
+            return {"error": True, "error_code": "AI_UNAVAILABLE", "error_message": "AI service not available. Please check your API key configuration."}
+
+        # Pre-validation
+        validation_error = self._validate_audit_data(audit_data)
+        if validation_error:
+            return validation_error
 
         stats = audit_data.get('stats', {})
         issues = audit_data.get('issues', [])
@@ -339,3 +405,113 @@ Answer:"""
         except Exception as e:
             logger.error(f"Chat error: {str(e)}")
             return {"answer": "I'm having trouble analyzing that right now.", "status": "error"}
+
+    async def generate_llms_txt(self, base_url: str, sitemap_urls: List[str]) -> str:
+        """
+        Generate an llms.txt file based on sitemap URLs.
+        Standard: https://llmstxt.org/
+        """
+        if not self.is_available():
+            return "# llms.txt\n\n> AI Service unavailable to generate content."
+
+        # Limit urls to avoid overflow
+        top_urls = sitemap_urls[:100]
+        site_name = base_url.replace('https://', '').replace('http://', '').replace('www.', '').split('/')[0]
+        
+        # Analyze URL patterns for subdomains
+        from urllib.parse import urlparse
+        subdomains = set()
+        main_pages = []
+        for url in top_urls:
+            parsed = urlparse(url)
+            host_parts = parsed.netloc.split('.')
+            if len(host_parts) > 2:
+                subdomains.add(parsed.netloc)
+            else:
+                main_pages.append(url)
+        
+        subdomain_list = list(subdomains)[:20]
+        main_page_list = main_pages[:30]
+        
+        from datetime import date
+        today = date.today().isoformat()
+
+        prompt = f"""
+You are an AI assistant that creates comprehensive llms.txt files for websites.
+These files help LLMs (AI assistants, search agents) understand a website's structure and purpose.
+
+**Target Website:** {base_url}
+**Site Name:** {site_name}
+
+**Available URLs from Sitemap:**
+{json.dumps(main_page_list, indent=2)}
+
+**Detected Subdomains:**
+{json.dumps(subdomain_list, indent=2) if subdomain_list else "None detected"}
+
+**Create a comprehensive llms.txt file using this EXACT format:**
+
+```
+# llms.txt — {site_name}
+# Purpose: Help LLMs (AI assistants, search agents) understand {site_name} and its structure.
+# Site Type: [Infer from URLs - e.g., E-commerce, Blog, Multi-site platform, Corporate, etc.]
+# Primary Domain: {base_url}
+
+site_name: {site_name}
+site_url: {base_url}
+site_type: [Describe the type of website based on URL patterns]
+publisher: [Infer or use site name]
+region: [Infer from domain or content, e.g., India, USA, Global]
+language: [Primary language, usually English]
+
+description:
+[Write a 2-4 sentence description of what the site is about based on the URLs and structure]
+
+primary_pages:
+- homepage: {base_url}
+- sitemap: {base_url}sitemap.xml
+[Add other key pages discovered]
+
+subdomain_structure:
+[If subdomains exist, explain the pattern. If not, state "No subdomains detected"]
+
+main_sections:
+[List main sections/categories found in the URLs with their URLs]
+
+content_types:
+[Describe what types of content the site likely contains based on URL patterns]
+
+navigation_and_priority:
+- Use the sitemap for complete page discovery
+- [Add 2-3 more navigation tips]
+
+guidelines_for_llms:
+- [Add 4-5 specific guidelines for how LLMs should use this site's content]
+- Be factual and cite sources
+- [More guidelines based on site type]
+
+recommended_citation:
+When referencing information from {site_name}, cite the exact page URL.
+Example: "According to {base_url}..., ..."
+
+last_updated: {today}
+```
+
+**IMPORTANT INSTRUCTIONS:**
+1. Generate ONLY the raw text content - NO markdown code blocks (no ```).
+2. Analyze the URL patterns to understand the site structure.
+3. Be specific and detailed in each section.
+4. Use the exact format shown above with proper indentation.
+5. If subdomains are detected, include a detailed subdomain_structure section.
+6. Make the guidelines_for_llms section practical and specific to this site type.
+7. Infer as much as possible from the URL patterns.
+"""
+        
+        try:
+            content = await self._generate_content(prompt)
+            # Cleanup potential markdown fences if model ignores instruction
+            content = content.replace('```markdown', '').replace('```', '').replace('```text', '').strip()
+            return content
+        except Exception as e:
+            logger.error(f"Failed to generate llms.txt: {e}")
+            return f"# {site_name}\n\n> Error generating content: {str(e)}"

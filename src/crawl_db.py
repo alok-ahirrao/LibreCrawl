@@ -555,6 +555,8 @@ def get_crawl_by_id(crawl_id):
                         crawl['robots_data'] = json.loads(crawl['robots_data'])
                     except:
                         crawl['robots_data'] = {'content': None, 'issues': []}
+                
+                if crawl.get('llms_data'):
                     try:
                         crawl['llms_data'] = json.loads(crawl['llms_data'])
                     except:

@@ -23,6 +23,7 @@ from src.core.sitemap_parser import SitemapParser
 from src.core.issue_detector import IssueDetector
 from src.core.memory_monitor import MemoryMonitor
 from src.core.llms_parser import LlmsTxtParser
+from src.audit.ai_service import AuditAIService
 
 
 class WebCrawler:
@@ -61,6 +62,7 @@ class WebCrawler:
         self.sitemap_parser = None
         self.issue_detector = None
         self.llms_parser = None
+        self.ai_service = None
         self.seo_extractor = SEOExtractor()
         self.memory_monitor = MemoryMonitor()
 
@@ -276,7 +278,27 @@ class WebCrawler:
 
             # Fetch llms.txt
             print(f"Fetching llms.txt for {self.base_url}")
-            self.llms_data = self.llms_parser.fetch_and_parse(self.base_url)
+            raw_llms_result = self.llms_parser.fetch_and_parse(self.base_url)
+            
+            # Structure llms_data with original and ai_generated sections
+            self.llms_data = {
+                'original': {
+                    'content': raw_llms_result.get('content'),
+                    'status': 200 if raw_llms_result.get('content') else (404 if raw_llms_result.get('needs_generation') else 0),
+                    'issues': raw_llms_result.get('issues', []),
+                    'url': raw_llms_result.get('url')
+                },
+                'ai_generated': None  # Will be populated on-demand via API
+            }
+            
+            # Save llms_data immediately to DB so frontend sees it
+            if self.db_save_enabled and self.crawl_id:
+                try:
+                    from src.crawl_db import update_crawl_stats
+                    update_crawl_stats(self.crawl_id, llms_data=self.llms_data)
+                    print(f"Saved llms_data to database immediately")
+                except Exception as e:
+                    print(f"Error saving llms_data: {e}")
 
             # Start auto-save thread if DB enabled
             if self.db_save_enabled:
@@ -313,6 +335,7 @@ class WebCrawler:
         self.sitemap_parser = SitemapParser(self.session, self.base_domain, self.config['timeout'])
         self.llms_parser = LlmsTxtParser(self.session)
         self.issue_detector = IssueDetector(self.config.get('issue_exclusion_patterns', []))
+        self.ai_service = AuditAIService()
 
         # Initialize JS renderer if needed
         if self.config.get('enable_javascript', False):

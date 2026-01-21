@@ -807,6 +807,70 @@ def get_crawl_data(crawl_id):
     
     return jsonify(response_data)
 
+@app.route('/api/generate_llms_txt', methods=['POST'])
+@login_required
+def generate_llms_txt():
+    """Generate llms.txt content using AI for a specific crawl"""
+    import asyncio
+    from src.audit.ai_service import AuditAIService
+    from src.crawl_db import get_crawl_by_id, update_crawl_stats
+    
+    data = request.get_json()
+    crawl_id = data.get('crawl_id')
+    
+    if not crawl_id:
+        return jsonify({'success': False, 'error': 'crawl_id is required'}), 400
+    
+    # Get crawl data
+    crawl = get_crawl_by_id(crawl_id)
+    if not crawl:
+        return jsonify({'success': False, 'error': 'Crawl not found'}), 404
+    
+    # Check permissions
+    user_id = session.get('user_id')
+    if not LOCAL_MODE and crawl.get('user_id') != user_id:
+        return jsonify({'success': False, 'error': 'Unauthorized'}), 403
+    
+    try:
+        # Get sitemap URLs for context
+        sitemap_urls = crawl.get('sitemap_urls', [])
+        base_url = crawl.get('base_url', '')
+        
+        # Generate using AI
+        ai_service = AuditAIService()
+        if not ai_service.is_available():
+            return jsonify({'success': False, 'error': 'AI service not available (check API key)'}), 503
+        
+        generated_content = asyncio.run(
+            ai_service.generate_llms_txt(base_url, sitemap_urls)
+        )
+        
+        # Update llms_data with AI generated content
+        llms_data = crawl.get('llms_data', {})
+        if isinstance(llms_data, str):
+            import json
+            llms_data = json.loads(llms_data)
+        
+        llms_data['ai_generated'] = {
+            'content': generated_content,
+            'generated_at': datetime.now().isoformat()
+        }
+        
+        # Save to database
+        update_crawl_stats(crawl_id, llms_data=llms_data)
+        
+        return jsonify({
+            'success': True,
+            'content': generated_content,
+            'llms_data': llms_data
+        })
+        
+    except Exception as e:
+        print(f"Error generating llms.txt: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 @app.route('/api/stop_crawl', methods=['POST'])
 @login_required
 def stop_crawl():

@@ -28,7 +28,8 @@ class LlmsTxtParser:
             result = {
                 'url': llms_url,
                 'content': None,
-                'issues': []
+                'issues': [],
+                'needs_generation': False
             }
             
             try:
@@ -44,6 +45,9 @@ class LlmsTxtParser:
                             'type': 'warning',
                             'message': f"Unexpected Content-Type: {response.headers.get('Content-Type')}. Should be text/plain or text/markdown."
                         })
+                        # If it looks like HTML, we might need to generate one
+                        if 'text/html' in response.headers.get('Content-Type', ''):
+                             result['needs_generation'] = True
                         
                     # Basic Validation
                     validation_issues = self._validate_content(response.text)
@@ -57,7 +61,9 @@ class LlmsTxtParser:
                             'type': 'fetch_error',
                             'message': f"Failed to fetch llms.txt: Status {response.status_code}"
                         })
-                    # For 404, we just leave content as None, it's not really an "issue" per se, just absence.
+                    
+                    if response.status_code == 404:
+                        result['needs_generation'] = True
                     
             except Exception as e:
                 result['issues'].append({
