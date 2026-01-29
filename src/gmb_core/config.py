@@ -49,7 +49,7 @@ class Config:
     PROXY_ROTATION_ENABLED = os.getenv('GMB_PROXY_ROTATION', 'false').lower() == 'true'
     
     # Crawler Settings
-    CRAWLER_HEADLESS = os.getenv('GMB_CRAWLER_HEADLESS', 'true').lower() == 'true'
+    CRAWLER_HEADLESS = os.getenv('GMB_CRAWLER_HEADLESS', 'false').lower() == 'true'
     CRAWLER_TIMEOUT = int(os.getenv('GMB_CRAWLER_TIMEOUT', '30000'))  # milliseconds
     CRAWLER_MAX_RETRIES = int(os.getenv('GMB_CRAWLER_MAX_RETRIES', '3'))
     
@@ -71,6 +71,10 @@ class Config:
     # Supports 2captcha, anticaptcha, or 'none' (default: manual solving)
     CAPTCHA_PROVIDER = os.getenv('CAPTCHA_PROVIDER', 'none').lower()
     CAPTCHA_API_KEY = os.getenv('CAPTCHA_API_KEY', '')  # API key for CAPTCHA service
+    
+    # Logging Mode Configuration
+    # Options: 'debug' (verbose output), 'production' (errors only), 'info' (default)
+    LOG_MODE = os.getenv('LOG_MODE', 'info').lower()
     
     # Database
     DATABASE_FILE = os.getenv('GMB_DATABASE_FILE', 'users.db')

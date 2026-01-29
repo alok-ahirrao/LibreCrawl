@@ -73,6 +73,7 @@ def init_gmb_tables():
                 additional_categories TEXT,
                 website_url TEXT,
                 phone_number TEXT,
+                source_url TEXT,
                 
                 -- Cached Stats
                 total_reviews INTEGER DEFAULT 0,
@@ -305,6 +306,114 @@ def init_gmb_tables():
             ON serp_searches(keyword, created_at DESC)
         ''')
 
+        # 12. GMB Health Snapshots - Historical health scoring
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS gmb_health_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                location_id INTEGER NOT NULL,
+                snapshot_date DATE NOT NULL,
+                
+                -- Scores (0-100)
+                overall_score INTEGER DEFAULT 0,
+                profile_score INTEGER DEFAULT 0,
+                photos_score INTEGER DEFAULT 0,
+                reviews_score INTEGER DEFAULT 0,
+                posts_score INTEGER DEFAULT 0,
+                qa_score INTEGER DEFAULT 0,
+                
+                -- Raw Metrics
+                metrics_json TEXT,
+                
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                
+                FOREIGN KEY (location_id) REFERENCES gmb_locations(id) ON DELETE CASCADE,
+                UNIQUE(location_id, snapshot_date)
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_gmb_health_location 
+            ON gmb_health_snapshots(location_id, snapshot_date DESC)
+        ''')
+
+        # 13. GMB Audit Logs - Change history tracking
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS gmb_audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entity_type TEXT NOT NULL,
+                entity_id INTEGER NOT NULL,
+                
+                action TEXT NOT NULL,
+                before_state TEXT,
+                after_state TEXT,
+                
+                actor_type TEXT DEFAULT 'SYSTEM',
+                actor_id INTEGER,
+                source TEXT DEFAULT 'API',
+                source_ip TEXT,
+                
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_gmb_audit_entity 
+            ON gmb_audit_logs(entity_type, entity_id, created_at DESC)
+        ''')
+
+        # 14. GMB Sync Jobs - Queue-based sync operations
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS gmb_sync_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id TEXT UNIQUE NOT NULL,
+                user_id INTEGER,
+                account_id INTEGER,
+                location_id INTEGER,
+                
+                job_type TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                priority INTEGER DEFAULT 5,
+                
+                progress INTEGER DEFAULT 0,
+                total_items INTEGER DEFAULT 0,
+                
+                retry_count INTEGER DEFAULT 0,
+                max_retries INTEGER DEFAULT 3,
+                error_message TEXT,
+                
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_gmb_sync_status 
+            ON gmb_sync_jobs(status, priority DESC, created_at ASC)
+        ''')
+
+        # 15. GMB Quota Logs - API quota tracking
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS gmb_quota_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                endpoint TEXT NOT NULL,
+                method TEXT DEFAULT 'GET',
+                
+                quota_used INTEGER DEFAULT 1,
+                response_code INTEGER,
+                response_time_ms INTEGER,
+                
+                error_message TEXT,
+                
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_gmb_quota_date 
+            ON gmb_quota_logs(created_at DESC)
+        ''')
+
         print("GMB Core tables initialized successfully")
         
         # Run migrations for existing databases
@@ -384,6 +493,56 @@ def _run_migrations(conn):
             CREATE INDEX IF NOT EXISTS idx_competitive_analyses_user 
             ON competitive_analyses(user_place_id)
         ''')
+    
+    # Migration: Add missing columns to gmb_locations
+    cursor.execute("PRAGMA table_info(gmb_locations)")
+    loc_columns = [col[1] for col in cursor.fetchall()]
+    
+    if 'region' not in loc_columns:
+        print("Migration: Adding region column to gmb_locations")
+        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN region TEXT')
+    
+    if 'locality' not in loc_columns:
+        print("Migration: Adding locality column to gmb_locations")
+        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN locality TEXT')
+    
+    if 'photo_count' not in loc_columns:
+        print("Migration: Adding photo_count column to gmb_locations")
+        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN photo_count INTEGER DEFAULT 0')
+    
+    # === NEW MIGRATIONS FOR ENHANCED GMB DATA ===
+    
+    if 'business_hours' not in loc_columns:
+        print("Migration: Adding business_hours column to gmb_locations")
+        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN business_hours TEXT')
+    
+    if 'attributes' not in loc_columns:
+        print("Migration: Adding attributes column to gmb_locations")
+        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN attributes TEXT')
+    
+    if 'description' not in loc_columns:
+        print("Migration: Adding description column to gmb_locations")
+        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN description TEXT')
+    
+    if 'service_area_type' not in loc_columns:
+        print("Migration: Adding service_area_type column to gmb_locations")
+        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN service_area_type TEXT DEFAULT "STOREFRONT"')
+    
+    if 'service_area_places' not in loc_columns:
+        print("Migration: Adding service_area_places column to gmb_locations")
+        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN service_area_places TEXT')
+    
+    if 'post_count' not in loc_columns:
+        print("Migration: Adding post_count column to gmb_locations")
+        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN post_count INTEGER DEFAULT 0')
+    
+    if 'last_post_date' not in loc_columns:
+        print("Migration: Adding last_post_date column to gmb_locations")
+        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN last_post_date TIMESTAMP')
+    
+    if 'qa_count' not in loc_columns:
+        print("Migration: Adding qa_count column to gmb_locations")
+        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN qa_count INTEGER DEFAULT 0')
 
 
 # ==================== Helper Functions ====================
@@ -584,3 +743,508 @@ def delete_serp_search(search_id: int) -> bool:
         cursor = conn.cursor()
         cursor.execute('DELETE FROM serp_searches WHERE id = ?', (search_id,))
         return cursor.rowcount > 0
+
+
+# ==================== Health Snapshot Functions ====================
+
+def save_health_snapshot(location_id: int, scores: dict, metrics: dict = None) -> int:
+    """Save a health snapshot for a location."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        today = datetime.now().strftime('%Y-%m-%d')
+        
+        cursor.execute('''
+            INSERT INTO gmb_health_snapshots (
+                location_id, snapshot_date,
+                overall_score, profile_score, photos_score,
+                reviews_score, posts_score, qa_score,
+                metrics_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(location_id, snapshot_date) DO UPDATE SET
+                overall_score = excluded.overall_score,
+                profile_score = excluded.profile_score,
+                photos_score = excluded.photos_score,
+                reviews_score = excluded.reviews_score,
+                posts_score = excluded.posts_score,
+                qa_score = excluded.qa_score,
+                metrics_json = excluded.metrics_json
+        ''', (
+            location_id,
+            today,
+            scores.get('overall', 0),
+            scores.get('profile', 0),
+            scores.get('photos', 0),
+            scores.get('reviews', 0),
+            scores.get('posts', 0),
+            scores.get('qa', 0),
+            json.dumps(metrics) if metrics else None
+        ))
+        return cursor.lastrowid
+
+
+def get_health_history(location_id: int, days: int = 30) -> list:
+    """Get health snapshot history for a location."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM gmb_health_snapshots
+            WHERE location_id = ?
+            ORDER BY snapshot_date DESC
+            LIMIT ?
+        ''', (location_id, days))
+        results = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            if item.get('metrics_json'):
+                item['metrics'] = json.loads(item['metrics_json'])
+            results.append(item)
+        return results
+
+
+def get_latest_health_score(location_id: int) -> dict:
+    """Get the most recent health snapshot for a location."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM gmb_health_snapshots
+            WHERE location_id = ?
+            ORDER BY snapshot_date DESC
+            LIMIT 1
+        ''', (location_id,))
+        row = cursor.fetchone()
+        if row:
+            item = dict(row)
+            if item.get('metrics_json'):
+                item['metrics'] = json.loads(item['metrics_json'])
+            return item
+        return None
+
+
+# ==================== Audit Log Functions ====================
+
+def log_audit_event(
+    entity_type: str,
+    entity_id: int,
+    action: str,
+    before_state: dict = None,
+    after_state: dict = None,
+    actor_type: str = 'SYSTEM',
+    actor_id: int = None,
+    source: str = 'API',
+    source_ip: str = None
+) -> int:
+    """Log an audit event for change history tracking."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO gmb_audit_logs (
+                entity_type, entity_id, action,
+                before_state, after_state,
+                actor_type, actor_id, source, source_ip
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            entity_type,
+            entity_id,
+            action,
+            json.dumps(before_state) if before_state else None,
+            json.dumps(after_state) if after_state else None,
+            actor_type,
+            actor_id,
+            source,
+            source_ip
+        ))
+        return cursor.lastrowid
+
+
+def get_audit_logs(
+    entity_type: str = None,
+    entity_id: int = None,
+    limit: int = 50
+) -> list:
+    """Get audit logs, optionally filtered by entity."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        query = 'SELECT * FROM gmb_audit_logs'
+        params = []
+        conditions = []
+        
+        if entity_type:
+            conditions.append('entity_type = ?')
+            params.append(entity_type)
+        if entity_id:
+            conditions.append('entity_id = ?')
+            params.append(entity_id)
+        
+        if conditions:
+            query += ' WHERE ' + ' AND '.join(conditions)
+        
+        query += ' ORDER BY created_at DESC LIMIT ?'
+        params.append(limit)
+        
+        cursor.execute(query, params)
+        results = []
+        for row in cursor.fetchall():
+            item = dict(row)
+            if item.get('before_state'):
+                item['before_state'] = json.loads(item['before_state'])
+            if item.get('after_state'):
+                item['after_state'] = json.loads(item['after_state'])
+            results.append(item)
+        return results
+
+
+# ==================== Sync Job Functions ====================
+
+def create_sync_job(
+    job_type: str,
+    user_id: int = None,
+    account_id: int = None,
+    location_id: int = None,
+    priority: int = 5,
+    total_items: int = 0
+) -> str:
+    """Create a new sync job in the queue."""
+    import uuid
+    job_id = str(uuid.uuid4())
+    
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO gmb_sync_jobs (
+                job_id, user_id, account_id, location_id,
+                job_type, priority, total_items
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (job_id, user_id, account_id, location_id, job_type, priority, total_items))
+        return job_id
+
+
+def update_sync_job(
+    job_id: str,
+    status: str = None,
+    progress: int = None,
+    error_message: str = None
+) -> bool:
+    """Update a sync job's status or progress."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        updates = []
+        params = []
+        
+        if status:
+            updates.append('status = ?')
+            params.append(status)
+            if status == 'running':
+                updates.append('started_at = CURRENT_TIMESTAMP')
+            elif status in ('completed', 'failed'):
+                updates.append('completed_at = CURRENT_TIMESTAMP')
+        
+        if progress is not None:
+            updates.append('progress = ?')
+            params.append(progress)
+        
+        if error_message:
+            updates.append('error_message = ?')
+            params.append(error_message)
+            updates.append('retry_count = retry_count + 1')
+        
+        if not updates:
+            return False
+        
+        params.append(job_id)
+        cursor.execute(
+            f'UPDATE gmb_sync_jobs SET {", ".join(updates)} WHERE job_id = ?',
+            params
+        )
+        return cursor.rowcount > 0
+
+
+def get_sync_job(job_id: str) -> dict:
+    """Get a sync job by ID."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM gmb_sync_jobs WHERE job_id = ?', (job_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def get_pending_sync_jobs(limit: int = 10) -> list:
+    """Get pending sync jobs ordered by priority."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT * FROM gmb_sync_jobs
+            WHERE status = 'pending' AND retry_count < max_retries
+            ORDER BY priority DESC, created_at ASC
+            LIMIT ?
+        ''', (limit,))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_sync_job_history(user_id: int = None, limit: int = 20) -> list:
+    """Get sync job history, optionally filtered by user."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        if user_id:
+            cursor.execute('''
+                SELECT * FROM gmb_sync_jobs
+                WHERE user_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            ''', (user_id, limit))
+        else:
+            cursor.execute('''
+                SELECT * FROM gmb_sync_jobs
+                ORDER BY created_at DESC
+                LIMIT ?
+            ''', (limit,))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+# ==================== Quota Logging Functions ====================
+
+def log_quota_usage(
+    endpoint: str,
+    method: str = 'GET',
+    quota_used: int = 1,
+    response_code: int = None,
+    response_time_ms: int = None,
+    error_message: str = None
+) -> int:
+    """Log an API quota usage event."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO gmb_quota_logs (
+                endpoint, method, quota_used,
+                response_code, response_time_ms, error_message
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        ''', (endpoint, method, quota_used, response_code, response_time_ms, error_message))
+        return cursor.lastrowid
+
+
+def get_quota_stats(period: str = 'day') -> dict:
+    """Get quota usage statistics for a period (day/week/month)."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        if period == 'day':
+            time_filter = "datetime('now', '-1 day')"
+        elif period == 'week':
+            time_filter = "datetime('now', '-7 days')"
+        else:  # month
+            time_filter = "datetime('now', '-30 days')"
+        
+        cursor.execute(f'''
+            SELECT 
+                COUNT(*) as total_requests,
+                SUM(quota_used) as total_quota_used,
+                SUM(CASE WHEN response_code >= 400 THEN 1 ELSE 0 END) as error_count,
+                AVG(response_time_ms) as avg_response_time
+            FROM gmb_quota_logs
+            WHERE created_at > {time_filter}
+        ''')
+        row = cursor.fetchone()
+        
+        # Get breakdown by endpoint
+        cursor.execute(f'''
+            SELECT endpoint, COUNT(*) as count, SUM(quota_used) as quota
+            FROM gmb_quota_logs
+            WHERE created_at > {time_filter}
+            GROUP BY endpoint
+            ORDER BY quota DESC
+        ''')
+        endpoints = [dict(r) for r in cursor.fetchall()]
+        
+        return {
+            'period': period,
+            'total_requests': row['total_requests'] or 0,
+            'total_quota_used': row['total_quota_used'] or 0,
+            'error_count': row['error_count'] or 0,
+            'avg_response_time_ms': round(row['avg_response_time'] or 0, 2),
+            'by_endpoint': endpoints
+        }
+
+
+# ==================== Location Helper Functions ====================
+
+def get_all_locations_with_health(account_id: int = None) -> list:
+    """Get all locations with their latest health scores."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        query = '''
+            SELECT 
+                l.*,
+                h.overall_score,
+                h.profile_score,
+                h.photos_score,
+                h.reviews_score,
+                h.posts_score,
+                h.qa_score,
+                h.snapshot_date as health_date
+            FROM gmb_locations l
+            LEFT JOIN gmb_health_snapshots h ON l.id = h.location_id
+                AND h.snapshot_date = (
+                    SELECT MAX(snapshot_date) 
+                    FROM gmb_health_snapshots 
+                    WHERE location_id = l.id
+                )
+        '''
+        
+        if account_id:
+            query += ' WHERE l.account_id = ?'
+            cursor.execute(query, (account_id,))
+        else:
+            cursor.execute(query)
+        
+        return [dict(row) for row in cursor.fetchall()]
+
+
+# ==================== Crawl-Only Location Functions ====================
+
+def save_crawled_location(business_data: dict, user_id: int = None) -> int:
+    """
+    Save a location from crawled Google Maps data (no OAuth needed).
+    
+    Args:
+        business_data: Dict with place_id, name, address, lat, lng, hours, attributes, etc.
+        user_id: Optional user ID for ownership
+        
+    Returns:
+        Location ID
+    """
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        place_id = business_data.get('place_id') or business_data.get('name', '').replace(' ', '_')
+        
+        # Serialize JSON fields
+        hours_json = json.dumps(business_data.get('hours')) if business_data.get('hours') else None
+        attributes_json = json.dumps(business_data.get('attributes')) if business_data.get('attributes') else None
+        service_area = business_data.get('service_area', {})
+        service_area_places_json = json.dumps(service_area.get('areas', [])) if service_area.get('areas') else None
+        
+        # Check if location already exists
+        cursor.execute('SELECT id FROM gmb_locations WHERE google_location_id = ?', (place_id,))
+        existing = cursor.fetchone()
+        
+        if existing:
+            # Update existing location with all new fields
+            cursor.execute('''
+                UPDATE gmb_locations SET
+                    location_name = ?,
+                    address_lines = ?,
+                    locality = ?,
+                    region = ?,
+                    primary_category = ?,
+                    lat = ?,
+                    lng = ?,
+                    website_url = ?,
+                    phone_number = ?,
+                    source_url = ?,
+                    total_reviews = ?,
+                    rating = ?,
+                    photo_count = ?,
+                    business_hours = ?,
+                    attributes = ?,
+                    description = ?,
+                    service_area_type = ?,
+                    service_area_places = ?,
+                    post_count = ?,
+                    last_post_date = ?,
+                    qa_count = ?,
+                    last_synced_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+            ''', (
+                business_data.get('name', ''),
+                business_data.get('address', ''),
+                business_data.get('locality', ''),
+                business_data.get('region', ''),
+                business_data.get('category', business_data.get('primary_category', '')),
+                business_data.get('lat'),
+                business_data.get('lng'),
+                business_data.get('website'),
+                business_data.get('phone'),
+                business_data.get('source_url'),
+                business_data.get('review_count', 0),
+                business_data.get('rating', 0),
+                business_data.get('photo_count', 0),
+                hours_json,
+                attributes_json,
+                business_data.get('description'),
+                service_area.get('type', 'STOREFRONT'),
+                service_area_places_json,
+                business_data.get('post_count', 0),
+                business_data.get('last_post_date'),
+                business_data.get('qa_count', 0),
+                existing['id']
+            ))
+            return existing['id']
+        else:
+            # Insert new location with all fields
+            cursor.execute('''
+                INSERT INTO gmb_locations (
+                    account_id, google_location_id, location_name,
+                    address_lines, locality, region, primary_category,
+                    lat, lng, website_url, phone_number, source_url,
+                    total_reviews, rating, photo_count,
+                    business_hours, attributes, description,
+                    service_area_type, service_area_places,
+                    post_count, last_post_date, qa_count,
+                    last_synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ''', (
+                None,  # account_id is NULL for crawl-only locations
+                place_id,
+                business_data.get('name', ''),
+                business_data.get('address', ''),
+                business_data.get('locality', ''),
+                business_data.get('region', ''),
+                business_data.get('category', business_data.get('primary_category', '')),
+                business_data.get('lat'),
+                business_data.get('lng'),
+                business_data.get('website'),
+                business_data.get('phone'),
+                business_data.get('source_url'),
+                business_data.get('review_count', 0),
+                business_data.get('rating', 0),
+                business_data.get('photo_count', 0),
+                hours_json,
+                attributes_json,
+                business_data.get('description'),
+                service_area.get('type', 'STOREFRONT'),
+                service_area_places_json,
+                business_data.get('post_count', 0),
+                business_data.get('last_post_date'),
+                business_data.get('qa_count', 0)
+            ))
+            return cursor.lastrowid
+
+
+def delete_location(location_id: int) -> bool:
+    """Delete a location and all related data."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        # Delete related data first (cascade should handle this, but be explicit)
+        cursor.execute('DELETE FROM gmb_health_snapshots WHERE location_id = ?', (location_id,))
+        cursor.execute('DELETE FROM gmb_reviews WHERE location_id = ?', (location_id,))
+        cursor.execute('DELETE FROM gmb_grid_scans WHERE location_id = ?', (location_id,))
+        
+        # Delete the location
+        cursor.execute('DELETE FROM gmb_locations WHERE id = ?', (location_id,))
+        
+        return cursor.rowcount > 0
+
+
+def get_location_by_id(location_id: int) -> dict:
+    """Get a single location by ID."""
+    with get_db() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM gmb_locations WHERE id = ?', (location_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+

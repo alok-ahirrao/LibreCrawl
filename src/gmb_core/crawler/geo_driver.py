@@ -1,11 +1,145 @@
 import time
 import random
+import threading
+import atexit
+import contextlib
 import numpy as np
 from math import cos, sin, radians, sqrt
 from playwright.sync_api import sync_playwright
+try:
+    from playwright_stealth import stealth_sync
+    STEALTH_AVAILABLE = True
+except ImportError:
+    STEALTH_AVAILABLE = False
+    stealth_sync = None
 from ..config import config
-from playwright.sync_api import sync_playwright
-from ..config import config
+from ..logger import log
+from .stealth_config import (
+    STEALTH_LAUNCH_ARGS,
+    STEALTH_INIT_SCRIPT,
+    DESKTOP_USER_AGENTS,
+    DESKTOP_VIEWPORTS,
+    MOBILE_USER_AGENTS,
+    MOBILE_VIEWPORTS,
+    random_delay,
+    human_like_mouse_move,
+    human_like_scroll,
+    apply_stealth_to_context,
+    setup_request_interception,
+    get_random_profile,
+)
+
+
+class PlaywrightManager:
+    """
+    Singleton manager that maintains THREAD-LOCAL Playwright instances.
+    This fixes 'greenlet' errors by ensuring each thread uses its own Playwright loop.
+    """
+    _instance = None
+    _lock = threading.Lock()
+    _semaphore = threading.Semaphore(16) # Balanced limit: 16 browsers (Faster than 8, safer than 32)
+    _local = threading.local()
+    
+    @classmethod
+    def get_instance(cls):
+        """Get the singleton manager instance."""
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+    
+    def __init__(self):
+        """Initialize Manager."""
+        log.debug("[PlaywrightManager] Initialized Thread-Local Manager")
+        
+    def _get_local_playwright(self):
+        """Get or create thread-local Playwright instance."""
+        if not hasattr(self._local, 'playwright'):
+            self._local.playwright = sync_playwright().start()
+            log.debug(f"[PlaywrightManager] Thread {threading.get_ident()} initialized Playwright")
+        return self._local.playwright
+
+    @contextlib.contextmanager
+    def managed_browser(self, headless: bool = True, proxy_url: str = None, launch_args: list = None):
+        """
+        Yields a THREAD-LOCAL browser instance.
+        Uses a Semaphore to limit total concurrent browsers across the system.
+        """
+        # Acquire slot
+        self._semaphore.acquire()
+        try:
+            p = self._get_local_playwright()
+            
+            # Default launch args - use comprehensive stealth args
+            if launch_args is None:
+                launch_args = STEALTH_LAUNCH_ARGS
+            
+            # Launch options
+            launch_opts = {
+                'headless': headless,
+                'args': launch_args
+            }
+            if proxy_url:
+                launch_opts['proxy'] = {'server': proxy_url}
+            
+            # Check for existing browser in this thread
+            if not hasattr(self._local, 'browser') or self._local.browser is None:
+                self._local.browser = p.chromium.launch(**launch_opts)
+            else:
+                # Optional: Check if connected, restart if valid?
+                try:
+                    if not self._local.browser.is_connected():
+                         self._local.browser = p.chromium.launch(**launch_opts)
+                except:
+                    self._local.browser = p.chromium.launch(**launch_opts)
+            
+            yield self._local.browser
+            
+        finally:
+            self._semaphore.release()
+            
+            # We DONT close the browser here to allow reuse within the thread!
+            # Waitress threads are reused. This enables persistent browsers per thread.
+            # But we must be careful about context cleanup (already handled by scan functions creating new_context)
+
+    # Deprecated methods
+    def get_browser(self, *args, **kwargs):
+        raise RuntimeError("Use managed_browser()")
+    
+    def close_browser(self):
+        """Close current thread's browser if tracked (not applicable for new-instance-per-call)."""
+        pass
+    
+    def shutdown(self):
+        """Cannot safely shutdown thread-local instances from main thread."""
+        pass
+
+
+# Global manager - lazily initialized
+_playwright_manager = None
+_playwright_lock = threading.Lock()
+
+
+def get_playwright_manager():
+    """Get or create the global PlaywrightManager instance."""
+    global _playwright_manager
+    if _playwright_manager is None:
+        with _playwright_lock:
+            if _playwright_manager is None:
+                _playwright_manager = PlaywrightManager.get_instance()
+    return _playwright_manager
+
+
+# Register cleanup on exit
+def _cleanup_playwright():
+    global _playwright_manager
+    if _playwright_manager:
+        _playwright_manager.shutdown()
+        _playwright_manager = None
+
+
+atexit.register(_cleanup_playwright)
 
 
 class GeoCrawlerDriver:
@@ -78,18 +212,28 @@ class GeoCrawlerDriver:
         return random.choice(self.VIEWPORTS)
     
     def _create_stealth_context(self, browser, lat: float, lng: float):
-        """Create a browser context with stealth and geolocation settings."""
+        """
+        Create a browser context with comprehensive stealth and geolocation settings.
+        Uses playwright_stealth if available, plus custom anti-detection scripts.
+        """
         timezone = self._get_timezone_for_coords(lng)
-        viewport = self._get_random_viewport()
-        user_agent = self._get_random_user_agent()
+        viewport = random.choice(DESKTOP_VIEWPORTS)
+        user_agent = random.choice(DESKTOP_USER_AGENTS)
         
         context_options = {
-            'geolocation': {'latitude': lat, 'longitude': lng, 'accuracy': 100},
+            'geolocation': {'latitude': lat, 'longitude': lng, 'accuracy': 50 + random.randint(0, 100)},
             'permissions': ['geolocation'],
             'viewport': viewport,
             'locale': 'en-US',
             'timezone_id': timezone,
             'user_agent': user_agent,
+            # Additional stealth options
+            'color_scheme': 'light',
+            'reduced_motion': 'no-preference',
+            'has_touch': False,
+            'java_script_enabled': True,
+            'bypass_csp': True,
+            'ignore_https_errors': True,
         }
         
         # Add proxy if configured
@@ -98,37 +242,26 @@ class GeoCrawlerDriver:
         
         context = browser.new_context(**context_options)
         
-        # Add stealth scripts
-        context.add_init_script("""
-            // Override webdriver detection
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            
-            // Override plugins
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5]
-            });
-            
-            // Override languages
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['en-US', 'en']
-            });
-            
-            // Override platform
-            Object.defineProperty(navigator, 'platform', {
-                get: () => 'Win32'
-            });
-            
-            // Hide automation indicators
-            window.chrome = { runtime: {} };
-            
-            // Override permissions query
-            const originalQuery = window.navigator.permissions.query;
-            window.navigator.permissions.query = (parameters) => (
-                parameters.name === 'notifications' ?
-                Promise.resolve({ state: Notification.permission }) :
-                originalQuery(parameters)
-            );
-        """)
+        # Apply playwright_stealth if available (comprehensive anti-detection)
+        if STEALTH_AVAILABLE:
+            page_for_stealth = context.new_page()
+            try:
+                stealth_sync(page_for_stealth)
+                log.debug("[Stealth] playwright_stealth applied successfully")
+            except Exception as e:
+                log.debug(f"[Stealth] playwright_stealth failed: {e}")
+            page_for_stealth.close()
+        
+        # Add comprehensive stealth init script from stealth_config
+        context.add_init_script(STEALTH_INIT_SCRIPT)
+        log.debug("[Stealth] Comprehensive anti-detection script injected")
+        
+        # Set up request interception to block trackers
+        try:
+            setup_request_interception(context)
+            log.debug("[Stealth] Tracker blocking enabled")
+        except Exception as e:
+            log.debug(f"[Stealth] Tracker blocking failed: {e}")
         
         return context
     
@@ -160,12 +293,19 @@ class GeoCrawlerDriver:
         from urllib.parse import quote_plus
         import re
         
-        print(f"[Geo] Resolving coordinates for '{location_name}'...")
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
+        log.debug(f"[Geo] Resolving coordinates for '{location_name}'...")
+        log.debug(f"[Geo] Resolving coordinates for '{location_name}'...")
+        
+        # [FIX] Use PlaywrightManager singleton
+        browser = None
+        browser_ctx = None
+        try:
+            pm = get_playwright_manager()
+            browser_ctx = pm.managed_browser(
                 headless=self.headless,
-                args=['--disable-blink-features=AutomationControlled']
+                launch_args=['--disable-blink-features=AutomationControlled']
             )
+            browser = browser_ctx.__enter__()
             # Use a fresh context with no specific location to let Google find the best match
             context = browser.new_context(
                 user_agent=self._get_random_user_agent(),
@@ -196,37 +336,64 @@ class GeoCrawlerDriver:
                 if match:
                     lat = float(match.group(1))
                     lng = float(match.group(2))
-                    print(f"[Geo] Resolved '{location_name}' -> ({lat}, {lng})")
+                    log.debug(f"[Geo] Resolved '{location_name}' -> ({lat}, {lng})")
                     return lat, lng
                 else:
-                    print(f"[Geo] Could not extract coordinates from URL: {target_url}")
+                    log.debug(f"[Geo] Could not extract coordinates from URL: {target_url}")
                     return None, None
             except Exception as e:
-                print(f"[Geo] Resolution error: {e}")
+                log.debug(f"[Geo] Resolution error: {e}")
                 return None, None
             finally:
-                browser.close()
+                pass
+                
+        except:
+            pass
+        finally:
+            if browser_ctx:
+                try:
+                    browser_ctx.__exit__(None, None, None)
+                except:
+                    pass
 
-    def scan_grid_point(self, keyword: str, lat: float, lng: float, fast_mode: bool = False) -> str:
+    def scan_grid_point(self, keyword: str, lat: float, lng: float, fast_mode: bool = False, target_name: str = None) -> str:
         """
         Perform a search for 'keyword' at the precise 'lat, lng'.
         Returns the raw HTML of the results page for parsing.
+        
+        Args:
+            keyword: Search term
+            lat: Latitude
+            lng: Longitude
+            fast_mode: If True, blocks images/fonts for speed
+            target_name: Optional business name to look for. If found, stops scrolling early.
         """
-        with sync_playwright() as p:
-            # Launch with stealth args
-            launch_args = [
-                '--disable-blink-features=AutomationControlled',
-                '--disable-dev-shm-usage',
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-accelerated-2d-canvas',
-                '--disable-gpu'
-            ]
-            
-            browser = p.chromium.launch(
-                headless=self.headless,
-                args=launch_args
-            )
+        browser = None
+        browser_ctx = None
+        context = None
+        page = None
+        
+        try:
+            # [FIX] Use dummy block to maintain indentation of existing code (16 spaces)
+            if True:
+                # [FIX] Use PlaywrightManager singleton
+                pm = get_playwright_manager()
+                
+                # Launch with stealth args
+                launch_args = [
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-dev-shm-usage',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-accelerated-2d-canvas',
+                    '--disable-gpu'
+                ]
+                
+                browser_ctx = pm.managed_browser(
+                    headless=self.headless,
+                    launch_args=launch_args
+                )
+                browser = browser_ctx.__enter__()
             
             context = self._create_stealth_context(browser, lat, lng)
             
@@ -238,7 +405,7 @@ class GeoCrawlerDriver:
                     
             page = context.new_page()
             
-            try:
+            if True: # Fixed indentation wrapper
                 # Navigate to Google Maps with keyword
                 url = f'https://www.google.com/maps/search/{keyword}/@{lat},{lng},15z'
                 page.goto(url, wait_until='networkidle', timeout=self.timeout)
@@ -265,22 +432,68 @@ class GeoCrawlerDriver:
                     page.wait_for_selector(sidebar_selector, timeout=5000)
                     
                      
-                    # Enhanced scrolling - scroll more times and with longer delays
-                    # This ensures all content (including review counts) is loaded
-                    num_scrolls = random.randint(1, 2) if fast_mode else random.randint(3, 4)
+                    # Enhanced scrolling logic to ensure we load enough results (depth)
+                    # We aim to load at least 60 results (rank #60) to catch lower rankings
+                    target_count = 20 if fast_mode else 60
+                    # Increase max scrolls to ensure we reach depth
+                    max_scrolls = 6 if fast_mode else 16
                     
-                    for i in range(num_scrolls):
+                    listing_selector = 'div[role="article"]'
+                    current_count = 0
+                    
+                    # Target name normalization for check
+                    target_name_lower = target_name.lower().strip() if target_name else None
+                    
+                    for i in range(max_scrolls):
+                        # --- EARLY EXIT OPTIMIZATION ---
+                        # If target_name is provided, check if it's already in the loaded content
+                        if target_name_lower:
+                            try:
+                                # Quick check using page text content (fastest) - scope to feed
+                                feed_text = page.locator(sidebar_selector).text_content()
+                                if feed_text:
+                                    feed_text_lower = feed_text.lower()
+                                    # Simple validation: Check if target (e.g. "Bar") is distinct from "Barber"
+                                    # We check if it is surrounded by non-alphanumeric chars or boundaries
+                                    # Using a simple heuristic for speed without heavy regex overhead in the loop
+                                    if target_name_lower in feed_text_lower:
+                                        # Double check basic boundaries to avoid simple substrings like "Bar" in "Barber"
+                                        # This is a lightweight robust check
+                                        import re
+                                        if re.search(rf"\b{re.escape(target_name_lower)}\b", feed_text_lower):
+                                            log.debug(f"[Geo] EARLY EXIT: Found target '{target_name}' at scroll {i+1}")
+                                            break
+                            except:
+                                pass
+                        
+                        # Scroll down
                         page.eval_on_selector(
                             sidebar_selector, 
-                            '(el) => el.scrollTop += 500 + Math.random() * 300'
+                            '(el) => el.scrollTop += 2000'  # Larger scroll step
                         )
-                        # Longer delay to allow content to load
+                        
+                        # Wait for loading
                         if fast_mode:
-                            time.sleep(random.uniform(0.2, 0.4))
+                            time.sleep(random.uniform(0.5, 0.8))
                         else:
-                            time.sleep(random.uniform(0.5, 1.0))
+                            time.sleep(random.uniform(0.8, 1.2))
+                            
+                        # Check count
+                        try:
+                            items = page.locator(listing_selector).all()
+                            current_count = len(items)
+                            
+                            # If we have reached target count AND we are not searching for a specific target 
+                            # (or we are searching but haven't found it yet - in which case we continue to max_scrolls)
+                            # Actually, if we haven't found it, we WANT to keep scrolling up to max_scrolls/target_count.
+                            # So the condition is: stop if enough items loaded. 
+                            # But wait: if we are looking for a target that is #50, and target_count=60, we keep going.
+                            if current_count >= target_count:
+                                break
+                        except:
+                            pass
                     
-                    # Scroll back to top to ensure first items are fully rendered
+                    # Scroll back to top to ensure first items are fully rendered/visible
                     page.eval_on_selector(
                         sidebar_selector,
                         '(el) => el.scrollTop = 0'
@@ -292,13 +505,16 @@ class GeoCrawlerDriver:
                     # FAST MODE: Skip hovers if possible, or do fewer
                     if not fast_mode:
                         try:
-                            listing_items = page.locator('div[role="article"]').all()
-                            for i, item in enumerate(listing_items[:10]):  # First 10 items
-                                try:
-                                    item.hover(timeout=500)
-                                    time.sleep(random.uniform(0.1, 0.2))
-                                except:
-                                    pass
+                            listing_items = page.locator(listing_selector).all()
+                            # Hover over a few items spread out to trigger lazy loading
+                            indices_to_hover = [0, 4, 9, 19, 29, 39, 49]
+                            for idx in indices_to_hover:
+                                if idx < len(listing_items):
+                                    try:
+                                        listing_items[idx].hover(timeout=500)
+                                        time.sleep(0.1)
+                                    except:
+                                        pass
                         except:
                             pass
                     
@@ -313,21 +529,65 @@ class GeoCrawlerDriver:
                         pass  # Continue even if not found
                         
                 except Exception as scroll_error:
-                    print(f"Scroll warning: {scroll_error}")
+                    log.debug(f"Scroll warning: {scroll_error}")
                 
                 # Capture content
                 content = page.content()
                 
                 return content
             
-            except Exception as e:
-                print(f"Error during crawl at {lat},{lng}: {e}")
-                return None
+        except Exception as e:
+            log.error(f"Error during crawl at {lat},{lng}: {e}")
+            return None
+            
+        finally:
+            # Explicitly close page and context to prevent leaks
+            # managed_browser reuses the browser, so we MUST cleanup these headers
+            if page:
+                try: page.close()
+                except: pass
+            
+            if context:
+                try: context.close()
+                except: pass
                 
-            finally:
-                browser.close()
+            if browser_ctx:
+                try:
+                    browser_ctx.__exit__(None, None, None)
+                except:
+                    pass
+            elif browser:
+                # Fallback if managed_browser wasn't used
+                try: browser.close()
+                except: pass
     
     
+    def _resolve_short_url(self, url: str) -> str:
+        """Resolve short URLs like maps.app.goo.gl to their full destination."""
+        if 'maps.app.goo.gl' not in url and 'goo.gl/maps' not in url:
+            return url
+            
+        try:
+            import requests
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            }
+            # Use GET request (HEAD doesn't always follow redirects properly)
+            response = requests.get(url, allow_redirects=True, timeout=15, headers=headers)
+            resolved_url = response.url
+            
+            log.debug(f"[URLResolve] Short URL '{url}' resolved to: {resolved_url}")
+            
+            # Validate the resolved URL - should contain /maps/place/
+            if '/maps/place/' in resolved_url or 'google.com/maps' in resolved_url:
+                return resolved_url
+            else:
+                log.debug(f"[URLResolve] ⚠️ Resolved URL doesn't look like a valid place URL, using original")
+                return url
+        except Exception as e:
+            log.debug(f"[URLResolve] Error resolving short URL: {e}")
+            return url
+
     def scan_place_details(self, place_url: str, lat: float = None, lng: float = None) -> tuple:
         """
         Scrape details from a specific place page.
@@ -340,11 +600,25 @@ class GeoCrawlerDriver:
         Returns:
             Tuple of (HTML content, final_url)
         """
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=self.headless,
-                args=['--disable-blink-features=AutomationControlled']
-            )
+        # Resolve short URLs first to avoid partial loading or list views
+        place_url = self._resolve_short_url(place_url)
+        log.debug(f"[ScanPlaceDetails] Resolved URL: {place_url}")
+
+        browser = None
+        browser_ctx = None
+        context = None
+        page = None
+        try:
+            # [FIX] Use dummy block to maintain indentation of existing code (16 spaces)
+            if True:
+                # [FIX] Use PlaywrightManager singleton
+                pm = get_playwright_manager()
+                
+                browser_ctx = pm.managed_browser(
+                    headless=self.headless,
+                    launch_args=['--disable-blink-features=AutomationControlled']
+                )
+                browser = browser_ctx.__enter__()
             
             # Use specific coordinates if provided, otherwise default to a varied location or keep it simple
             if lat is not None and lng is not None:
@@ -371,48 +645,154 @@ class GeoCrawlerDriver:
             
             page = context.new_page()
             
-            try:
-                page.goto(place_url, wait_until='domcontentloaded', timeout=self.timeout)
-                time.sleep(random.uniform(2.0, 3.0))
+            if True: # wrapper to maintain indentation
+                # Use networkidle to wait for JS content to load
+                page.goto(place_url, wait_until='networkidle', timeout=self.timeout)
                 
-                # Capture the final URL after any redirects (contains coordinates)
-                final_url = page.url
-                print(f"[ScanPlaceDetails] Final URL after redirect: {final_url}")
-                
-                # Click "About" tab if exists to load more details
+                # Check if we landed on a search results list instead of a specific place
+                # This happens with short URLs like maps.app.goo.gl/... that resolve to a search query
                 try:
-                    about_tab = page.locator('button[aria-label*="About"]')
-                    if about_tab.is_visible(timeout=2000):
-                        about_tab.click()
-                        time.sleep(1)
+                    # Wait briefly to see if it's a list view
+                    page.wait_for_selector('div[role="feed"]', timeout=4000)
+                    log.debug("[ScanPlaceDetails] Detected search results list - clicking first result...")
+                    
+                    # Find first result
+                    first_result = page.locator('div[role="feed"] > div > div[jsaction] a[href*="/maps/place/"]').first
+                    if first_result.is_visible():
+                        # Click it and wait for details to load
+                        first_result.click()
+                        time.sleep(random.uniform(4.5, 5.5))
+                except:
+                    # Not a list view, or timed out waiting for it - assume it's the direct page or will load
+                    pass
+
+                # ========== ENHANCED WAITING FOR CONTENT ==========
+                
+                # Wait for the main business name (h1) to appear first
+                try:
+                    page.wait_for_selector('h1', timeout=10000)
+                except:
+                    log.debug("[ScanPlaceDetails] ⚠️ H1 title not found after 10s")
+
+                # Click tabs to load more data
+                try:
+                    # 1. Click "Reviews" tab - handle "Reviews" or "Reviews (123)"
+                    try:
+                        reviews_tab = page.locator('button[role="tab"][aria-label*="Reviews"], div[role="tab"][aria-label*="Reviews"]').first
+                        if reviews_tab.count() > 0:
+                             log.debug("[ScanPlaceDetails] Found Reviews tab, clicking...")
+                             reviews_tab.click(force=True)
+                             time.sleep(2.0)
+                             
+                             # Wait for at least one review to appear
+                             try:
+                                 page.wait_for_selector('div[data-review-id], div[class*="review"]', timeout=5000)
+                                 log.debug("[ScanPlaceDetails] Review content loaded.")
+                             except:
+                                 log.debug("[ScanPlaceDetails] Timeout waiting for review content.")
+                        else:
+                             log.debug("[ScanPlaceDetails] Reviews tab NOT found.")
+                    except Exception as e:
+                        log.debug(f"[ScanPlaceDetails] Error clicking Reviews tab: {e}")
+                        
+                    # 2. Click "About" tab
+                    try:
+                        about_tab = page.locator('button[role="tab"][aria-label*="About"], div[role="tab"][aria-label*="About"]').first
+                        if about_tab.count() > 0:
+                             about_tab.click(force=True)
+                             time.sleep(1.0)
+                    except: pass
+                        
+                    # 3. Go back to Overview 
+                    try:
+                        overview_tab = page.locator('button[role="tab"][aria-label*="Overview"], div[role="tab"][aria-label*="Overview"]').first
+                        if overview_tab.count() > 0:
+                             overview_tab.click(force=True)
+                             time.sleep(0.5)
+                    except: pass
+                        
+                except Exception as e:
+                    log.debug(f"[ScanPlaceDetails] Tab interaction warning: {e}")
+                        
+                except Exception as e:
+                    log.debug(f"[ScanPlaceDetails] Tab interaction warning: {e}")
+
+                # Scroll to load dynamic content (Q&A, Competitors, Reviews)
+                try:
+                    # Target the main scrollable container
+                    page.evaluate('''() => {
+                        const main = document.querySelector('div[role="main"]');
+                        if (main) {
+                            main.scrollTo(0, 500);
+                            setTimeout(() => main.scrollTo(0, 1500), 500);
+                            setTimeout(() => main.scrollTo(0, 3000), 1000);
+                            setTimeout(() => main.scrollTo(0, main.scrollHeight), 1500);
+                        }
+                            setTimeout(() => main.scrollTo(0, main.scrollHeight), 1500);
+                        }
+                    }''')
+                    log.debug("[ScanPlaceDetails] Scrolling to load dynamic content...")
+                    time.sleep(3.0)
+                    
+                    # Keyboard scroll to trigger interaction observers
+                    try:
+                        page.click('div[role="main"]', timeout=2000)
+                        for _ in range(3):
+                            page.keyboard.press('End')
+                            time.sleep(1.5)
+                    except:
+                        pass
+                    
+                except Exception as e:
+                     log.debug(f"[ScanPlaceDetails] Scroll warning: {e}")
+                
+                # Debug screenshot to check what we see
+                try:
+                    page.screenshot(path="crawl_debug_view.png")
+                    log.debug("[ScanPlaceDetails] Saved debug screenshot to crawl_debug_view.png")
                 except:
                     pass
+
+                # Capture the final URL after any redirects
+                final_url = page.url
+                log.debug(f"[ScanPlaceDetails] Final URL after redirect: {final_url}")
                 
-                return page.content(), final_url
+                # Get page content
+                html_content = page.content()
                 
-            except Exception as e:
-                print(f"Error scraping place details: {e}")
-                return None, None
+                # Quick validation
+                if html_content and len(html_content) < 15000: # Increased threshold again
+                    log.debug("[ScanPlaceDetails] ⚠️ HTML content seems too short/incomplete, waiting longer...")
+                    time.sleep(3)
+                    html_content = page.content()
                 
-            finally:
-                browser.close()
-    
-    def verify_location_spoof(self, lat: float, lng: float) -> bool:
-        """Debug method to verify geolocation spoofing works."""
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=self.headless)
-            context = self._create_stealth_context(browser, lat, lng)
-            page = context.new_page()
+                return html_content, final_url
+                
+        except Exception as e:
+            log.error(f"Error scraping place details: {e}")
+            return None, None
             
-            try:
-                page.goto('https://browserleaks.com/geo', timeout=self.timeout)
-                time.sleep(5)
-                page.screenshot(path=f"verification_spoof_{lat}_{lng}.png")
-                return True
-            except:
-                return False
-            finally:
-                browser.close()
+        finally:
+            if page:
+                try: page.close()
+                except: pass
+            if context:
+                try: context.close()
+                except: pass
+
+            # Force close browser to prevent lingering process
+            if browser and browser.is_connected():
+                try: browser.close()
+                except: pass
+
+            if browser_ctx:
+                try:
+                    browser_ctx.__exit__(None, None, None)
+                except:
+                    pass
+            elif browser:
+                try: browser.close()
+                except: pass
     
     def search_business(self, query: str, location: str = None, lat: float = None, lng: float = None) -> str:
         """
@@ -431,35 +811,52 @@ class GeoCrawlerDriver:
         if location:
             search_query = f"{query} {location}"
         
-        # Use provided lat/lng or fallback
-        # If no lat/lng, we can try to guess or just use a generic US location if location string implies US
-        # But crucially, we shouldn't force NYC if the user asked for London unless we have London coords.
-        # For now, if no lat/lng, we use the default NYC *only if* no location string is provided, 
-        # OR we just rely on Google finding it by string.
-        
+        # Determine if we should use geo-spoofing or let Google figure it out
+        # If user provides a location STRING but no coordinates, skip geo-spoofing
+        # to let Google naturally find businesses in that location
+        use_geolocation = (lat is not None and lng is not None)
         target_lat = lat if lat is not None else 40.7580
         target_lng = lng if lng is not None else -73.9855
         
-        with sync_playwright() as p:
-            launch_args = [
-                '--disable-blink-features=AutomationControlled',
-                '--disable-dev-shm-usage',
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-            ]
+        browser = None
+        browser_ctx = None
+        context = None
+        page = None
+        try:
+            # [FIX] Use dummy block to maintain indentation of existing code (16 spaces)
+            if True:
+                # [FIX] Use PlaywrightManager singleton
+                pm = get_playwright_manager()
+                
+                launch_args = [
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-dev-shm-usage',
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                ]
+                
+                browser_ctx = pm.managed_browser(
+                    headless=self.headless,
+                    launch_args=launch_args
+                )
+                browser = browser_ctx.__enter__()
             
-            browser = p.chromium.launch(
-                headless=self.headless,
-                args=launch_args
-            )
-            
-            context = self._create_stealth_context(browser, target_lat, target_lng)
+            # If we have specific coordinates, use stealth context with geo-spoofing
+            # Otherwise, use a simple context and let Google handle location from search query
+            if use_geolocation:
+                context = self._create_stealth_context(browser, target_lat, target_lng)
+            else:
+                # Simple context without geo-spoofing - lets Google use search query for location
+                context = browser.new_context(
+                    user_agent=self._get_random_user_agent(),
+                    viewport=self._get_random_viewport()
+                )
             page = context.new_page()
             
-            try:
+            if True: # wrapper to maintain indentation
                 # Navigate to Google Maps with business search
                 url = f'https://www.google.com/maps/search/{search_query}'
-                print(f"[BusinessSearch] Navigating to: {url}")
+                log.debug(f"[BusinessSearch] Navigating to: {url}")
                 page.goto(url, wait_until='domcontentloaded', timeout=self.timeout)
                 
                 # Wait for results to load (optimized for speed)
@@ -486,15 +883,39 @@ class GeoCrawlerDriver:
                 
                 content = page.content()
                 final_url = page.url
-                print(f"[BusinessSearch] Captured {len(content)} bytes of HTML from {final_url}")
+                log.debug(f"[BusinessSearch] Captured {len(content)} bytes of HTML from {final_url}")
                 return content, final_url
                 
-            except Exception as e:
-                print(f"[BusinessSearch] Error searching for '{query}': {e}")
-                return None, None
-                
-            finally:
-                browser.close()
+        except Exception as e:
+            log.debug(f"[BusinessSearch] Error searching for '{query}': {e}")
+            while True:  # Small hack to ensure we break out of retry loop if we had one, or just return
+                 return None, None
+                 
+        finally:
+            if page:
+                try:
+                    page.close()
+                except:
+                    pass
+            if context:
+                try:
+                    context.close()
+                except:
+                    pass
+
+            # Force close browser to prevent lingering process
+            if browser and browser.is_connected():
+                try: browser.close()
+                except: pass
+
+            if browser_ctx:
+                try:
+                    browser_ctx.__exit__(None, None, None)
+                except:
+                    pass
+            elif browser:
+                try: browser.close()
+                except: pass
     
     def scan_serp_fast(self, keyword: str, location: str = "United States", 
                        device: str = "desktop", depth: int = 10, language: str = "en") -> tuple:
@@ -525,18 +946,18 @@ class GeoCrawlerDriver:
         from urllib.parse import quote_plus
         from ..config import config
         
-        print(f"[SerpFast] Starting fast SERP scan for '{keyword}' in '{location}'")
+        log.debug(f"[SerpFast] Starting fast SERP scan for '{keyword}' in '{location}'")
         
         # Check if a SERP API provider is configured
         api_provider = config.SERP_API_PROVIDER
         api_key = config.SERP_API_KEY
         
         if api_provider != 'none' and api_key:
-            print(f"[SerpFast] Using {api_provider.upper()} for fast mode")
+            log.debug(f"[SerpFast] Using {api_provider.upper()} for fast mode")
             return self._scan_serp_via_api(keyword, location, device, depth, language, api_provider, api_key)
         
         # Fall back to direct requests (may be blocked)
-        print(f"[SerpFast] No SERP API configured, attempting direct request...")
+        log.debug(f"[SerpFast] No SERP API configured, attempting direct request...")
         
         
         # Map location to Google's gl parameter (country code)
@@ -596,7 +1017,7 @@ class GeoCrawlerDriver:
         if cleaned_loc not in LOCATION_MAP:
             # It's a city or specific location, generate UULE
             uule = self._generate_uule(location)
-            print(f"[SerpFast] Generated UULE for '{location}'")
+            log.debug(f"[SerpFast] Generated UULE for '{location}'")
         
         # Device-specific user agents
         if device.lower() == 'mobile':
@@ -644,7 +1065,7 @@ class GeoCrawlerDriver:
         if uule:
             search_url += f'&uule={uule}'
         
-        print(f"[SerpFast] Fetching: {search_url}")
+        log.debug(f"[SerpFast] Fetching: {search_url}")
         
         # Configure session with proxy if available
         session = requests.Session()
@@ -656,7 +1077,7 @@ class GeoCrawlerDriver:
                 'http': self.proxy_url,
                 'https': self.proxy_url
             }
-            print(f"[SerpFast] Using proxy: {self.proxy_url[:30]}...")
+            log.debug(f"[SerpFast] Using proxy: {self.proxy_url[:30]}...")
         
         # Add cookies that indicate a real browser session
         # This can help bypass some JavaScript requirement checks
@@ -672,11 +1093,11 @@ class GeoCrawlerDriver:
                 allow_redirects=True
             )
             
-            print(f"[SerpFast] Response: {response.status_code}, {len(response.text)} bytes")
+            log.debug(f"[SerpFast] Response: {response.status_code}, {len(response.text)} bytes")
             
             # Check for success
             if response.status_code != 200:
-                print(f"[SerpFast] Non-200 status code: {response.status_code}")
+                log.debug(f"[SerpFast] Non-200 status code: {response.status_code}")
                 return None, None, False
             
             html_content = response.text
@@ -687,13 +1108,13 @@ class GeoCrawlerDriver:
             html_lower = html_content[:10000].lower()
             
             if any(indicator in html_lower for indicator in captcha_indicators):
-                print("[SerpFast] ⚠️ CAPTCHA/Block detected - falling back to browser mode")
+                log.debug("[SerpFast] ⚠️ CAPTCHA/Block detected - falling back to browser mode")
                 return None, None, False
             
             # Check for JavaScript-required page (Google's JS gate)
             js_required_indicators = ['please click', 'enable javascript', 'javascript is required', 'enablejs']
             if any(indicator in html_lower for indicator in js_required_indicators):
-                print("[SerpFast] ⚠️ JavaScript required page - falling back to browser mode")
+                log.debug("[SerpFast] ⚠️ JavaScript required page - falling back to browser mode")
                 return None, None, False
             
             # Check for valid search results - look for actual result containers
@@ -707,20 +1128,20 @@ class GeoCrawlerDriver:
             ])
             
             if not has_results:
-                print("[SerpFast] ⚠️ No search results found in response - may be blocked")
+                log.debug("[SerpFast] ⚠️ No search results found in response - may be blocked")
                 return None, None, False
             
-            print(f"[SerpFast] ✓ Successfully fetched SERP ({len(html_content)} bytes)")
+            log.debug(f"[SerpFast] ✓ Successfully fetched SERP ({len(html_content)} bytes)")
             return html_content, final_url, True
             
         except requests.exceptions.Timeout:
-            print("[SerpFast] ⚠️ Request timed out")
+            log.debug("[SerpFast] ⚠️ Request timed out")
             return None, None, False
         except requests.exceptions.ConnectionError as e:
-            print(f"[SerpFast] ⚠️ Connection error: {e}")
+            log.debug(f"[SerpFast] ⚠️ Connection error: {e}")
             return None, None, False
         except Exception as e:
-            print(f"[SerpFast] ⚠️ Error: {e}")
+            log.debug(f"[SerpFast] ⚠️ Error: {e}")
             return None, None, False
     
     def _scan_serp_via_api(self, keyword: str, location: str, device: str, 
@@ -759,15 +1180,15 @@ class GeoCrawlerDriver:
                 if device.lower() == 'mobile':
                     api_url += "&device_type=mobile"
                 
-                print(f"[SerpAPI] Fetching via ScraperAPI...")
+                log.debug(f"[SerpAPI] Fetching via ScraperAPI...")
                 response = requests.get(api_url, timeout=60)
                 
                 if response.status_code == 200:
                     html_content = response.text
-                    print(f"[SerpAPI] ✓ ScraperAPI returned {len(html_content)} bytes")
+                    log.debug(f"[SerpAPI] ✓ ScraperAPI returned {len(html_content)} bytes")
                     return html_content, target_url, True
                 else:
-                    print(f"[SerpAPI] ⚠️ ScraperAPI returned status {response.status_code}")
+                    log.debug(f"[SerpAPI] ⚠️ ScraperAPI returned status {response.status_code}")
                     return None, None, False
                     
             elif provider == 'serpapi':
@@ -787,26 +1208,26 @@ class GeoCrawlerDriver:
                 if device.lower() == 'mobile':
                     params['device'] = 'mobile'
                 
-                print(f"[SerpAPI] Fetching via SerpAPI...")
+                log.debug(f"[SerpAPI] Fetching via SerpAPI...")
                 response = requests.get(api_url, params=params, timeout=60)
                 
                 if response.status_code == 200:
                     html_content = response.text
-                    print(f"[SerpAPI] ✓ SerpAPI returned {len(html_content)} bytes")
+                    log.debug(f"[SerpAPI] ✓ SerpAPI returned {len(html_content)} bytes")
                     return html_content, f"https://www.google.com/search?q={quote_plus(keyword)}", True
                 else:
-                    print(f"[SerpAPI] ⚠️ SerpAPI returned status {response.status_code}: {response.text[:200]}")
+                    log.debug(f"[SerpAPI] ⚠️ SerpAPI returned status {response.status_code}: {response.text[:200]}")
                     return None, None, False
             
             else:
-                print(f"[SerpAPI] ⚠️ Unknown provider: {provider}")
+                log.debug(f"[SerpAPI] ⚠️ Unknown provider: {provider}")
                 return None, None, False
                 
         except requests.exceptions.Timeout:
-            print(f"[SerpAPI] ⚠️ API request timed out")
+            log.debug(f"[SerpAPI] ⚠️ API request timed out")
             return None, None, False
         except Exception as e:
-            print(f"[SerpAPI] ⚠️ Error: {e}")
+            log.debug(f"[SerpAPI] ⚠️ Error: {e}")
             return None, None, False
     
     def scan_serp(self, keyword: str, location: str = "United States", 
@@ -864,7 +1285,7 @@ class GeoCrawlerDriver:
         # If we have a specific location (no gl_code match) and no coordinates, try to find them
         # [FIX] Use API-based geocoding instead of browser to avoid opening extra browser windows
         if location.strip() and not gl_code and (lat is None or lng is None):
-            print(f"[SerpScan] Location '{location}' needs coordinates. Resolving via API...")
+            log.debug(f"[SerpScan] Location '{location}' needs coordinates. Resolving via API...")
             try:
                 from ..geoip import geocode_location
                 geo_result = geocode_location(location)
@@ -877,11 +1298,11 @@ class GeoCrawlerDriver:
                     if country_code and country_code in ['us', 'gb', 'ca', 'au', 'de', 'fr', 'in', 'br', 'mx', 'es', 'it', 'nl', 'jp']:
                         gl_code = country_code
                     
-                    print(f"[SerpScan] Resolved coordinates: {lat}, {lng} -> GL: {gl_code}")
+                    log.debug(f"[SerpScan] Resolved coordinates: {lat}, {lng} -> GL: {gl_code}")
                 else:
-                    print(f"[SerpScan] Could not resolve coordinates for '{location}'")
+                    log.debug(f"[SerpScan] Could not resolve coordinates for '{location}'")
             except Exception as e:
-                print(f"[SerpScan] Geocoding error: {e}")
+                log.debug(f"[SerpScan] Geocoding error: {e}")
                 # Fallback to browser-based resolution if API fails
                 r_lat, r_lng = self.resolve_location_to_coords(location)
                 if r_lat is not None and r_lng is not None:
@@ -896,7 +1317,7 @@ class GeoCrawlerDriver:
                         elif 112 <= lng <= 154 and -44 <= lat <= -10: gl_code = 'au'
                         elif -141 <= lng <= -52 and 41 <= lat <= 83: gl_code = 'ca'
                         
-                    print(f"[SerpScan] Fallback resolved: {lat}, {lng} -> GL: {gl_code}")
+                    log.debug(f"[SerpScan] Fallback resolved: {lat}, {lng} -> GL: {gl_code}")
 
 
 
@@ -909,12 +1330,12 @@ class GeoCrawlerDriver:
              # No, UULE is good backup. But if we have lat/lng, maybe we don't strictly need it?
              # Let's keep it for now but log it.
             uule = self._generate_uule(location)
-            print(f"[SerpScan] Generated UULE for '{location}': {uule}")
+            log.debug(f"[SerpScan] Generated UULE for '{location}': {uule}")
         
         # [FIX] If we have lat/lng but no gl_code yet, infer gl_code from coordinates
         # This is essential for product/shopping searches which rely on gl parameter
         if lat is not None and lng is not None and not gl_code:
-            print(f"[SerpScan] Inferring GL code from coordinates: {lat}, {lng}")
+            log.debug(f"[SerpScan] Inferring GL code from coordinates: {lat}, {lng}")
             if -125 <= lng <= -65:  # US
                 gl_code = 'us'
             elif -10 <= lng <= 3 and 49 <= lat <= 60:  # UK
@@ -943,7 +1364,7 @@ class GeoCrawlerDriver:
                 gl_code = 'nl'
             
             if gl_code:
-                print(f"[SerpScan] Inferred GL code from coordinates: {gl_code}")
+                log.debug(f"[SerpScan] Inferred GL code from coordinates: {gl_code}")
         
         # Device viewport settings
         if device.lower() == 'mobile':
@@ -953,9 +1374,13 @@ class GeoCrawlerDriver:
             viewport = self._get_random_viewport()
             user_agent = self._get_random_user_agent()
         
-        with sync_playwright() as p:
-            # ... (launch args omitted for brevity in replace block if unchanged, but I need to include context to replace correctly)
-            # Actually I should target the lines before context creation
+        # [FIX] Global try-except to prevent Playwright crashes from killing the server
+        browser = None
+        context = None
+        browser_ctx = None
+        try:
+            # [FIX] Use PlaywrightManager singleton to avoid event loop corruption
+            pm = get_playwright_manager()
             
             # [OPTIMIZED] Enhanced launch args for better stealth and performance
             launch_args = [
@@ -967,7 +1392,6 @@ class GeoCrawlerDriver:
                 '--disable-gpu',
                 '--no-first-run',
                 '--no-default-browser-check',
-                # [NEW] Additional stealth flags
                 '--disable-extensions',
                 '--disable-background-networking',
                 '--disable-background-timer-throttling',
@@ -982,16 +1406,20 @@ class GeoCrawlerDriver:
                 '--metrics-recording-only',
                 '--password-store=basic',
                 '--use-mock-keychain',
-                # Performance optimization
                 '--disable-features=TranslateUI',
                 '--disable-features=BlinkGenPropertyTrees',
             ]
             
-            # Prepare context options
-            context_args = {
-                'user_data_dir': self.profile_dir,
-                'headless': self.headless,
-                'args': launch_args,
+            # Acquire lock and browser via context manager manually
+            browser_ctx = pm.managed_browser(
+                headless=self.headless,
+                proxy_url=self.proxy_url,
+                launch_args=launch_args
+            )
+            browser = browser_ctx.__enter__()
+            
+            # Prepare context options (excluding user_data_dir for fresh context)
+            context_options = {
                 'viewport': viewport,
                 'user_agent': user_agent,
                 'java_script_enabled': True,
@@ -1018,21 +1446,21 @@ class GeoCrawlerDriver:
             # Add Geolocation if available
             if lat is not None and lng is not None:
                 # [FIX] Use higher accuracy (10m) for better local pack results
-                context_args['geolocation'] = {'latitude': lat, 'longitude': lng, 'accuracy': 10}
-                context_args['permissions'] = ['geolocation']
-                context_args['timezone_id'] = tz_id
-                print(f"[SerpScan] 📍 Geolocation set: ({lat}, {lng}) with 10m accuracy, TZ: {tz_id}")
+                context_options['geolocation'] = {'latitude': lat, 'longitude': lng, 'accuracy': 10}
+                context_options['permissions'] = ['geolocation']
+                context_options['timezone_id'] = tz_id
+                log.debug(f"[SerpScan] 📍 Geolocation set: ({lat}, {lng}) with 10m accuracy, TZ: {tz_id}")
                 
             # Add Locale
             locale_suffix = gl_code.upper() if gl_code else 'US'
-            context_args['locale'] = f'{language}-{locale_suffix}'
+            context_options['locale'] = f'{language}-{locale_suffix}'
             
             # Add Proxy
             if self.proxy_url:
-                context_args['proxy'] = {'server': self.proxy_url}
+                context_options['proxy'] = {'server': self.proxy_url}
             
-            # Launch persistent context
-            context = p.chromium.launch_persistent_context(**context_args)
+            # Create context from the browser we got from PlaywrightManager
+            context = browser.new_context(**context_options)
 
             # [OPTIMIZED] Enhanced stealth scripts for human-like behavior
             context.add_init_script("""
@@ -1190,14 +1618,35 @@ class GeoCrawlerDriver:
                 # Default to google.com if no gl_code
                 google_domain = GOOGLE_DOMAINS.get(gl_code, 'google.com')
                 
-                # Warmup skipped for speed
-                # proceeding to direct navigation optimization
+                # [CRITICAL] WARM-UP VISIT - Real users come from Google homepage
+                # Bots that directly hit search URLs get flagged immediately
+                log.debug(f"[SerpScan] Starting warm-up visit to Google homepage...")
+                try:
+                    # First visit Google homepage to establish session cookies
+                    page.goto(f'https://www.{google_domain}/', wait_until='domcontentloaded', timeout=15000)
+                    random_delay(1000, 2500)  # Wait like a human looking at the page
+                    
+                    # Accept cookies/consent if shown (important for EU regions)
+                    try:
+                        consent_btns = page.locator('button:has-text("Accept"), button:has-text("I agree"), button:has-text("Accept all")')
+                        if consent_btns.count() > 0:
+                            consent_btns.first.click()
+                            random_delay(500, 1000)
+                            log.debug("[SerpScan] Accepted consent dialog")
+                    except:
+                        pass
+                    
+                    # Simulate human interaction - move mouse, maybe scroll
+                    try:
+                        human_like_mouse_move(page, random.randint(300, 600), random.randint(200, 400))
+                        random_delay(300, 700)
+                    except:
+                        pass
+                    
+                except Exception as warmup_err:
+                    log.debug(f"[SerpScan] Warmup warning: {warmup_err}")
                 
-                # (Simulation removed)
-                
-                # DIRECT NAVIGATION (Optimized)
-                # Skip warm-up and simulated typing for speed
-                
+                # Now navigate to search via the actual search box or direct URL
                 search_url = f'https://www.{google_domain}/search?q={quote_plus(keyword)}&hl={language}&num={depth}'
                 
                 if gl_code:
@@ -1206,33 +1655,60 @@ class GeoCrawlerDriver:
                 if uule:
                     search_url += f'&uule={uule}'
                     
-                print(f"[SerpScan] fast-nav -> {search_url}")
-                # [OPTIMIZED] Faster page loading with smart wait
+                log.debug(f"[SerpScan] Navigating to search -> {search_url}")
+                
+                # [STEALTH] Use longer timeout and networkidle for more realistic loading
                 try:
-                    page.goto(search_url, wait_until='domcontentloaded', timeout=20000)
+                    page.goto(search_url, wait_until='networkidle', timeout=25000)
+                    
+                    # [NEW] CAPTCHA DETECTION & MANUAL SOLVE WAIT
+                    # Check if we hit the "Unusual traffic" or "I'm not a robot" page
+                    page_content = page.content().lower()
+                    if "unusual traffic" in page_content or "recaptcha" in page_content or "i'm not a robot" in page_content:
+                        log.warning("[CAPTCHA] ⚠️ GOOGLE BLOCK DETECTED!")
+                        log.warning("[CAPTCHA] The browser is visible - PLEASE SOLVE THE CAPTCHA MANUALLY NOW.")
+                        log.warning("[CAPTCHA] The script is paused waiting for search results to appear...")
+                        
+                        # Wait for user to solve it (up to 5 minutes)
+                        # We check for the search results container (#rso) every 2 seconds
+                        try:
+                            for i in range(150): # 300 seconds
+                                time.sleep(2)
+                                if page.locator('#rso, #search, .g').count() > 0:
+                                    log.info("[CAPTCHA] ✓ access restored! Resuming...")
+                                    break
+                                if i % 15 == 0:
+                                    log.debug(f"[CAPTCHA] Waiting for manual solution... ({i*2}s)")
+                        except:
+                            pass
+                            
                 except Exception as nav_err:
-                    print(f"[SerpScan] Navigation warning: {nav_err}")
+                    log.debug(f"[SerpScan] Navigation warning: {nav_err}")
                 
                 # [OPTIMIZED] Smart wait - check for content before fixed delay
-                print(f"[SerpScan] Waiting for search results (depth={depth})...")
+                log.debug(f"[SerpScan] Waiting for search results (depth={depth})...")
                 try:
                     # Wait for search results container (max 3s, usually much faster)
                     page.wait_for_selector('#rso, #search, .g', timeout=3000)
                 except:
                     pass  # Continue anyway
                 
-                # [OPTIMIZED] Reduced fixed wait (human-like micro-delay)
-                time.sleep(random.uniform(0.5, 1.2))
+                # [STEALTH] Longer wait for page to fully render - short waits are bot signals
+                random_delay(1500, 3000)
                 
-                # [NEW] Simulate human-like mouse movement to avoid detection
+                # [ENHANCED] Simulate human-like mouse movement and scroll to avoid detection
                 try:
-                    page.mouse.move(
-                        random.randint(100, 400),
-                        random.randint(200, 500),
-                        steps=random.randint(3, 8)
-                    )
-                except:
-                    pass
+                    # Natural Bezier curve mouse movement to a random position
+                    human_like_mouse_move(page, random.randint(150, 500), random.randint(200, 400))
+                    random_delay(500, 1000)
+                    
+                    # Simulate casual viewport scroll (like a human reading results)
+                    human_like_scroll(page, 'down', random.randint(200, 400))
+                    random_delay(800, 1500)
+                    human_like_scroll(page, 'up', random.randint(100, 200))
+                    random_delay(300, 600)
+                except Exception as e:
+                    log.debug(f"[Stealth] Human simulation skipped: {e}")
                 
                 # [ENHANCED] Check for CAPTCHA and handle automatically or wait for manual solving
                 def solve_captcha_via_api(site_key: str, page_url: str) -> str:
@@ -1248,7 +1724,7 @@ class GeoCrawlerDriver:
                     try:
                         if config.CAPTCHA_PROVIDER == '2captcha':
                             # Submit CAPTCHA to 2captcha
-                            print(f"[CAPTCHA] Submitting to 2captcha...")
+                            log.debug(f"[CAPTCHA] Submitting to 2captcha...")
                             submit_url = "http://2captcha.com/in.php"
                             submit_data = {
                                 'key': api_key,
@@ -1261,11 +1737,11 @@ class GeoCrawlerDriver:
                             result = resp.json()
                             
                             if result.get('status') != 1:
-                                print(f"[CAPTCHA] 2captcha error: {result.get('error_text', 'Unknown error')}")
+                                log.debug(f"[CAPTCHA] 2captcha error: {result.get('error_text', 'Unknown error')}")
                                 return None
                             
                             captcha_id = result.get('request')
-                            print(f"[CAPTCHA] 2captcha submitted, ID: {captcha_id}")
+                            log.debug(f"[CAPTCHA] 2captcha submitted, ID: {captcha_id}")
                             
                             # Poll for result
                             for attempt in range(60):  # Max 3 minutes
@@ -1276,18 +1752,18 @@ class GeoCrawlerDriver:
                                 
                                 if check_result.get('status') == 1:
                                     token = check_result.get('request')
-                                    print(f"[CAPTCHA] ✓ 2captcha solved!")
+                                    log.debug(f"[CAPTCHA] ✓ 2captcha solved!")
                                     return token
                                 elif 'CAPCHA_NOT_READY' not in check_result.get('request', ''):
-                                    print(f"[CAPTCHA] 2captcha error: {check_result.get('request')}")
+                                    log.debug(f"[CAPTCHA] 2captcha error: {check_result.get('request')}")
                                     return None
                                     
                                 if attempt % 10 == 0:
-                                    print(f"[CAPTCHA] Waiting for 2captcha... ({attempt * 3}s)")
+                                    log.debug(f"[CAPTCHA] Waiting for 2captcha... ({attempt * 3}s)")
                         
                         elif config.CAPTCHA_PROVIDER == 'anticaptcha':
                             # Submit CAPTCHA to antiCaptcha
-                            print(f"[CAPTCHA] Submitting to antiCaptcha...")
+                            log.debug(f"[CAPTCHA] Submitting to antiCaptcha...")
                             submit_url = "https://api.anti-captcha.com/createTask"
                             submit_data = {
                                 "clientKey": api_key,
@@ -1301,11 +1777,11 @@ class GeoCrawlerDriver:
                             result = resp.json()
                             
                             if result.get('errorId') != 0:
-                                print(f"[CAPTCHA] antiCaptcha error: {result.get('errorDescription', 'Unknown error')}")
+                                log.debug(f"[CAPTCHA] antiCaptcha error: {result.get('errorDescription', 'Unknown error')}")
                                 return None
                             
                             task_id = result.get('taskId')
-                            print(f"[CAPTCHA] antiCaptcha submitted, ID: {task_id}")
+                            log.debug(f"[CAPTCHA] antiCaptcha submitted, ID: {task_id}")
                             
                             # Poll for result
                             for attempt in range(60):
@@ -1317,17 +1793,17 @@ class GeoCrawlerDriver:
                                 
                                 if check_result.get('status') == 'ready':
                                     token = check_result.get('solution', {}).get('gRecaptchaResponse')
-                                    print(f"[CAPTCHA] ✓ antiCaptcha solved!")
+                                    log.debug(f"[CAPTCHA] ✓ antiCaptcha solved!")
                                     return token
                                 elif check_result.get('status') == 'processing':
                                     if attempt % 10 == 0:
-                                        print(f"[CAPTCHA] Waiting for antiCaptcha... ({attempt * 3}s)")
+                                        log.debug(f"[CAPTCHA] Waiting for antiCaptcha... ({attempt * 3}s)")
                                 else:
-                                    print(f"[CAPTCHA] antiCaptcha error: {check_result.get('errorDescription')}")
+                                    log.debug(f"[CAPTCHA] antiCaptcha error: {check_result.get('errorDescription')}")
                                     return None
                         
                     except Exception as e:
-                        print(f"[CAPTCHA] API error: {e}")
+                        log.debug(f"[CAPTCHA] API error: {e}")
                     
                     return None
                 
@@ -1336,14 +1812,14 @@ class GeoCrawlerDriver:
                     try:
                         html_preview = pg.content()[:10000].lower()
                     except Exception as e:
-                        print(f"[SerpScan] Warning: Could not check for CAPTCHA (page navigating?): {e}")
+                        log.debug(f"[SerpScan] Warning: Could not check for CAPTCHA (page navigating?): {e}")
                         time.sleep(2)
                         return True
 
                     captcha_indicators = ['unusual traffic', 'captcha', 'recaptcha', 'verify you', 'not a robot']
                     
                     if any(indicator in html_preview for indicator in captcha_indicators):
-                        print("[SerpScan] ⚠️ CAPTCHA detected!")
+                        log.debug("[SerpScan] ⚠️ CAPTCHA detected!")
                         
                         # Try to extract reCAPTCHA site key for automatic solving
                         site_key = None
@@ -1352,7 +1828,7 @@ class GeoCrawlerDriver:
                             site_key_match = re.search(r'data-sitekey=["\']([^"\']+)["\']', pg.content())
                             if site_key_match:
                                 site_key = site_key_match.group(1)
-                                print(f"[CAPTCHA] Found site key: {site_key[:20]}...")
+                                log.debug(f"[CAPTCHA] Found site key: {site_key[:20]}...")
                         except:
                             pass
                         
@@ -1375,13 +1851,13 @@ class GeoCrawlerDriver:
                                     # Check if solved
                                     new_html = pg.content()[:5000].lower()
                                     if not any(ind in new_html for ind in captcha_indicators):
-                                        print("[CAPTCHA] ✓ Automatic CAPTCHA solving succeeded!")
+                                        log.debug("[CAPTCHA] ✓ Automatic CAPTCHA solving succeeded!")
                                         return True
                                 except Exception as e:
-                                    print(f"[CAPTCHA] Token injection error: {e}")
+                                    log.debug(f"[CAPTCHA] Token injection error: {e}")
                         
                         # Fall back to manual solving
-                        print(f"[SerpScan] Waiting up to {max_wait} seconds for manual CAPTCHA solve...")
+                        log.debug(f"[SerpScan] Waiting up to {max_wait} seconds for manual CAPTCHA solve...")
                         
                         for wait_count in range(max_wait // 2):
                             time.sleep(2)  # Check more frequently
@@ -1391,13 +1867,13 @@ class GeoCrawlerDriver:
                                 continue
 
                             if 'search' in current_html and not any(ind in current_html for ind in captcha_indicators):
-                                print("[SerpScan] ✓ CAPTCHA solved! Continuing...")
+                                log.debug("[SerpScan] ✓ CAPTCHA solved! Continuing...")
                                 time.sleep(1)
                                 return True
                             if wait_count % 10 == 0:
-                                print(f"[SerpScan] Still waiting for CAPTCHA... ({wait_count * 2}s)")
+                                log.debug(f"[SerpScan] Still waiting for CAPTCHA... ({wait_count * 2}s)")
                         
-                        print("[SerpScan] ⚠️ Timeout waiting for CAPTCHA. Results may be incomplete.")
+                        log.debug("[SerpScan] ⚠️ Timeout waiting for CAPTCHA. Results may be incomplete.")
                         return False
                     return True
                 
@@ -1408,7 +1884,7 @@ class GeoCrawlerDriver:
                 all_html_parts = []
                 
                 if depth > 10:
-                    print(f"[SerpScan] Collecting results across multiple pages for depth={depth}...")
+                    log.debug(f"[SerpScan] Collecting results across multiple pages for depth={depth}...")
                     
                     # Calculate how many pages we might need (10 results per page)
                     pages_needed = max(1, depth // 10)
@@ -1417,7 +1893,7 @@ class GeoCrawlerDriver:
                         # Capture current page's HTML
                         current_html = page.content()
                         all_html_parts.append(current_html)
-                        print(f"[SerpScan] Captured page {page_num + 1} ({len(current_html)} bytes)")
+                        log.debug(f"[SerpScan] Captured page {page_num + 1} ({len(current_html)} bytes)")
                         
                         if page_num >= pages_needed - 1:
                             break
@@ -1441,7 +1917,7 @@ class GeoCrawlerDriver:
                                 more_btn = page.locator(selector).first
                                 if more_btn.is_visible(timeout=1500):
                                     more_btn.click()
-                                    print(f"[SerpScan] Moving to page {page_num + 2}...")
+                                    log.debug(f"[SerpScan] Moving to page {page_num + 2}...")
                                     clicked = True
                                     # [OPTIMIZED] Wait for next page to load
                                     try:
@@ -1454,13 +1930,13 @@ class GeoCrawlerDriver:
                                 continue
                         
                         if not clicked:
-                            print("[SerpScan] No more pages available")
+                            log.debug("[SerpScan] No more pages available")
                             break
                     
                     # Combine all HTML parts - wrap in container for parser
                     # Combine all HTML parts - Merge into the first page (Base)
                     # [FIX] Use Page 1 as base to preserve Local Pack and other features
-                    print(f"[SerpScan] Merging {len(all_html_parts)} pages into single SERP...")
+                    log.debug(f"[SerpScan] Merging {len(all_html_parts)} pages into single SERP...")
                     from bs4 import BeautifulSoup
                     
                     # Parse Page 1 as the base
@@ -1482,13 +1958,13 @@ class GeoCrawlerDriver:
                                     for child in list(part_rso.children):
                                         base_rso.append(child)
                             except Exception as e:
-                                print(f"[SerpScan] Error merging page {i+2}: {e}")
+                                log.debug(f"[SerpScan] Error merging page {i+2}: {e}")
                                 
                         content = str(base_soup)
-                        print(f"[SerpScan] Merged content size: {len(content)} bytes")
+                        log.debug(f"[SerpScan] Merged content size: {len(content)} bytes")
                     else:
                          # Fallback if Page 1 structure is weird - just concat strings (raw)
-                         print("[SerpScan] Could not find #rso in Page 1, falling back to concatenation")
+                         log.debug("[SerpScan] Could not find #rso in Page 1, falling back to concatenation")
                          content = "".join(all_html_parts)
                     
                     final_url = page.url
@@ -1500,7 +1976,7 @@ class GeoCrawlerDriver:
                     
                     content = page.content()
                     final_url = page.url
-                    print(f"[SerpScan] Captured {len(content)} bytes of HTML")
+                    log.debug(f"[SerpScan] Captured {len(content)} bytes of HTML")
 
                 # --- AI MODE TAB DETECTION (Labs Feature) ---
                 # Check if "AI Mode" tab exists and capture it
@@ -1525,8 +2001,13 @@ class GeoCrawlerDriver:
                         except: continue
                     
                     if ai_mode_tab:
-                        print("[SerpScan] Found 'AI Mode' tab! Navigating to AI view...")
-                        ai_mode_tab.click()
+                        log.debug("[SerpScan] Found 'AI Mode' tab! Navigating to AI view...")
+                        try:
+                            ai_mode_tab.click(timeout=5000)
+                        except Exception as e:
+                             log.debug(f"[SerpScan] Failed to click AI Mode tab: {e}")
+                             raise e # Re-raise to be caught by outer try/except and skip AI mode logic 
+
                         
                         # Wait for the AI interface to load
                         try:
@@ -1560,7 +2041,7 @@ class GeoCrawlerDriver:
                             try:
                                 show_all_btn = page.locator(sel).first
                                 if show_all_btn.is_visible(timeout=2000):
-                                    print(f"[SerpScan] Found 'Show all' button via: {sel}")
+                                    log.debug(f"[SerpScan] Found 'Show all' button via: {sel}")
                                     
                                     # Scroll it into view
                                     show_all_btn.scroll_into_view_if_needed()
@@ -1569,7 +2050,7 @@ class GeoCrawlerDriver:
                                     # Click it
                                     show_all_btn.click()
                                     show_all_clicked = True
-                                    print("[SerpScan] Clicked 'Show all' - waiting for full list to load...")
+                                    log.debug("[SerpScan] Clicked 'Show all' - waiting for full list to load...")
                                     
                                     # Wait for expanded list to fully render
                                     time.sleep(3.0)
@@ -1584,7 +2065,7 @@ class GeoCrawlerDriver:
                                 continue
                         
                         if not show_all_clicked:
-                            print("[SerpScan] Could not find 'Show all' button - capturing visible citations only")
+                            log.debug("[SerpScan] Could not find 'Show all' button - capturing visible citations only")
                             # Try scrolling the sidebar to load more
                             try:
                                 sidebar = page.locator('[class*="sidebar"], [class*="panel"]').first
@@ -1597,10 +2078,10 @@ class GeoCrawlerDriver:
                         
                         # Capture the full AI Mode content including all expanded citations
                         ai_mode_html = page.content()
-                        print(f"[SerpScan] Captured AI Mode content ({len(ai_mode_html)} bytes)")
+                        log.debug(f"[SerpScan] Captured AI Mode content ({len(ai_mode_html)} bytes)")
                         
                 except Exception as e:
-                    print(f"[SerpScan] AI Mode check/capture failed: {e}")
+                    log.debug(f"[SerpScan] AI Mode check/capture failed: {e}")
                     
                 if ai_mode_html:
                     content += f"\n<!-- AI_MODE_HTML_START -->\n{ai_mode_html}\n<!-- AI_MODE_HTML_END -->"
@@ -1625,7 +2106,7 @@ class GeoCrawlerDriver:
                     ai_header = soup_ai.find(lambda tag: tag.name in ['h1', 'h2', 'span', 'div'] and tag.get_text(strip=True) == "AI Overview")
                     
                     if ai_container or ai_header:
-                        print("[SerpScan] AI Overview detected! Attempting expansion...")
+                        log.debug("[SerpScan] AI Overview detected! Attempting expansion...")
                         
                         # Try to click "Show more" or expand button
                         expand_clicked = False
@@ -1642,7 +2123,7 @@ class GeoCrawlerDriver:
                             try:
                                 expand_btn = page.locator(selector).first
                                 if expand_btn.is_visible(timeout=1000):
-                                    print(f"[SerpScan] Found AI expand button via: {selector}")
+                                    log.debug(f"[SerpScan] Found AI expand button via: {selector}")
                                     # Hover first to simulate human interest
                                     expand_btn.hover()
                                     time.sleep(random.uniform(0.5, 1.0)) 
@@ -1650,16 +2131,16 @@ class GeoCrawlerDriver:
                                     expand_clicked = True
                                     
                                     # [FIX] Wait longer for generation/expansion (AI can be slow)
-                                    print("[SerpScan] Waiting for AI content to generate...")
+                                    log.debug("[SerpScan] Waiting for AI content to generate...")
                                     time.sleep(4.0) 
                                     break
                             except:
                                 continue
                         
                         if expand_clicked:
-                            print("[SerpScan] AI Overview expanded successfully")
+                            log.debug("[SerpScan] AI Overview expanded successfully")
                         else:
-                            print("[SerpScan] AI Overview may already be fully expanded")
+                            log.debug("[SerpScan] AI Overview may already be fully expanded")
                         
                         # Re-capture content after expansion
                         # Wait for network idle to ensure streaming content finishes
@@ -1682,15 +2163,15 @@ class GeoCrawlerDriver:
                         
                         if ai_section:
                             ai_overview_html = str(ai_section)
-                            print(f"[SerpScan] Captured AI Overview ({len(ai_overview_html)} bytes)")
+                            log.debug(f"[SerpScan] Captured AI Overview ({len(ai_overview_html)} bytes)")
                             
                             # Update main content with expanded version
                             content = ai_content_now
                     else:
-                        print("[SerpScan] No AI Overview detected on this SERP")
+                        log.debug("[SerpScan] No AI Overview detected on this SERP")
                         
                 except Exception as ai_err:
-                    print(f"[SerpScan] AI Overview expansion error: {ai_err}")
+                    log.debug(f"[SerpScan] AI Overview expansion error: {ai_err}")
 
                 # Append AI Overview HTML with markers if captured
                 if ai_overview_html:
@@ -1750,11 +2231,11 @@ class GeoCrawlerDriver:
                     if detected_intent == 'ORGANIC':
                         fallback_hotel_link = soup_check.find(lambda tag: tag.name == 'a' and ('View all hotels' in tag.get_text() or 'More hotels' in tag.get_text()) and 'google' not in tag.get('href', ''))
                         if fallback_hotel_link:
-                            print(f"[SerpScan] Fallback: Detected Hotel intent via Link '{fallback_hotel_link.get_text()}'")
+                            log.debug(f"[SerpScan] Fallback: Detected Hotel intent via Link '{fallback_hotel_link.get_text()}'")
                             detected_intent = 'HOTELS'
                             detected_heading_text = "Fallback Link"
 
-                    print(f"[SerpScan] Detected Heading: '{detected_heading_text}' -> Intent: {detected_intent}")
+                    log.debug(f"[SerpScan] Detected Heading: '{detected_heading_text}' -> Intent: {detected_intent}")
                     
                     if detected_heading_text:
                         content += f"\n<!-- DETECTED_HEADING: {detected_heading_text} -->\n"
@@ -1779,9 +2260,12 @@ class GeoCrawlerDriver:
                             # VALIDATION: Ensure it looks like a map/search URL (not video)
                             if '/maps' in local_url or 'tbs=lrf' in local_url or '/search?' in local_url:
                                 if '/vid' not in local_url:
-                                    print(f"[SerpScan] Found VALID 'More places' URL: {local_url}")
-                                    print("[SerpScan] Navigating to Local Finder...")
-                                    page.goto(local_url, wait_until='domcontentloaded', timeout=20000)
+                                    log.debug(f"[SerpScan] Found VALID 'More places' URL: {local_url}")
+                                    log.debug("[SerpScan] Navigating to Local Finder...")
+                                    try:
+                                        page.goto(local_url, wait_until='domcontentloaded', timeout=20000)
+                                    except Exception as nav_err:
+                                        log.debug(f"[SerpScan] Local Finder navigation warning (proceeding anyway): {nav_err}")
                                     
                                     # [FIX] Wait for lazy-loaded content (Phone, Timings)
                                     try:
@@ -1793,23 +2277,28 @@ class GeoCrawlerDriver:
                                     
                                     # 2. Trigger lazy load by scrolling
                                     try:
-                                        print("[SerpScan] Triggering lazy load via scroll...")
-                                        page.mouse.wheel(0, 500)
-                                        time.sleep(0.5)
-                                        page.mouse.wheel(0, 1000)
-                                        time.sleep(1.0)
-                                        page.mouse.wheel(0, -1500) # Scroll back up for top results
-                                        time.sleep(1.0)
+                                        if not page.is_closed():
+                                            log.debug("[SerpScan] Triggering lazy load via scroll...")
+                                            # Use safe scroll wrapper
+                                            try:
+                                                page.mouse.wheel(0, 500)
+                                                time.sleep(0.5)
+                                                page.mouse.wheel(0, 1000)
+                                                time.sleep(1.0)
+                                                page.mouse.wheel(0, -1500) # Scroll back up for top results
+                                                time.sleep(1.0)
+                                            except Exception as scroll_err:
+                                                log.debug(f"[SerpScan] Scroll error (ignoring): {scroll_err}")
                                     except Exception as e:
-                                        print(f"[SerpScan] Scroll/Wait warning: {e}")
+                                        log.debug(f"[SerpScan] Scroll/Wait warning: {e}")
 
                                 else:
-                                    print(f"[SerpScan] SKIPPING: URL looks like video/image: {local_url}")
+                                    log.debug(f"[SerpScan] SKIPPING: URL looks like video/image: {local_url}")
                             else:
-                                print(f"[SerpScan] SKIPPING: URL does not look like Local Finder: {local_url}")
+                                log.debug(f"[SerpScan] SKIPPING: URL does not look like Local Finder: {local_url}")
 
                     elif detected_intent == 'HOTELS':
-                        print(f"[SerpScan] Hotel intent detected via '{detected_heading_text}'. Looking for 'See more' link...")
+                        log.debug(f"[SerpScan] Hotel intent detected via '{detected_heading_text}'. Looking for 'See more' link...")
                         # Look for "View all", "More hotels", or similar
                         hotel_link = soup_check.find(lambda tag: tag.name == 'a' and ('View all' in tag.get_text() or 'More hotels' in tag.get_text() or 'See more' in tag.get_text()) and 'google' not in tag.get('href', ''))
                         
@@ -1823,8 +2312,8 @@ class GeoCrawlerDriver:
                                 hotel_url += f"&gl={gl_code}"
 
                             
-                            print(f"[SerpScan] Found Hotel View URL: {hotel_url}")
-                            print("[SerpScan] Navigating to Hotel Finder...")
+                            log.debug(f"[SerpScan] Found Hotel View URL: {hotel_url}")
+                            log.debug("[SerpScan] Navigating to Hotel Finder...")
                             page.goto(hotel_url, wait_until='domcontentloaded', timeout=20000)
                             
                             # Hotel finder specific wait - it often takes longer to load the grid
@@ -1835,19 +2324,19 @@ class GeoCrawlerDriver:
                                 time.sleep(random.uniform(2.0, 4.0)) # Extra wait for Hotel UI
                                 
                                 # Scroll logic specifically for Hotels
-                                print("[SerpScan] Scrolling Hotel List...")
+                                log.debug("[SerpScan] Scrolling Hotel List...")
                                 for _ in range(4):
                                     page.mouse.wheel(0, random.randint(500, 800))
                                     time.sleep(random.uniform(0.8, 1.5))
                                     
                             except Exception as e:
-                                print(f"[SerpScan] Hotel wait/scroll warning: {e}")
+                                log.debug(f"[SerpScan] Hotel wait/scroll warning: {e}")
                                 time.sleep(2)
                         else:
-                            print("[SerpScan] Could not find a 'View all' link for Hotels.")
+                            log.debug("[SerpScan] Could not find a 'View all' link for Hotels.")
 
                     elif detected_intent == 'SHOPPING':
-                        print("[SerpScan] Shopping intent detected. Looking for 'Shopping' tab...")
+                        log.debug("[SerpScan] Shopping intent detected. Looking for 'Shopping' tab...")
                         # 1. Try to find the "Shopping" tab in the top navigation bar
                         # Tabs are usually <a> tags with text "Shopping"
                         shopping_tab = soup_check.find(lambda tag: tag.name == 'a' and 'Shopping' in tag.get_text())
@@ -1864,8 +2353,8 @@ class GeoCrawlerDriver:
                                  shopping_url += f"&gl={gl_code}"
 
                              
-                             print(f"[SerpScan] Found Shopping Tab URL: {shopping_url}")
-                             print("[SerpScan] Navigating to Shopping Tab...")
+                             log.debug(f"[SerpScan] Found Shopping Tab URL: {shopping_url}")
+                             log.debug("[SerpScan] Navigating to Shopping Tab...")
                              page.goto(shopping_url, wait_until='domcontentloaded', timeout=20000)
                              
                              # Wait for product grid
@@ -1875,23 +2364,23 @@ class GeoCrawlerDriver:
                                  page.wait_for_selector('div.sh-pr__product-results-grid, div.sh-dgr__grid-result, div[data-docid], div.i0X6df, div.KZmu8e', timeout=10000)
                                  time.sleep(2)
                                  
-                                 print("[SerpScan] Scrolling Shopping List...")
+                                 log.debug("[SerpScan] Scrolling Shopping List...")
                                  for _ in range(3):
                                      page.mouse.wheel(0, 800)
                                      time.sleep(1)
                                      
                              except Exception as e:
-                                 print(f"[SerpScan] Shopping grid wait warning: {e}")
+                                 log.debug(f"[SerpScan] Shopping grid wait warning: {e}")
                                  time.sleep(1)
                         else:
-                             print("[SerpScan] Could not find 'Shopping' tab link.")
+                             log.debug("[SerpScan] Could not find 'Shopping' tab link.")
 
                     elif detected_intent == 'ORGANIC':
                         # Fallback / Default
                         pass
 
                 except Exception as e:
-                    print(f"[SerpScan] Error during navigation check: {e}")
+                    log.debug(f"[SerpScan] Error during navigation check: {e}")
                     pass
                 
                 # --- Post-Navigation Scraping ---
@@ -1900,26 +2389,26 @@ class GeoCrawlerDriver:
                 detected_move = page.url != final_url
                 
                 if detected_move:
-                    print(f"[SerpScan] Navigation occurred. Current URL: {page.url}")
+                    log.debug(f"[SerpScan] Navigation occurred. Current URL: {page.url}")
                     
                     if detected_intent == 'HOTELS':
                          try:
                             # Hotel specific scraping
                             # Hotels often load lazily. Ensure we capture enough.
                             hotel_html = page.content()
-                            print(f"[SerpScan] Captured Hotel List ({len(hotel_html)} bytes)")
+                            log.debug(f"[SerpScan] Captured Hotel List ({len(hotel_html)} bytes)")
                             
                             content += f"\n<!-- HOTELS_HTML_START -->\n{hotel_html}\n<!-- HOTELS_HTML_END -->"
                          except Exception as e:
-                             print(f"[SerpScan] Error scraping Hotel content: {e}")
+                             log.debug(f"[SerpScan] Error scraping Hotel content: {e}")
 
                     elif detected_intent == 'SHOPPING':
                         try:
                             shopping_html = page.content()
-                            print(f"[SerpScan] Captured Shopping List ({len(shopping_html)} bytes)")
+                            log.debug(f"[SerpScan] Captured Shopping List ({len(shopping_html)} bytes)")
                             content += f"\n<!-- SHOPPING_HTML_START -->\n{shopping_html}\n<!-- SHOPPING_HTML_END -->"
                         except Exception as e:
-                            print(f"[SerpScan] Error scraping Shopping content: {e}")
+                            log.debug(f"[SerpScan] Error scraping Shopping content: {e}")
 
                     else:
                         # Assume Local Finder (PLACES)
@@ -1946,19 +2435,19 @@ class GeoCrawlerDriver:
                                 time.sleep(1)
                             
                             local_finder_html = page.content()
-                            print(f"[SerpScan] Captured Local Finder ({len(local_finder_html)} bytes)")
+                            log.debug(f"[SerpScan] Captured Local Finder ({len(local_finder_html)} bytes)")
                             
                             # Append to content with marker
                             content += f"\n<!-- LOCAL_FINDER_HTML_START -->\n{local_finder_html}\n<!-- LOCAL_FINDER_HTML_END -->"
                             
                         except Exception as e:
-                            print(f"[SerpScan] Extended Local Pack Error: {e}")
+                            log.debug(f"[SerpScan] Extended Local Pack Error: {e}")
 
                 
                 return content, final_url
                 
             except Exception as e:
-                print(f"[SerpScan] Error: {e}")
+                log.debug(f"[SerpScan] Error: {e}")
                 import traceback
                 traceback.print_exc()
                 return None, None
@@ -1968,4 +2457,18 @@ class GeoCrawlerDriver:
                     context.close()
                 except:
                     pass
+                try:
+                    if browser_ctx:
+                        browser_ctx.__exit__(None, None, None)
+                    elif browser:
+                        browser.close()
+                except:
+                    pass
+        
+        except Exception as global_err:
+            # [FIX] Catch Playwright/greenlet crashes that would otherwise kill the server
+            log.error(f"[SerpScan] Fatal Playwright error: {global_err}")
+            import traceback
+            traceback.print_exc()
+            return None, None
 

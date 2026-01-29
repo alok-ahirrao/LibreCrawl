@@ -148,47 +148,63 @@ class GridEngine:
         }
         
         try:
+            # Jitter: Random stagger to prevent all browsers launching simultaneously (Thundering Herd)
+            # This significantly improves stability when running 20+ workers
+            if point_index > 0:
+                time.sleep(random.uniform(0.1, 1.5))
+
             # Check cache first
             cached = get_cached_serp(keyword, lat, lng)
             if cached:
-                result['top_results'] = cached
+                full_results = cached
                 result['cached'] = True
             else:
-                # Perform fresh crawl
-                driver = GeoCrawlerDriver(
-                    headless=config.CRAWLER_HEADLESS,
-                    proxy_url=config.PROXY_URL if config.PROXY_ENABLED else None
-                )
-                
-                html = driver.scan_grid_point(
-                    keyword, 
-                    lat, 
-                    lng, 
-                    fast_mode=config.CRAWLER_FAST_MODE
-                )
-                
-                if html:
-                    parsed_results = self.parser.parse_list_results(html)
-                    result['top_results'] = parsed_results[:20]  # Top 20
-                    
-                    # Cache the results
-                    save_serp_cache(keyword, lat, lng, parsed_results, config.CACHE_TTL_SERP_RESULT)
-                    result['cached'] = False
-                else:
-                    result['error'] = 'Failed to fetch results'
+                # Retry loop for reliability
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        # Perform fresh crawl
+                        driver = GeoCrawlerDriver(
+                            headless=config.CRAWLER_HEADLESS,
+                            proxy_url=config.PROXY_URL if config.PROXY_ENABLED else None
+                        )
+                        
+                        # Pass target_business_name for early exit optimization
+                        html = driver.scan_grid_point(
+                            keyword, 
+                            lat, 
+                            lng, 
+                            fast_mode=config.CRAWLER_FAST_MODE,
+                            target_name=target_business_name
+                        )
+                        
+                        if html:
+                            parsed_results = self.parser.parse_list_results(html)
+                            full_results = parsed_results # Keep ALL results for checking
+                            
+                            # Cache the results
+                            save_serp_cache(keyword, lat, lng, parsed_results, config.CACHE_TTL_SERP_RESULT)
+                            result['cached'] = False
+                            # Success, break loop
+                            break
+                        else:
+                            if attempt == max_retries - 1:
+                                full_results = []
+                                result['error'] = 'Failed to fetch results (Empty HTML)'
+                    except Exception as scan_err:
+                        if attempt == max_retries - 1:
+                            raise scan_err
+                        time.sleep(2) # Backoff before retry
             
-            # Find target business rank
-            if result['top_results']:
-                # First try place_id match (exact)
+            # Find target business rank IN FULL RESULTS (before truncation)
+            if full_results:
                 # First try place_id match (exact)
                 if target_place_id:
                     print(f"[GridEngine] Checking target ID: {target_place_id}")
-                    for r in result['top_results']:
+                    for r in full_results:
                         rid = r.get('place_id')
-                        # Debug extracted IDs
-                        # print(f"  -> Candidate ID: {rid} | Name: {r.get('name')}") 
                         if rid == target_place_id:
-                            print(f"[GridEngine] MATCH FOUND by ID! {rid}")
+                            print(f"[GridEngine] MATCH FOUND by ID! {rid} at rank {r['rank']}")
                             result['target_rank'] = r['rank']
                             result['target_found'] = True
                             break
@@ -197,22 +213,26 @@ class GridEngine:
                 if not result['target_found'] and target_business_name:
                     print(f"[GridEngine] Fallback to name match for: {target_business_name}")
                     target_lower = target_business_name.lower().strip()
-                    for r in result['top_results']:
+                    for r in full_results:
                         result_name = r.get('name', '').lower().strip()
-                        # print(f"  -> Comparing '{target_lower}' vs '{result_name}'")
                         
                         # Check for substring match (either direction) or high similarity
                         if (target_lower in result_name or 
                             result_name in target_lower or
                             self._name_similarity(target_lower, result_name) > 0.7):
                             
-                            print(f"[GridEngine] MATCH FOUND by Name! {result_name}")
+                            print(f"[GridEngine] MATCH FOUND by Name! {result_name} at rank {r['rank']}")
                             result['target_rank'] = r['rank']
                             result['target_found'] = True
                             break
             
+            # Store top 100 results in DB to ensure we show the full picture
+            result['top_results'] = full_results[:100] if full_results else []
+            
         except Exception as e:
             result['error'] = str(e)
+            print(f"[GridEngine] Error in scan point {point_index}: {e}")
+            traceback.print_exc()
         
         # Rate limiting delay
         if config.CRAWLER_FAST_MODE:
@@ -290,8 +310,29 @@ class GridEngine:
         self._update_scan_status(scan_id, 'running', completed, total_points)
         
         try:
+            # Dynamic Worker Scaling Optimization
+            # 3x3 (9 pts) -> 5 workers (default)
+            # 5x5 (25 pts) -> 10 workers
+            # 7x7 (49 pts) -> 14 workers
+            # Works for both 'square' and 'circle' shapes as they have similar point counts for same grid_size
+            
+            dynamic_workers = self.max_workers
+            
+            # Scaled concurrency (Balanced for stability/speed)
+            if grid_size >= 7:
+                 # 7x7 (49 pts) -> 16 workers (approx 3 batches)
+                 dynamic_workers = max(self.max_workers, 16)
+            elif grid_size >= 5:
+                 # 5x5 (25 pts) -> 12 workers (approx 2 batches)
+                 dynamic_workers = max(self.max_workers, 12)
+                 
+            # Cap at 16 to match the browser driver limit
+            dynamic_workers = min(dynamic_workers, 16)
+            
+            print(f"[GridEngine] Starting scan with {dynamic_workers} workers")
+
             # Execute scans with limited parallelism
-            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            with ThreadPoolExecutor(max_workers=dynamic_workers) as executor:
                 futures = {
                     executor.submit(
                         self._scan_single_point,

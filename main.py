@@ -11,6 +11,16 @@ import string
 import os
 from io import StringIO
 from datetime import datetime, timedelta
+import sys
+
+# Increase recursion limit for deep HTML parsing (e.g., BeautifulSoup on AI results)
+# Default is usually 1000, which can be exceeded by complex SERPs
+try:
+    sys.setrecursionlimit(10000)
+    print(f"System recursion limit set to {sys.getrecursionlimit()}")
+except Exception as e:
+    print(f"Failed to set recursion limit: {e}")
+
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for
 from flask_compress import Compress
 from functools import wraps
@@ -53,9 +63,7 @@ init_keyword_tables()
 from src.gmb_core.router import gmb_bp
 app.register_blueprint(gmb_bp)
 
-# [NEW] Register Competitor Blueprint
-from src.competitor.routes import competitor_bp
-app.register_blueprint(competitor_bp)
+
 
 # [NEW] Register Keyword Research Blueprint
 from src.keyword.routes import keyword_bp
@@ -1622,6 +1630,15 @@ def graceful_shutdown(signum, frame):
     sys.exit(0)
 
 def main():
+    # [FIX] Initialize Playwright globally before signal handlers
+    # This prevents Playwright's lazy loading from overwriting our signal handlers later
+    try:
+        from src.gmb_core.crawler.geo_driver import get_playwright_manager
+        print("Initializing Global Playwright Manager...")
+        get_playwright_manager()
+    except Exception as e:
+        print(f"Warning: Failed to pre-initialize Playwright: {e}")
+
     import signal
 
     # Register signal handlers for graceful shutdown
