@@ -200,19 +200,50 @@ class GoogleMapsParser:
                     try:
                         # Look for rating followed by a number
                         rating_str = str(rating)
-                        # Pattern like "4.8 68" or "4.8(68)"
+                        # Pattern like "4.8 68" or "4.8(68)" or "4.8 · 68"
+                        # Expanded regex to capture just the number if it appears reasonably close
                         after_rating_match = re.search(
-                            rf'{re.escape(rating_str)}\s*\(?([0-9,]+)\)?',
+                            rf'{re.escape(rating_str)}\s*(?:·|-|\|)?\s*\(?([0-9,]+)\)?',
                             clean_text
                         )
                         if after_rating_match:
                             potential_count = int(after_rating_match.group(1).replace(',', ''))
                             # Sanity check: review count should be reasonable
+                            # And avoid extracting the year (e.g. 2024) unless it's clearly a count
                             if potential_count > 0 and potential_count < 1000000:
-                                review_count = potential_count
-                                log.debug(f"[Parser] Found review count after rating: {review_count}")
+                                if 1990 <= potential_count <= 2030:
+                                    # Ambiguous number that looks like a year
+                                    # Only accept if specifically wrapped in parens or followed by "reviews"
+                                    if '(' in after_rating_match.group(0) or 'review' in clean_text.lower():
+                                         review_count = potential_count
+                                else:
+                                    review_count = potential_count
+                                
+                                if review_count > 0:
+                                    log.debug(f"[Parser] Found review count after rating: {review_count}")
                     except Exception as e:
                         log.debug(f"[Parser] Regex warning: {e}")
+                
+                # Pattern 5: VERY Aggressive fallback - look for any number > 0 flowing the rating text
+                if review_count == 0 and rating > 0:
+                    try:
+                        # Find all numbers in the first 200 chars of text
+                        # This handles cases like "4.8 1,234" where they are just adjacent text nodes
+                        all_numbers = re.findall(r'(\d+(?:,\d{3})*)', clean_text[:200])
+                        for num_str in all_numbers:
+                            num = int(num_str.replace(',', ''))
+                            # Heuristic: Review count usually isn't 4 (rating) or 2024 (year)
+                            # But valid counts can be small. 
+                            # If we see "4.8" then "123", 123 is likely review count.
+                            if num == int(rating): continue
+                            if 1990 <= num <= 2030: continue # Skip likely years
+                            if num > 1000000: continue # Skip unlikely large numbers
+                            
+                            # If it's the very next number after rating, take it
+                            review_count = num
+                            log.debug(f"[Parser] Aggressive fallback found: {review_count}")
+                            break
+                    except: pass
         
         # Method 4: Try extracting from aria-label on buttons or links
         if review_count == 0:
@@ -1284,8 +1315,17 @@ class GoogleMapsParser:
             
             # Enhanced photo details
             details['photos'] = self._extract_photo_details(soup)
+
+            # Products
+            details['products'] = self._extract_products(soup)
+
+            # Services
+            details['services'] = self._extract_services(soup)
+
+            # Menu Items
+            details['menu_items'] = self._extract_menu_items(soup)
             
-            log.debug(f"[Parser] Parsed details: name={details['name']}, rating={details['rating']}, reviews={details['review_count']}, hours={bool(details['hours'])}, attrs={len(details['attributes'])}, competitors={len(details['competitors'])}, coords=({details['latitude']}, {details['longitude']})")
+            log.debug(f"[Parser] Parsed details: name={details['name']}, rating={details['rating']}, reviews={details['review_count']}, products={len(details['products'])}, services={len(details['services'])}, menu={len(details['menu_items'])}, attrs={len(details['attributes'])}")
             
         except Exception as e:
             log.error(f"Error parsing place details: {e}")
@@ -1324,6 +1364,29 @@ class GoogleMapsParser:
                         hours[day] = {'open': match.group(1).strip(), 'close': match.group(2).strip()}
                     elif 'closed' in label.lower() and day in label.lower():
                         hours[day] = {'open': 'Closed', 'close': 'Closed'}
+                
+            if not hours:
+                # Method 1b: Try simplified aria-label parsing
+                hours_btn = soup.select_one('button[data-item-id="oh"], button[aria-label*="hour"]')
+                if hours_btn:
+                    label = hours_btn.get('aria-label', '')
+                    # Map full day names to keys
+                    day_map = {d: d for d in days}
+                    day_map.update({d[:3]: d for d in days}) # Mon, Tue...
+                    
+                    # Split by comma or semicolon
+                    parts = re.split(r'[,;]\s*', label)
+                    for part in parts:
+                        part = part.lower().strip()
+                        for d_key, d_name in day_map.items():
+                            if d_key in part:
+                                if 'closed' in part:
+                                    hours[d_name] = {'open': 'Closed', 'close': 'Closed'}
+                                else:
+                                    # Extract times
+                                    times = re.findall(r'(\d{1,2}(?::\d{2})?\s*(?:am|pm)?)', part, re.IGNORECASE)
+                                    if len(times) >= 2:
+                                         hours[d_name] = {'open': times[0], 'close': times[1]}
             
             # Method 2: Look for expanded hours table
             hours_table = soup.select('table.eK4R0e tr, div[class*="hours"] table tr')
@@ -1345,13 +1408,39 @@ class GoogleMapsParser:
                                 if time_match:
                                     hours[day] = {'open': time_match.group(1), 'close': time_match.group(2)}
             
-            # Method 3: Check for "Open 24 hours" or "Temporarily closed"
+            # Method 3: Check for "Open 24 hours" specific indicators
             full_text = soup.get_text().lower()
             if 'open 24 hours' in full_text:
                 hours['is_24_hours'] = True
+                # Populate all days as 24h if verified
+                for day in days:
+                     if day not in hours:
+                         hours[day] = {'open': '00:00', 'close': '23:59'}
+
             if 'temporarily closed' in full_text:
                 hours['is_temporarily_closed'] = True
-                
+            
+            # Method 4: Fallback - Extract generic list if specific table fails
+            if not hours:
+                # Look for list items containing days
+                list_items = soup.select('ul li, div[role="listitem"]')
+                for item in list_items:
+                    text = item.get_text(strip=True)
+                    if not text: continue
+                    
+                    text_lower = text.lower()
+                    for day in days:
+                        if day in text_lower:
+                             # Simple extract: "Monday: 9AM-5PM"
+                             if 'closed' in text_lower:
+                                  hours[day] = {'open': 'Closed', 'close': 'Closed'}
+                             else:
+                                  times = re.findall(r'(\d{1,2}(?::\d{2})?\s*(?:AM|PM)?)', text, re.IGNORECASE)
+                                  if len(times) >= 2:
+                                      hours[day] = {'open': times[0], 'close': times[1]}
+                                  elif '24' in text:
+                                       hours[day] = {'open': '00:00', 'close': '23:59'}
+
         except Exception as e:
             log.debug(f"[Parser] Hours extraction error: {e}")
         
@@ -1392,12 +1481,14 @@ class GoogleMapsParser:
                     if text and len(text) > 1 and text not in attributes and text.lower() not in skip_words:
                         attributes.append(text)
             
-            # Method 3: Parse from About tab content
-            about_section = soup.select('div[data-tab="about"] span, div[aria-label="About this place"] li')
+            # Method 3: Parse from About tab content (Enhanced)
+            about_section = soup.select('div[data-tab="about"] span, div[aria-label="About this place"] li, div.iP2t7d')
             for el in about_section:
                 text = el.get_text(strip=True)
                 if text and len(text) > 2 and len(text) < 50 and text not in attributes:
-                    attributes.append(text)
+                     # Exclude obviously wrong headers
+                     if text.lower() not in ['amenities', 'about', 'crowd', 'planning', 'details']:
+                        attributes.append(text)
             
             # Method 4: Look for check/tick marks indicating features
             for el in soup.select('[aria-label*="has"], [aria-label*="offers"]'):
@@ -1411,7 +1502,7 @@ class GoogleMapsParser:
         except Exception as e:
             log.debug(f"[Parser] Attributes extraction error: {e}")
         
-        return attributes[:20]  # Limit to 20 attributes
+        return attributes[:30]  # Limit to 30 attributes
     
     def _extract_service_area(self, soup) -> dict:
         """
@@ -1468,9 +1559,10 @@ class GoogleMapsParser:
         try:
             # Look for Q&A tab or section
             qa_patterns = [
-                r'(\d+)\s*(?:questions?\s*(?:and\s*)?)?(?:answers?)?',
+                r'(\d+)\s*(?:questions?\s*(?:and\s*)?)(?:answers?)',
                 r'Q\s*&\s*A\s*\((\d+)\)',
-                r'(\d+)\s*Q\s*&\s*A'
+                r'(\d+)\s*Q\s*&\s*A',
+                r'See\s*all\s*(\d+)\s*questions'
             ]
             
             # Check Q&A button/tab
@@ -1699,11 +1791,30 @@ class GoogleMapsParser:
                     text = item.get('aria-label', item.get_text())
                     # Pattern: "5 stars, 80%" or "5 stars 1000 reviews"
                     # Also handle simple "5" followed by number in a table
-                    match = re.search(r'(\d)\s*stars?\s*,?\s*(\d+)%?', text, re.IGNORECASE)
-                    if match:
-                        stars = int(match.group(1))
-                        count_or_pct = int(match.group(2))
-                        review_details['breakdown'][stars] = count_or_pct
+                    patterns = [
+                        r'(\d)\s*stars?\s*,?\s*(\d+)(?:%|\s*reviews)?',
+                        r'(\d+)(?:%|\s*reviews?)\s*(?:with)?\s*(\d)\s*stars?',
+                        r'(\d)\s*stars?\s*(\d+)'
+                    ]
+                    
+                    found_match = False
+                    for pattern in patterns:
+                        match = re.search(pattern, text, re.IGNORECASE)
+                        if match:
+                            # Try to deduce which is stars (1-5) and which is count
+                            v1, v2 = int(match.group(1)), int(match.group(2))
+                            if 1 <= v1 <= 5 and (v2 > 5 or v2 == 0):
+                                review_details['breakdown'][v1] = v2
+                                found_match = True
+                            elif 1 <= v2 <= 5 and (v1 > 5 or v1 == 0):
+                                review_details['breakdown'][v2] = v1
+                                found_match = True
+                            elif 1 <= v1 <= 5: # Ambiguous, prefer v1 as stars
+                                review_details['breakdown'][v1] = v2
+                                found_match = True
+                            
+                            if found_match: break
+
                         
             # Fallback: Try to parse generic "5 4 3 2 1" list if strictly ordered
             if not review_details['breakdown']:
@@ -1852,6 +1963,24 @@ class GoogleMapsParser:
         try:
             # Look for popular times graph/section
             times_section = soup.select_one('div[aria-label*="Popular times"], div[data-attrid*="popular_times"], div[class*="popular"]')
+            
+            # Fallback: Find by header text "Popular times" or "People typically spend"
+            if not times_section:
+                 # Search for text elements directly
+                 full_text = soup.get_text()
+                 if 'popular times' in full_text.lower() or 'people typically spend' in full_text.lower():
+                     # Try to find the container via specific text elements
+                     headers = soup.find_all(string=re.compile(r'(Popular times|People typically spend)', re.IGNORECASE))
+                     for h in headers:
+                         parent = h.parent
+                         # Traverse up to find the main container (usually a few levels up)
+                         for _ in range(3):
+                             if parent:
+                                 if parent.select('div[class*="bar"], div[aria-label*="busy"]'):
+                                     times_section = parent
+                                     break
+                                 parent = parent.parent
+                         if times_section: break
             
             if times_section:
                 # Check for day tabs/buttons
@@ -2045,6 +2174,23 @@ class GoogleMapsParser:
         photo_urls = []
         
         try:
+            # 0. Check for injected gallery photos (from geo_driver.py)
+            injected_script = soup.select_one('script#extracted-gallery-photos')
+            if injected_script:
+                import json
+                try:
+                    gallery_urls = json.loads(injected_script.string or '[]')
+                    if gallery_urls:
+                        # Add all gallery URLs (up to a reasonable limit if needed, primarily relies on what was extracted)
+                        photo_urls.extend(gallery_urls)
+                        # Mark these as seen so we don't duplicate
+                        seen_urls = set(url.split('=')[0] for url in gallery_urls)
+                except Exception as e:
+                    log.debug(f"[Parser] Error parsing injected gallery photos: {e}")
+            
+            # If we have plenty of photos from gallery, we might just return them
+            # But let's verify if we want to add the main header image as well if missing
+            
             # 1. Main Knowledge Panel / Header Image (Prioritize this)
             main_photo = None
             
@@ -2500,6 +2646,115 @@ class GoogleMapsParser:
         return photos
 
 
+
+    def _extract_products(self, soup) -> list:
+        """
+        Extract products from the place page.
+        Returns:
+            List of product dicts: [{'name': 'Product Name', 'price': '$10', 'category': 'Cat'}]
+        """
+        products = []
+        try:
+            # Strategy 1: Look for product cards in a carousel or grid
+            # Common selector for product cards
+            product_cards = soup.select('div[data-item-id*="product"], div[jsaction*="product"], div.m6QErb:has(span:contains("Products")) div[role="listitem"]')
+            
+            for card in product_cards:
+                try:
+                    product = {}
+                    name_el = card.select_one('div[aria-label], span.fontTitleMedium, div.fontTitleSmall')
+                    if name_el:
+                        product['name'] = name_el.get('aria-label') or name_el.get_text(strip=True)
+                    
+                    price_el = card.select_one('span:contains("$"), span:contains("₹")')
+                    if price_el:
+                        product['price'] = price_el.get_text(strip=True)
+                        
+                    if product.get('name'):
+                        products.append(product)
+                except:
+                    continue
+            
+            # Strategy 2: Look for "Products" section specific structure
+            if not products:
+                # Find section header "Products"
+                headers = soup.find_all(['h2', 'div'], string=re.compile(r'^Products$', re.IGNORECASE))
+                for h in headers:
+                    section = h.find_parent('div', class_='m6QErb')
+                    if section:
+                        items = section.select('div[role="listitem"]')
+                        for item in items:
+                            name = item.select_one('[aria-label]')
+                            if name:
+                                products.append({'name': name.get('aria-label')})
+        except Exception as e:
+            log.debug(f"[Parser] Products extraction error: {e}")
+            
+        return products
+
+    def _extract_services(self, soup) -> list:
+        """
+        Extract services from the place page.
+        Returns:
+            List of service strings or dicts.
+        """
+        services = []
+        try:
+            # Strategy 1: Look for "Services" section
+            headers = soup.find_all(['h2', 'div', 'span'], string=re.compile(r'^Services$', re.IGNORECASE))
+            for h in headers:
+                # Traverse up to find container
+                container = h.find_parent('div', class_='m6QErb') or h.find_parent('div').find_parent('div')
+                if container:
+                    # Look for list items
+                    items = container.select('div[role="listitem"] span.fontBodyMedium, li span')
+                    for item in items:
+                        text = item.get_text(strip=True)
+                        if text and len(text) > 3 and text not in services:
+                            services.append(text)
+                            
+            # Strategy 2: Look for service buttons/chips
+            chips = soup.select('div[aria-label*="Services"] button, div[role="button"][aria-label]') 
+            for chip in chips:
+                label = chip.get('aria-label', '')
+                if label and label not in services:
+                    # Heuristic to filter out non-service buttons
+                    if len(label) < 40 and "Review" not in label and "Photo" not in label:
+                        services.append(label)
+                        
+        except Exception as e:
+            log.debug(f"[Parser] Services extraction error: {e}")
+            
+        return services
+
+    def _extract_menu_items(self, soup) -> list:
+        """
+        Extract menu items/sections.
+        Returns:
+            List of menu items.
+        """
+        menu_items = []
+        try:
+            # Look for "Menu" section link or preview content
+            menu_link = soup.select_one('a[href*="menu"], button[aria-label="Menu"]')
+            if menu_link:
+                # If we are on the main page, we might just see a link. 
+                # If the content is loaded, look for menu items.
+                pass
+                
+            # Common structure for menu list items on main page
+            items = soup.select('div[data-item-id*="menu_item"] span.fontTitleMedium')
+            for item in items:
+                text = item.get_text(strip=True)
+                if text:
+                    menu_items.append({'name': text})
+            
+        except Exception as e:
+            log.debug(f"[Parser] Menu items extraction error: {e}")
+            
+        return menu_items
+
+
 class LocalPackParser:
     """
     Parser specifically for Google Search Local Pack (3-pack).
@@ -2550,3 +2805,5 @@ class LocalPackParser:
             return params.get('ludocid', [None])[0]
         except:
             return None
+
+

@@ -63,6 +63,10 @@ init_keyword_tables()
 from src.gmb_core.router import gmb_bp
 app.register_blueprint(gmb_bp)
 
+# # [NEW] Register GMB Crawler V2 Blueprint (Isolated Module)
+# from src.gmb_crawler_v2.routes import gmb_v2_bp
+# app.register_blueprint(gmb_v2_bp)
+
 
 
 # [NEW] Register Keyword Research Blueprint

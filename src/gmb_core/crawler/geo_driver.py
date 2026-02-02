@@ -175,8 +175,11 @@ class GeoCrawlerDriver:
         # Windows Chrome 130+ (High Trust)
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
         # Windows Edge (High Trust)
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0',
     ]
     
     VIEWPORTS = [
@@ -234,6 +237,10 @@ class GeoCrawlerDriver:
             'java_script_enabled': True,
             'bypass_csp': True,
             'ignore_https_errors': True,
+            'extra_http_headers': {
+                'Referer': 'https://www.google.com/',
+                'Accept-Language': 'en-US,en;q=0.9',
+            },
         }
         
         # Add proxy if configured
@@ -252,6 +259,24 @@ class GeoCrawlerDriver:
                 log.debug(f"[Stealth] playwright_stealth failed: {e}")
             page_for_stealth.close()
         
+        # Add consent cookies to bypass "Before you continue"
+        # These are standard Google consent cookies for "Accepted"
+        consent_cookies = [
+            {
+                'name': 'CONSENT',
+                'value': 'YES+cb.20241015-04-p0.en+FX+410',
+                'domain': '.google.com',
+                'path': '/'
+            },
+            {
+                'name': 'SOCS',
+                'value': 'CAESHAgBEhJnd3NfMjAyNDEwMTUtMF9SQzEaAmVuIAEaBgiAoLm3Bg',
+                'domain': '.google.com',
+                'path': '/'
+            }
+        ]
+        context.add_cookies(consent_cookies)
+
         # Add comprehensive stealth init script from stealth_config
         context.add_init_script(STEALTH_INIT_SCRIPT)
         log.debug("[Stealth] Comprehensive anti-detection script injected")
@@ -719,32 +744,102 @@ class GeoCrawlerDriver:
 
                 # Scroll to load dynamic content (Q&A, Competitors, Reviews)
                 try:
-                    # Target the main scrollable container
-                    page.evaluate('''() => {
-                        const main = document.querySelector('div[role="main"]');
-                        if (main) {
-                            main.scrollTo(0, 500);
-                            setTimeout(() => main.scrollTo(0, 1500), 500);
-                            setTimeout(() => main.scrollTo(0, 3000), 1000);
-                            setTimeout(() => main.scrollTo(0, main.scrollHeight), 1500);
-                        }
-                            setTimeout(() => main.scrollTo(0, main.scrollHeight), 1500);
-                        }
-                    }''')
                     log.debug("[ScanPlaceDetails] Scrolling to load dynamic content...")
-                    time.sleep(3.0)
                     
-                    # Keyboard scroll to trigger interaction observers
-                    try:
-                        page.click('div[role="main"]', timeout=2000)
-                        for _ in range(3):
-                            page.keyboard.press('End')
-                            time.sleep(1.5)
-                    except:
-                        pass
-                    
+                    # Locate main container
+                    main_div = page.locator('div[role="main"]')
+                    if main_div.count() > 0:
+                        # Focus and scroll using mouse wheel (more reliable than JS/Keyboard sometimes)
+                        try:
+                            main_div.click(timeout=2000)
+                            # Scroll loop
+                            for _ in range(6):
+                                page.mouse.wheel(0, 5000)
+                                time.sleep(1.0)
+                                # Also key press
+                                page.keyboard.press('PageDown')
+                        except:
+                            pass
+                            
+                        # Final JS scroll to be sure
+                        page.evaluate('''() => {
+                            const main = document.querySelector('div[role="main"]');
+                            if (main) main.scrollTo(0, main.scrollHeight);
+                        }''')
+                        time.sleep(2.0)
+
                 except Exception as e:
                      log.debug(f"[ScanPlaceDetails] Scroll warning: {e}")
+
+                # Try to expand Q&A to capture entries
+                try:
+                    qa_button = page.locator('button[aria-label*="See all questions"], button[aria-label*="questions"]').first
+                    if qa_button.is_visible():
+                        log.debug("[ScanPlaceDetails] Clicking Q&A button...")
+                        qa_button.click()
+                        time.sleep(2.5) # Wait for modal
+                except:
+                    pass
+                
+                # Try to expand Operating Hours (Critical for full weekly execution)
+                try:
+                    # Look for the hours container which acts as a dropdown
+                    # Usually has "Opens..." or "Closed..." text and an arrow icon
+                    # We look for a div/button containing typical status text and check if it's clickable/expandable
+                    # Best selector: matching the current status text container that has aria-label or role="button"
+                    
+                    # Common selectors for the hours header
+                    hours_selectors = [
+                        'div[aria-label*="Hide open hours"]', # If already open?
+                        'div[aria-label*="Show open hours"]',
+                        'button[aria-label*="Show open hours"]',
+                        'div.Oh5wg', # Common class for hours container
+                        'div.t39EBf', # Another common class
+                        # Generic fallback: look for the status text container
+                        'div[aria-expanded="false"][role="button"]:has-text("Open")',
+                        'div[aria-expanded="false"][role="button"]:has-text("Closed")',
+                    ]
+                    
+                    for sel in hours_selectors:
+                        try:
+                            el = page.locator(sel).first
+                            if el.is_visible():
+                                log.debug(f"[ScanPlaceDetails] Clicking hours dropdown: {sel}")
+                                el.click()
+                                time.sleep(1.0)
+                                break
+                        except: continue
+                        
+                    # Also try generic text match for hours section
+                    if not page.locator('table.eK4R0e').is_visible(): # Class for hours table
+                         # Try clicking the status text directly if we haven't found the table
+                         status_text = page.locator('div[aria-label]:has-text("Opens"), div[aria-label]:has-text("Closes")').first
+                         if status_text.is_visible():
+                             try:
+                                 status_text.click()
+                                 time.sleep(1.0)
+                             except: pass
+                except Exception as e:
+                    log.debug(f"[ScanPlaceDetails] Hours expansion warning: {e}")
+
+                # Capture HTML state BEFORE gallery extraction to ensure we have valid business details
+                # (Gallery extraction might navigate away or change page state)
+                safe_html_content = page.content()
+                safe_url = page.url
+                log.debug(f"[ScanPlaceDetails] Captured safe base HTML ({len(safe_html_content)} bytes)")
+
+                # ========== PHOTO GALLERY EXTRACTION ==========
+                # Click cover image and scroll gallery to extract all photos
+                gallery_photo_urls = []
+                try:
+                    log.debug("[ScanPlaceDetails] Starting photo gallery extraction...")
+                    gallery_html, gallery_photo_urls = self.extract_photo_gallery(page)
+                    if gallery_photo_urls:
+                        log.debug(f"[ScanPlaceDetails] ✓ Extracted {len(gallery_photo_urls)} photos from gallery")
+                    else:
+                        log.debug("[ScanPlaceDetails] ⚠️ No photos extracted from gallery")
+                except Exception as e:
+                    log.debug(f"[ScanPlaceDetails] Photo gallery extraction error: {e}")
                 
                 # Debug screenshot to check what we see
                 try:
@@ -753,12 +848,33 @@ class GeoCrawlerDriver:
                 except:
                     pass
 
-                # Capture the final URL after any redirects
+                # Capture the final URL after any redirects (might be changed by gallery)
                 final_url = page.url
                 log.debug(f"[ScanPlaceDetails] Final URL after redirect: {final_url}")
                 
-                # Get page content
-                html_content = page.content()
+                # Use the SAFE HTML as base, unless gallery extraction was totally benign?
+                # Actually, better to use safe_html_content but maybe update with gallery html if we want?
+                # No, the parsers rely on the main page structure. The gallery page structure is different.
+                # So we MUST use safe_html_content.
+                html_content = safe_html_content
+                
+                # However, if we didn't redirect away, we might want fresh content?
+                # Let's check if the URL changed significantly
+                if "place" not in final_url and "place" in safe_url:
+                     log.warning("[ScanPlaceDetails] ⚠️ URL changed to generic map after gallery extraction. Using safe predecessor HTML.")
+                     final_url = safe_url # Restore the correct business URL
+                
+                # Inject extracted photo URLs into HTML as a data script for parser
+                if gallery_photo_urls:
+                    import json
+                    photo_data_script = f'''
+                    <script type="application/json" id="extracted-gallery-photos">
+                    {json.dumps(gallery_photo_urls)}
+                    </script>
+                    '''
+                    # Insert before closing </body> tag
+                    html_content = html_content.replace('</body>', f'{photo_data_script}</body>')
+                    log.debug(f"[ScanPlaceDetails] Injected {len(gallery_photo_urls)} photo URLs into HTML")
                 
                 # Quick validation
                 if html_content and len(html_content) < 15000: # Increased threshold again
@@ -794,6 +910,399 @@ class GeoCrawlerDriver:
                 try: browser.close()
                 except: pass
     
+    def extract_photo_gallery(self, page, max_scroll_attempts: int = 30) -> tuple:
+        """
+        Click on cover image to open photo gallery and scroll to load all photos.
+        
+        Args:
+            page: Playwright page object (must already be on the business page)
+            max_scroll_attempts: Maximum scroll attempts before stopping (default 30)
+            
+        Returns:
+            Tuple of (gallery_html, list of photo_urls)
+        """
+        photo_urls = []
+        gallery_html = None
+        
+        try:
+            log.info("[PhotoGallery] Starting photo gallery extraction...")
+            
+            # ========== STEP 1: CLICK COVER IMAGE TO OPEN GALLERY ==========
+            # [CRITICAL] STRICT selectors only. No generic images or partial text matches that could hit Reviews/Search.
+            clicked = False
+
+            # [ANTI-STUCK] Press ESC before interacting to close any open search suggestions/popups
+            try:
+                page.keyboard.press("Escape")
+                time.sleep(0.5)
+                
+                # [AGGRESSIVE] Hide the search bar to prevent misclicks
+                log.info("[PhotoGallery] Hiding search bar to prevent interference...")
+                page.evaluate("""() => {
+                    const searchBox = document.querySelector('#searchbox');
+                    if (searchBox) searchBox.style.display = 'none';
+                    const omnibox = document.querySelector('#omnibox-container');
+                    if (omnibox) omnibox.style.display = 'none';
+                    const searchInput = document.querySelector('input[name="q"]');
+                    if (searchInput) {
+                        const form = searchInput.closest('form');
+                        if (form) form.style.display = 'none';
+                    }
+                }""")
+                time.sleep(0.5)
+            except: pass
+
+            # Priority 1: High-confidence "See photos" text or specific buttons
+            # We prioritize this because the generic image often sits behind the search bar,
+            # whereas the "See photos" button is usually overlaying it or below it.
+            try:
+                # Look for the specific "See photos" text overlay or button
+                # This is the most reliable way to hit the correct element
+                text_targets = [
+                    page.get_by_role("button", name="See photos"),
+                    page.get_by_text("See photos", exact=True),
+                    page.get_by_label("See photos"),
+                    page.get_by_role("button", name="View all photos"),
+                    page.get_by_role("button", name="Add photos"), # Sometimes close enough to trigger gallery
+                ]
+                
+                for target in text_targets:
+                    if target.is_visible(timeout=500):
+                        log.info(f"[PhotoGallery] Found specific text/button target: {target}")
+                        target.click(force=True)
+                        clicked = True
+                        break
+            except Exception as e:
+                log.debug(f"[PhotoGallery] Text target check failed: {e}")
+
+            # Priority 2: CSS Selectors for the button/container
+            if not clicked:
+                cover_selectors = [
+                    # Explicit Buttons
+                    'button[aria-label*="See photos"]',
+                    'button[aria-label*="View all photos"]',
+                    'div[role="button"][aria-label*="See photos"]',
+                    
+                    # The specific overlay button often found on mobile/desktop web
+                    'button.aoLEge', 
+                    'button[data-value="See photos"]',
+                ]
+                
+                for selector in cover_selectors:
+                    try:
+                        element = page.locator(selector).first
+                        if element.is_visible(timeout=500):
+                            log.info(f"[PhotoGallery] Found selector target: {selector}")
+                            element.click(force=True)
+                            clicked = True
+                            break
+                    except:
+                        continue
+            
+            # Priority 3: Generic access (RISKY - acts as fallback)
+            # Only do this if above failed.
+            if not clicked:
+                log.info("[PhotoGallery] No specific button found, trying generic hero image fallback...")
+                generic_selectors = [
+                    'div.RZ66Rb.FgCUCc img', # Standard GMB Hero Image class
+                    'div.RZ66Rb button',      # Button inside hero container
+                    'div[data-photo-index="0"]',
+                ]
+                
+                for selector in generic_selectors:
+                    try:
+                        element = page.locator(selector).first
+                        if element.is_visible(timeout=500):
+                            # [CRITICAL UPDATE]
+                            # The search bar is usually at the TOP-LEFT.
+                            # We must click AWAY from it. 
+                            # Strategy: Click the BOTTOM-RIGHT quadrant of the image.
+                            
+                            box = element.bounding_box()
+                            if box:
+                                # Target: 80% to the right, 80% down
+                                x = box['x'] + (box['width'] * 0.8)
+                                y = box['y'] + (box['height'] * 0.8)
+                                
+                                log.info(f"[PhotoGallery] Clicking generic image at SAFE OFFSET (Bottom-Right): {x},{y}")
+                                page.mouse.click(x, y)
+                                clicked = True
+                                break
+                            else:
+                                # Fallback if no box (unlikely if visible)
+                                element.click(force=True)
+                                clicked = True
+                                break
+                    except:
+                        continue
+            
+            # Priority 4: JavaScript Force Click (The Nuclear Option)
+            # If standard clicks fail, try to trigger the click event directly via JS on the cover photo
+            if not clicked:
+                log.info("[PhotoGallery] Standard clicks failed. Attempting JS force-click...")
+                try:
+                    # Try to find the image container and click it via JS
+                    js_selector = 'div.RZ66Rb' 
+                    handle = page.locator(js_selector).first
+                    if handle.is_visible():
+                        page.evaluate('(el) => el.click()', handle.element_handle())
+                        clicked = True
+                        log.info(f"[PhotoGallery] JS force-click successful on {js_selector}")
+                except Exception as e:
+                    log.debug(f"[PhotoGallery] JS click failed: {e}")
+
+            if not clicked:
+                log.info("[PhotoGallery] ⚠️ Could not find cover image to click")
+                return None, []
+            
+            # Wait for gallery modal/page to load
+            time.sleep(2.5)
+            
+            # ========== STEP 2: WAIT FOR GALLERY TO LOAD ==========
+            # Gallery appears as a modal or navigates to a photos page
+            gallery_loaded = False
+            
+            gallery_indicators = [
+                'div[role="dialog"] img',  # Modal with images
+                'div[data-photo-index]',   # Photo gallery container
+                'div[role="listbox"] img', # Image list
+                'button[aria-label*="Next"]',  # Next photo button
+                'div[jscontroller] img[src*="googleusercontent"]',  # Photo viewer
+            ]
+            
+            for indicator in gallery_indicators:
+                try:
+                    page.wait_for_selector(indicator, timeout=5000)
+                    gallery_loaded = True
+                    log.info(f"[PhotoGallery] Gallery loaded (found: {indicator})")
+                    break
+                except:
+                    continue
+            
+            if not gallery_loaded:
+                log.info("[PhotoGallery] ⚠️ Gallery did not load properly")
+                # Still try to extract what we can
+            
+            # ========== STEP 3: SCROLL GALLERY TO LOAD ALL PHOTOS ==========
+            log.info("[PhotoGallery] Starting scroll to load all photos...")
+            
+            # Find the SPECIFIC scrollable gallery container (usually left sidebar)
+            # Common selectors for the scrollable photo list:
+            scroll_container_selectors = [
+                'div[aria-label="List of photos"]',  # Explicit label
+                'div.m6QErb[aria-label]',            # Common class + label
+                'div[role="listbox"]',               # List role
+                'div[tabindex="-1"] > div.m6QErb',   # Nested scrollable
+                'div.m6QErb:has(a[data-photo-index])', # Container with photos
+            ]
+            
+            scroll_container = None
+            for selector in scroll_container_selectors:
+                try:
+                    candidates = page.locator(selector).all()
+                    for cand in candidates:
+                         # Check if it has scrollable height
+                         box = cand.bounding_box()
+                         if box and box['height'] > 0:
+                             # Check overflow style or just try it
+                             scroll_container = cand
+                             log.info(f"[PhotoGallery] Found scroll container: {selector}")
+                             break
+                    if scroll_container: break
+                except:
+                    continue
+            
+            # Fallback: Just try to scroll the window or main
+            if not scroll_container:
+                log.info("[PhotoGallery] ⚠️ Specific scroll container not found, trying generic selectors")
+                scroll_container = page.locator('div[role="main"]').first
+            
+            # SCROLL LOOP - Optimized for MAXIMUM SPEED
+            last_photo_count = 0
+            same_count_retries = 0
+            
+            # Ensure focus is on the page/container for keyboard events
+            try:
+                if scroll_container:
+                     scroll_container.click(force=True)
+                     log.info("[PhotoGallery] Clicked scroll container to focus")
+                else:
+                    page.click('body', force=True)
+            except: pass
+
+            for i in range(max_scroll_attempts):
+                # 1. Scroll using multiple methods (Keyboard is fastest for infinite lists)
+                try:
+                    # Method A: Aggressive ArrowDown (Simulates fast user browsing)
+                    # Increased batch size and reduced delay for speed
+                    for _ in range(30): # WAS: 10
+                        page.keyboard.press("ArrowDown")
+                        time.sleep(0.01) # WAS: 0.05
+                    
+                    # Method B: PageDown for larger jumps (Do this every loop now)
+                    page.keyboard.press("PageDown")
+                    
+                    # Method C: JS Scroll if container found (Backup, but keep it snappy)
+                    if scroll_container:
+                        scroll_container.evaluate('(el) => el.scrollTop = el.scrollHeight')
+                    else:
+                        # Fallback window scroll
+                         page.mouse.wheel(0, 5000)
+                except Exception as e:
+                    log.info(f"[PhotoGallery] Scroll error: {e}")
+                
+                # 2. Wait for lazy loading (Reduced for speed)
+                time.sleep(0.5) # WAS: 1.0
+                
+                # 3. Check progress
+                current_photos = self._extract_visible_photo_urls(page)
+                current_count = len(current_photos)
+                
+                log.info(f"[PhotoGallery] Scroll {i+1}: Found {current_count} photos")
+                
+                if current_count > last_photo_count:
+                    last_photo_count = current_count
+                    same_count_retries = 0
+                    # Accumulate found URLs
+                    photo_urls.extend(current_photos)
+                else:
+                    same_count_retries += 1
+                
+                # Stop if no new photos for several tries
+                if same_count_retries >= 2: # Slightly higher tolerance since we loop faster
+                     # One last desperate scroll attempt
+                     if same_count_retries == 3:
+                         log.info("[PhotoGallery] Stuck? Trying random jumps...")
+                         try:
+                             page.keyboard.press("Home")
+                             time.sleep(0.2)
+                             page.keyboard.press("End")
+                         except: pass
+                         time.sleep(1.5)
+                         continue
+                         
+                     log.info(f"[PhotoGallery] No new photos after {same_count_retries} scrolls. Stopping.")
+                     break
+                
+                # Optimized extraction: Update unique set periodically
+                photo_urls = list(set(photo_urls))
+            
+            # ========== STEP 4: EXTRACT ALL PHOTO URLS ==========
+            photo_urls = self._extract_visible_photo_urls(page)
+            log.info(f"[PhotoGallery] ✓ Extracted {len(photo_urls)} photo URLs")
+            
+            # Get gallery HTML for additional parsing
+            gallery_html = page.content()
+            
+            # ========== STEP 5: CLOSE GALLERY AND RETURN ==========
+            try:
+                # Try to close the modal/gallery
+                close_selectors = [
+                    'button[aria-label="Close"]',
+                    'button[aria-label*="close"]',
+                    'button[aria-label="Back"]',
+                    'div[role="dialog"] button[jsaction*="close"]',
+                ]
+                for selector in close_selectors:
+                    try:
+                        close_btn = page.locator(selector).first
+                        if close_btn.is_visible(timeout=500):
+                            close_btn.click()
+                            break
+                    except:
+                        continue
+                
+                # If no close button, press Escape
+                page.keyboard.press('Escape')
+                time.sleep(0.5)
+            except:
+                pass
+            
+            return gallery_html, photo_urls
+            
+        except Exception as e:
+            log.error(f"[PhotoGallery] Error extracting photo gallery: {e}")
+            return None, photo_urls
+    
+    def _extract_visible_photo_urls(self, page) -> list:
+        """
+        Extract all visible photo URLs from the current page state.
+        Filters for business photos using AF1Qip* patterns.
+        
+        Returns:
+            List of unique photo URLs
+        """
+        photo_urls = set()
+        
+        try:
+            # Get all img elements with googleusercontent URLs
+            images = page.locator('img[src*="googleusercontent"]').all()
+            
+            for img in images:
+                try:
+                    src = img.get_attribute('src')
+                    if src:
+                        # Filter for business photos (AF1QipM, AF1QipN, AF1QipO)
+                        # These prefixes indicate user-uploaded business photos
+                        if 'AF1Qip' in src:
+                            # Get high-res version by modifying URL parameters
+                            high_res_url = self._get_high_res_photo_url(src)
+                            photo_urls.add(high_res_url)
+                        elif 'lh5.googleusercontent.com' in src or 'streetviewpixels' not in src.lower():
+                            # Include other googleusercontent photos that aren't Street View
+                            high_res_url = self._get_high_res_photo_url(src)
+                            photo_urls.add(high_res_url)
+                except:
+                    continue
+            
+            # Also check for background-image style photos
+            try:
+                bg_elements = page.query_selector_all('[style*="background-image"]')
+                for el in bg_elements:
+                    style = el.get_attribute('style') or ''
+                    import re
+                    match = re.search(r'url\(["\']?(https://[^"\')\s]+)["\']?\)', style)
+                    if match:
+                        url = match.group(1)
+                        if 'googleusercontent' in url and 'AF1Qip' in url:
+                            photo_urls.add(self._get_high_res_photo_url(url))
+            except:
+                pass
+                
+        except Exception as e:
+            log.debug(f"[PhotoGallery] Error extracting visible photos: {e}")
+        
+        return list(photo_urls)
+    
+    def _get_high_res_photo_url(self, url: str) -> str:
+        """
+        Convert a Google photo URL to its high-resolution version.
+        
+        Args:
+            url: Original photo URL
+            
+        Returns:
+            High-resolution photo URL
+        """
+        if not url:
+            return url
+        
+        # Remove existing size parameters and add high-res ones
+        # Pattern: =wXXX-hYYY-... or =sXXX-...
+        import re
+        
+        # Remove existing dimension params
+        cleaned_url = re.sub(r'=[swh]\d+(-[a-zA-Z0-9\-]+)?$', '', url)
+        cleaned_url = re.sub(r'=w\d+-h\d+(-[a-zA-Z0-9\-]+)?$', '', cleaned_url)
+        
+        # Add high-res parameter (w1920 = max width 1920px)
+        if '=' not in cleaned_url.split('/')[-1]:
+            high_res_url = cleaned_url + '=w1920'
+        else:
+            high_res_url = cleaned_url
+            
+        return high_res_url
+
     def search_business(self, query: str, location: str = None, lat: float = None, lng: float = None) -> str:
         """
         Search for a business by name on Google Maps.
