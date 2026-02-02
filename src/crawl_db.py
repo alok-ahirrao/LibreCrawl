@@ -259,6 +259,13 @@ def init_crawl_tables():
         except:
             pass
 
+        # === CLIENT DATA VISIBILITY MIGRATION ===
+        try:
+            cursor.execute('ALTER TABLE crawls ADD COLUMN show_to_client BOOLEAN DEFAULT 0')
+            print("Migration: Added show_to_client column to crawls table")
+        except:
+            pass  # Column likely exists
+
         print("Crawl persistence tables initialized successfully")
 
 def create_crawl(user_id, session_id, base_url, base_domain, config_snapshot):

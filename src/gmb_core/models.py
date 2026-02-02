@@ -142,6 +142,9 @@ def init_gmb_tables():
                 total_points INTEGER,
                 completed_points INTEGER DEFAULT 0,
                 
+                average_rank REAL,
+                show_to_client BOOLEAN DEFAULT 0,
+                
                 started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 completed_at TIMESTAMP,
                 
@@ -543,6 +546,33 @@ def _run_migrations(conn):
     if 'qa_count' not in loc_columns:
         print("Migration: Adding qa_count column to gmb_locations")
         cursor.execute('ALTER TABLE gmb_locations ADD COLUMN qa_count INTEGER DEFAULT 0')
+
+    # === CLIENT DATA VISIBILITY MIGRATIONS ===
+    
+    # Migration: Add show_to_client to serp_searches
+    if 'show_to_client' not in serp_columns:
+        print("Migration: Adding show_to_client column to serp_searches")
+        cursor.execute('ALTER TABLE serp_searches ADD COLUMN show_to_client BOOLEAN DEFAULT 0')
+    
+    # Migration: Add show_to_client to gmb_health_snapshots
+    cursor.execute("PRAGMA table_info(gmb_health_snapshots)")
+    health_columns = [col[1] for col in cursor.fetchall()]
+    
+    if 'show_to_client' not in health_columns:
+        print("Migration: Adding show_to_client column to gmb_health_snapshots")
+        cursor.execute('ALTER TABLE gmb_health_snapshots ADD COLUMN show_to_client BOOLEAN DEFAULT 0')
+    
+    # Migration: Add show_to_client to gmb_grid_scans
+    cursor.execute("PRAGMA table_info(gmb_grid_scans)")
+    scan_columns = [col[1] for col in cursor.fetchall()]
+    
+    if 'show_to_client' not in scan_columns:
+        print("Migration: Adding show_to_client column to gmb_grid_scans")
+        cursor.execute('ALTER TABLE gmb_grid_scans ADD COLUMN show_to_client BOOLEAN DEFAULT 0')
+
+    if 'average_rank' not in scan_columns:
+        print("Migration: Adding average_rank column to gmb_grid_scans")
+        cursor.execute('ALTER TABLE gmb_grid_scans ADD COLUMN average_rank REAL')
 
 
 # ==================== Helper Functions ====================

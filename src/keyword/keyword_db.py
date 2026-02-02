@@ -91,6 +91,13 @@ def init_keyword_tables():
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_content_items_user ON content_items(user_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_content_items_client ON content_items(client_id)')
 
+        # === CLIENT DATA VISIBILITY MIGRATION ===
+        try:
+            cursor.execute('ALTER TABLE keyword_history ADD COLUMN show_to_client BOOLEAN DEFAULT 0')
+            print("Migration: Added show_to_client column to keyword_history table")
+        except:
+            pass  # Column likely exists
+
         print("Keyword history tables initialized successfully")
 
 def save_keyword_history(type, input_params, results, user_id=None):
