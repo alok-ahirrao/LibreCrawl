@@ -3,34 +3,27 @@ Crawl data persistence module
 Handles database operations for storing and retrieving crawl data
 Enables crash recovery and historical crawl access
 """
-import sqlite3
-import json
 import time
-from datetime import datetime
-from contextlib import contextmanager
+import json
+from datetime import datetime, timedelta
+from .database import get_db
 
-# Database file location (same as auth database)
-DB_FILE = 'users.db'
 
-@contextmanager
-def get_db():
-    """Context manager for database connections"""
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row  # Return rows as dictionaries
-    try:
-        yield conn
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        conn.close()
-
-def init_crawl_tables():
+def init_crawl_tables(enable_migrations=False):
     """Initialize crawl persistence tables"""
+    if not enable_migrations:
+        return
+        
     with get_db() as conn:
         cursor = conn.cursor()
-
+        
+        # Verify connection health
+        try:
+            cursor.execute("SELECT 1")
+        except Exception as e:
+            print(f"Warning: Connection check failed in init_crawl_tables: {e}")
+            return # Abort initialization if connection is dead
+            
         # Main crawls table
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS crawls (
@@ -58,6 +51,15 @@ def init_crawl_tables():
                 resume_checkpoint TEXT,
 
                 sitemap_urls TEXT,
+
+                resumable BOOLEAN DEFAULT 1,
+                
+                pagespeed_results TEXT,
+                robots_data TEXT,
+                llms_data TEXT,
+
+                show_to_client BOOLEAN DEFAULT FALSE,
+                client_id TEXT,
 
                 FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
@@ -102,6 +104,8 @@ def init_crawl_tables():
 
                 external_links INTEGER,
                 internal_links INTEGER,
+                
+
 
                 response_time REAL,
                 javascript_rendered BOOLEAN DEFAULT 0,
@@ -136,153 +140,59 @@ def init_crawl_tables():
                 FOREIGN KEY (crawl_id) REFERENCES crawls (id)
             )
         ''')
-        
-        # Attempt to add scope column if it doesn't exist (migrations-lite)
-        try:
-            cursor.execute('ALTER TABLE crawl_links ADD COLUMN scope TEXT')
-        except:
-            pass # Column likely exists
 
-        # Attempt to add is_nofollow column as well
-        try:
-            cursor.execute('ALTER TABLE crawl_links ADD COLUMN is_nofollow BOOLEAN')
-        except:
-            pass # Column likely exists
-
-        # Issues table
+        # === Create crawl_issues table ===
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS crawl_issues (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 crawl_id INTEGER NOT NULL,
-
-                url TEXT NOT NULL,
+                url TEXT,
                 type TEXT,
                 category TEXT,
                 issue TEXT,
                 details TEXT,
-
-                detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-                FOREIGN KEY (crawl_id) REFERENCES crawls(id) ON DELETE CASCADE
-            )
-        ''')
-
-        # Queue table for crash recovery
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS crawl_queue (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                crawl_id INTEGER NOT NULL,
-
-                url TEXT NOT NULL,
-                depth INTEGER,
-                priority INTEGER DEFAULT 0,
-
-                added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-                FOREIGN KEY (crawl_id) REFERENCES crawls(id) ON DELETE CASCADE,
-                UNIQUE(crawl_id, url)
-            )
-        ''')
-
-        # Create indexes for performance
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawls_user_status ON crawls(user_id, status)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawls_session ON crawls(session_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawled_urls_crawl ON crawled_urls(crawl_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawled_urls_url ON crawled_urls(crawl_id, url)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawled_urls_status ON crawled_urls(crawl_id, status_code)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawl_links_crawl ON crawl_links(crawl_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawl_links_source ON crawl_links(crawl_id, source_url)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawl_links_target ON crawl_links(crawl_id, target_url)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawl_issues_crawl ON crawl_issues(crawl_id)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawl_issues_url ON crawl_issues(crawl_id, url)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawl_issues_category ON crawl_issues(crawl_id, category)')
-        cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawl_queue_crawl ON crawl_queue(crawl_id)')
-        
-        # Insights table (New)
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS audit_insights (
-                crawl_id INTEGER PRIMARY KEY,
-                insights_json TEXT,
+                severity TEXT DEFAULT 'info',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (crawl_id) REFERENCES crawls(id) ON DELETE CASCADE
             )
         ''')
-
-        # Attempt to add pagespeed_results column
+        
+        # === Create audit_insights table ===
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS audit_insights (
+                id SERIAL PRIMARY KEY,
+                crawl_id INTEGER NOT NULL UNIQUE,
+                insights_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (crawl_id) REFERENCES crawls(id) ON DELETE CASCADE
+            )
+        ''')
+        
+        # Create indexes for better performance
         try:
-            cursor.execute('ALTER TABLE crawls ADD COLUMN pagespeed_results TEXT')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_crawl_issues_crawl_id ON crawl_issues(crawl_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_audit_insights_crawl_id ON audit_insights(crawl_id)')
         except:
-            pass # Column likely exists
-
-        # Attempt to add sitemap_urls column
-        try:
-            cursor.execute('ALTER TABLE crawls ADD COLUMN sitemap_urls TEXT')
-        except:
-            pass # Column likely exists
-
-        # Attempt to add robots_data column
-        try:
-            cursor.execute('ALTER TABLE crawls ADD COLUMN robots_data TEXT')
-        except:
-            pass # Column likely exists
-
-        # Attempt to add llms_data column
-        try:
-            cursor.execute('ALTER TABLE crawls ADD COLUMN llms_data TEXT')
-        except:
-            pass # Column likely exists
-
-        # Attempt to add dom_size and dom_depth columns to crawled_urls
-        try:
-            cursor.execute('ALTER TABLE crawled_urls ADD COLUMN dom_size INTEGER DEFAULT 0')
-        except:
-            pass
-            
-        try:
-            cursor.execute('ALTER TABLE crawled_urls ADD COLUMN dom_depth INTEGER DEFAULT 0')
-        except:
-            pass
-
-        # Attempt to add JS rendering columns
-        try:
-            cursor.execute('ALTER TABLE crawled_urls ADD COLUMN requires_js BOOLEAN DEFAULT 0')
-        except:
-            pass
-            
-        try:
-            cursor.execute('ALTER TABLE crawled_urls ADD COLUMN raw_html_hash TEXT')
-        except:
-            pass
-
-        try:
-            cursor.execute('ALTER TABLE crawled_urls ADD COLUMN rendered_html_hash TEXT')
-        except:
-            pass
-
-        # === CLIENT DATA VISIBILITY MIGRATION ===
-        try:
-            cursor.execute('ALTER TABLE crawls ADD COLUMN show_to_client BOOLEAN DEFAULT 0')
-            print("Migration: Added show_to_client column to crawls table")
-        except:
-            pass  # Column likely exists
+            pass  # Indexes may already exist
 
         print("Crawl persistence tables initialized successfully")
 
-def create_crawl(user_id, session_id, base_url, base_domain, config_snapshot):
+def create_crawl(user_id, session_id, base_url, base_domain, config_snapshot, client_id=None):
     """
-    Create a new crawl record
+    Create a new crawl record with optional client_id for data isolation
     Returns the crawl_id
     """
     try:
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT INTO crawls (user_id, session_id, base_url, base_domain, config_snapshot, status)
-                VALUES (?, ?, ?, ?, ?, 'running')
-            ''', (user_id, session_id, base_url, base_domain, json.dumps(config_snapshot)))
+                INSERT INTO crawls (user_id, session_id, base_url, base_domain, config_snapshot, status, client_id)
+                VALUES (?, ?, ?, ?, ?, 'running', ?)
+            ''', (user_id, session_id, base_url, base_domain, json.dumps(config_snapshot), client_id))
 
             crawl_id = cursor.lastrowid
-            print(f"Created new crawl record: ID={crawl_id}, URL={base_url}")
+            print(f"Created new crawl record: ID={crawl_id}, URL={base_url}, client_id={client_id}")
             return crawl_id
     except Exception as e:
         print(f"Error creating crawl: {e}")
@@ -575,14 +485,26 @@ def get_crawl_by_id(crawl_id):
         print(f"Error fetching crawl: {e}")
         return None
 
-def get_user_crawls(user_id, limit=50, offset=0, status_filter=None):
-    """Get all crawls for a user"""
+def get_user_crawls(user_id, limit=50, offset=0, status_filter=None, client_id=None):
+    """Get all crawls for a user, optionally filtered by client_id for proper isolation."""
     try:
         with get_db() as conn:
             cursor = conn.cursor()
 
-            query = 'SELECT * FROM crawls WHERE user_id = ?'
-            params = [user_id]
+            # Build query based on filters
+            query = 'SELECT * FROM crawls WHERE 1=1'
+            params = []
+            
+            # Filter by user_id if provided
+            if user_id is not None:
+                query += ' AND user_id = ?'
+                params.append(user_id)
+            
+            # Filter by client_id for client-based isolation
+            # Include NULL client_id (legacy crawls) so history isn't lost
+            if client_id:
+                query += ' AND client_id = ?'
+                params.append(client_id)
 
             if status_filter:
                 query += ' AND status = ?'
@@ -737,9 +659,9 @@ def cleanup_old_crawls(days=90):
             cursor = conn.cursor()
             cursor.execute('''
                 DELETE FROM crawls
-                WHERE started_at < datetime('now', '-' || ? || ' days')
+                WHERE started_at < %s
                 AND status IN ('completed', 'failed', 'stopped')
-            ''', (days,))
+            ''', ((datetime.now() - timedelta(days=days)),))
 
             deleted = cursor.rowcount
             print(f"Cleaned up {deleted} old crawls")
@@ -749,12 +671,25 @@ def cleanup_old_crawls(days=90):
         print(f"Error cleaning up old crawls: {e}")
         return 0
 
-def get_crawl_count(user_id):
-    """Get total number of crawls for a user"""
+def get_crawl_count(user_id, client_id=None):
+    """Get total number of crawls for a user, optionally filtered by client_id."""
     try:
         with get_db() as conn:
             cursor = conn.cursor()
-            cursor.execute('SELECT COUNT(*) as count FROM crawls WHERE user_id = ?', (user_id,))
+            
+            # Build query with optional filters
+            query = 'SELECT COUNT(*) as count FROM crawls WHERE 1=1'
+            params = []
+            
+            if user_id is not None:
+                query += ' AND user_id = ?'
+                params.append(user_id)
+            
+            if client_id:
+                query += ' AND client_id = ?'
+                params.append(client_id)
+            
+            cursor.execute(query, params)
             result = cursor.fetchone()
             return result['count'] if result else 0
     except Exception as e:
@@ -762,12 +697,15 @@ def get_crawl_count(user_id):
         return 0
 
 def get_database_size_mb():
-    """Get total database size in MB"""
+    """Get total database size in MB (PostgreSQL)"""
     try:
-        import os
-        if os.path.exists(DB_FILE):
-            size_bytes = os.path.getsize(DB_FILE)
-            return round(size_bytes / (1024 * 1024), 2)
+        # For PostgreSQL, query the database size
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT pg_database_size(current_database()) as size")
+            result = cursor.fetchone()
+            if result and result['size']:
+                return round(result['size'] / (1024 * 1024), 2)
         return 0
     except Exception as e:
         print(f"Error getting database size: {e}")
@@ -778,9 +716,13 @@ def save_audit_insights(crawl_id, insights_data):
     try:
         with get_db() as conn:
             cursor = conn.cursor()
+            # Use PostgreSQL-compatible ON CONFLICT syntax instead of SQLite's INSERT OR REPLACE
             cursor.execute('''
-                INSERT OR REPLACE INTO audit_insights (crawl_id, insights_json, created_at)
+                INSERT INTO audit_insights (crawl_id, insights_json, created_at)
                 VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(crawl_id) DO UPDATE SET
+                    insights_json = excluded.insights_json,
+                    updated_at = CURRENT_TIMESTAMP
             ''', (crawl_id, json.dumps(insights_data)))
             print(f"Saved insights for crawl {crawl_id}")
             return True

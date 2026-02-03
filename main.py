@@ -12,6 +12,10 @@ import os
 from io import StringIO
 from datetime import datetime, timedelta
 import sys
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Increase recursion limit for deep HTML parsing (e.g., BeautifulSoup on AI results)
 # Default is usually 1000, which can be exceeded by complex SERPs
@@ -45,13 +49,14 @@ LOCAL_MODE = args.local
 DISABLE_REGISTER = args.disable_register
 
 app = Flask(__name__, template_folder='web/templates', static_folder='web/static')
-app.secret_key = 'librecrawl-secret-key-change-in-production'  # TODO: Use environment variable in production
+app.secret_key = os.getenv('FLASK_SECRET_KEY') or 'librecrawl-secret-key-change-in-production' 
+if app.secret_key == 'librecrawl-secret-key-change-in-production':
+    print("WARNING: Using insecure default SECRET_KEY. Please set FLASK_SECRET_KEY in .env.")
 app.config['SESSION_COOKIE_NAME'] = 'librecrawl_session'  # Rename cookie to avoid collision with Next.js
 
 # Enable compression for all responses
 Compress(app)
 
-# Initialize database on startup
 # Initialize database on startup
 init_db()
 from src.crawl_db import init_crawl_tables
@@ -62,10 +67,6 @@ init_keyword_tables()
 # [NEW] Register GMB Blueprint
 from src.gmb_core.router import gmb_bp
 app.register_blueprint(gmb_bp)
-
-# # [NEW] Register GMB Crawler V2 Blueprint (Isolated Module)
-# from src.gmb_crawler_v2.routes import gmb_v2_bp
-# app.register_blueprint(gmb_v2_bp)
 
 
 
@@ -83,49 +84,79 @@ def generate_random_password(length=16):
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
 def auto_login_local_mode():
-    """Auto-login for local mode - creates or logs into 'local' admin account"""
-    import sqlite3
+    """Auto-login for local mode - logs into 'Alok Admin' account"""
+    from src.database import get_db
+    from src.auth_db import hash_password
+    
     try:
-        conn = sqlite3.connect('users.db')
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
+        # Use centralized DB connection (Postgres/SQLite agnostic)
+        with get_db() as conn:
+            cursor = conn.cursor()
 
-        # Check if 'local' user exists
-        cursor.execute('SELECT id, username, tier FROM users WHERE username = ?', ('local',))
-        user = cursor.fetchone()
+            # Check for specific admin user
+            admin_email = os.getenv('ADMIN_EMAIL') or 'alok.ahirrao1108@gmail.com'
+            try:
+                cursor.execute("SELECT * FROM users WHERE email = %s", (admin_email,))
+            except:
+                # Fallback for SQLite style if db adapter doesn't auto-covert
+                cursor.execute("SELECT * FROM users WHERE email = ?", (admin_email,))
+            
+            user = cursor.fetchone()
+            
+            if user:
+                # Admin user exists, log them in
+                session['user_id'] = user['id']
+                session['username'] = user['username']
+                session['tier'] = 'admin'
+                session.permanent = True
+                print(f"Auto-logged in as Admin (ID: {user['id']})")
+                return True
+            else:
+                # Create Admin user
+                print("Admin account not found. Creating default admin...")
+                username = 'Admin User'
+                password = os.getenv('ADMIN_PASSWORD') or 'Alok@1108*'
+                password_hash = hash_password(password)
 
-        if user:
-            # User exists, just log them in
-            session['user_id'] = user['id']
-            session['username'] = user['username']
-            session['tier'] = 'admin'
-            session.permanent = True
-            print(f"Auto-logged in as existing 'local' user (ID: {user['id']})")
-        else:
-            # Create new local user with random password
-            random_password = generate_random_password()
-            from src.auth_db import hash_password
-            password_hash = hash_password(random_password)
+                # Attempt to create with explicit ID 1 if possible (best effort)
+                try:
+                    cursor.execute('''
+                        INSERT INTO users (id, username, email, full_name, password_hash, verified, tier, role, status)
+                        VALUES (1, %s, %s, %s, %s, 1, 'admin', 'admin', 'active')
+                    ''', (username, admin_email, username, password_hash))
+                    print("Created default admin with ID 1")
+                except Exception as e:
+                    print(f"Could not force ID 1 (might exist or identity column issue): {e}")
+                    # Fallback to normal create
+                    cursor.execute('''
+                        INSERT INTO users (username, email, full_name, password_hash, verified, tier, role, status)
+                        VALUES (%s, %s, %s, %s, 1, 'admin', 'admin', 'active')
+                    ''', (username, admin_email, username, password_hash))
+                    print("Created default admin (auto-ID)")
+                
+                # Commit if needed
+                if hasattr(conn, 'commit'):
+                    conn.commit()
 
-            cursor.execute('''
-                INSERT INTO users (username, email, password_hash, verified, tier)
-                VALUES (?, ?, ?, 1, 'admin')
-            ''', ('local', 'local@localhost', password_hash))
-            conn.commit()
+                user_id = cursor.lastrowid
+                
+                # If lastrowid not supported by Postgres adapter or failed, fetch it
+                if not user_id:
+                     try:
+                         cursor.execute("SELECT id FROM users WHERE email = %s", (admin_email,))
+                     except:
+                         cursor.execute("SELECT id FROM users WHERE email = ?", (admin_email,))
+                     user_id = cursor.fetchone()['id']
 
-            user_id = cursor.lastrowid
+                # Log in the new user
+                session['user_id'] = user_id
+                session['username'] = username
+                session['tier'] = 'admin'
+                session.permanent = True
 
-            # Log in the new user
-            session['user_id'] = user_id
-            session['username'] = 'local'
-            session['tier'] = 'admin'
-            session.permanent = True
+                print(f"Created and auto-logged in as new admin user '{username}' (ID: {user_id})")
+                return True
 
-            print(f"Created and auto-logged in as new 'local' admin user (ID: {user_id})")
-            print(f"Generated password: {random_password}")
-
-        conn.close()
-        return True
     except Exception as e:
         print(f"Error in auto_login_local_mode: {e}")
         return False
@@ -517,14 +548,12 @@ def register():
     if success and LOCAL_MODE:
         try:
             from src.auth_db import verify_user, set_user_tier
+            from src.database import get_db
             # Get the user that was just created
-            import sqlite3
-            conn = sqlite3.connect('users.db')
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute('SELECT id FROM users WHERE username = ?', (username,))
-            user = cursor.fetchone()
-            conn.close()
+            with get_db() as conn:
+                cursor = conn.cursor()
+                cursor.execute('SELECT id FROM users WHERE username = ?', (username,))
+                user = cursor.fetchone()
 
             if user:
                 verify_user(user['id'])
@@ -655,13 +684,27 @@ def start_crawl():
 
     data = request.get_json()
     url = data.get('url')
+    
+    # Get client_id for proper client-based data isolation
+    client_id = data.get('client_id')
 
     if not url:
         return jsonify({'success': False, 'error': 'URL is required'})
 
+    # Get user_id from Flask session or X-User-Id header from proxy
     user_id = session.get('user_id')
+    if not user_id:
+        x_user_id = request.headers.get('X-User-Id')
+        if x_user_id:
+            try:
+                user_id = int(x_user_id)
+            except ValueError:
+                pass
+    
     session_id = session.get('session_id')
     tier = session.get('tier', 'guest')
+    
+    print(f"start_crawl: Creating crawl for user_id={user_id}, client_id={client_id}")
 
     # Check guest limits (IP-based) - skip in local mode
     if tier == 'guest' and not LOCAL_MODE:
@@ -693,8 +736,8 @@ def start_crawl():
     except Exception as e:
         print(f"Warning: Could not apply settings: {e}")
 
-    # Pass user_id and session_id for database persistence
-    success, message = crawler.start_crawl(url, user_id=user_id, session_id=session_id)
+    # Pass user_id, session_id, and client_id for database persistence
+    success, message = crawler.start_crawl(url, user_id=user_id, session_id=session_id, client_id=client_id)
 
     # Store crawl_id in session
     if success and crawler.crawl_id:
@@ -710,6 +753,7 @@ def run_pagespeed():
     """Run PageSpeed analysis on a specific URL without full crawl"""
     data = request.get_json()
     url = data.get('url')
+    client_id = data.get('client_id')
     
     if not url:
         return jsonify({'success': False, 'error': 'URL is required'})
@@ -759,7 +803,8 @@ def run_pagespeed():
                 session_id=session_id,
                 base_url=base_url,
                 base_domain=base_domain,
-                config_snapshot=crawler_config
+                config_snapshot=crawler_config,
+                client_id=client_id
             )
             
             if crawl_id:
@@ -1189,17 +1234,42 @@ def resume_crawl():
 @app.route('/api/crawls/list')
 @login_required
 def list_crawls():
-    """Get all crawls for current user"""
+    """Get all crawls for current user - properly filtered by user_id"""
     try:
+        # First try to get user_id from Flask session
         user_id = session.get('user_id')
+        
+        # If no Flask session user_id, check for X-User-Id header from proxy
+        if not user_id:
+            x_user_id = request.headers.get('X-User-Id')
+            if x_user_id:
+                try:
+                    user_id = int(x_user_id)
+                except ValueError:
+                    pass
+        
+        # If still no user_id, return empty list (Security: Don't show global data)
+        if not user_id and not LOCAL_MODE:
+            print("list_crawls: No user_id found (Header missing?), returning empty list.")
+            return jsonify({'success': True, 'crawls': [], 'total': 0})
+            
+        # Get client_id filter for proper client-based isolation
+        client_id = request.args.get('client_id')
+        
+        # Debug logging
+        print(f"list_crawls: Fetching crawls for user_id={user_id}, client_id={client_id}")
+        
         from src.crawl_db import get_user_crawls, get_crawl_count
 
         limit = request.args.get('limit', 50, type=int)
         offset = request.args.get('offset', 0, type=int)
         status_filter = request.args.get('status')
 
-        crawls = get_user_crawls(user_id, limit=limit, offset=offset, status_filter=status_filter)
-        total_count = get_crawl_count(user_id)
+        # Pass client_id for filtering
+        crawls = get_user_crawls(user_id, limit=limit, offset=offset, status_filter=status_filter, client_id=client_id)
+        total_count = get_crawl_count(user_id, client_id=client_id)
+        
+        print(f"list_crawls: Found {len(crawls)} crawls for user_id={user_id}, client_id={client_id}")
 
         return jsonify({
             'success': True,
@@ -1404,21 +1474,20 @@ def crawl_stats():
     try:
         user_id = session.get('user_id')
         from src.crawl_db import get_crawl_count, get_database_size_mb
-        import sqlite3
+        from src.database import get_db
 
         # Get counts by status
-        conn = sqlite3.connect('users.db')
-        cursor = conn.cursor()
+        with get_db() as conn:
+            cursor = conn.cursor()
 
-        cursor.execute('''
-            SELECT status, COUNT(*) as count
-            FROM crawls
-            WHERE user_id = ?
-            GROUP BY status
-        ''', (user_id,))
+            cursor.execute('''
+                SELECT status, COUNT(*) as count
+                FROM crawls
+                WHERE user_id = ?
+                GROUP BY status
+            ''', (user_id,))
 
-        status_counts = {row[0]: row[1] for row in cursor.fetchall()}
-        conn.close()
+            status_counts = {row[0]: row[1] for row in cursor.fetchall()}
 
         return jsonify({
             'success': True,
@@ -1598,14 +1667,16 @@ def get_all_client_data():
     - type: 'serp', 'audit', 'gmb_health', 'gmb_scan', 'keyword', or 'all'
     - search: text search filter
     - client_visible_only: 'true' to show only client-visible items
+    - client_id: filter by specific client (for multi-tenant isolation)
     - page: pagination (default 1)
     - limit: items per page (default 50)
     """
-    import sqlite3
+    from src.database import get_db
     
     data_type = request.args.get('type', 'all')
     search = request.args.get('search', '')
     client_visible_only = request.args.get('client_visible_only', 'false') == 'true'
+    client_id = request.args.get('client_id')  # For multi-tenant filtering
     page = int(request.args.get('page', 1))
     limit = int(request.args.get('limit', 50))
     offset = (page - 1) * limit
@@ -1616,44 +1687,57 @@ def get_all_client_data():
         # SERP Data
         if data_type in ['all', 'serp']:
             from src.gmb_core.config import config
-            conn = sqlite3.connect(config.DATABASE_FILE)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            
-            query = '''
-                SELECT id, keyword, location, device, organic_count, 
-                       target_rank, created_at, show_to_client
-                FROM serp_searches
-                WHERE 1=1
-            '''
-            params = []
-            
-            if search:
-                query += ' AND keyword LIKE ?'
-                params.append(f'%{search}%')
-            
-            if client_visible_only:
-                query += ' AND show_to_client = 1'
-            
-            query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?'
-            params.extend([limit, offset])
-            
-            cursor.execute(query, params)
-            for row in cursor.fetchall():
-                results.append({
-                    'type': 'serp',
-                    'id': row['id'],
-                    'title': row['keyword'],
-                    'subtitle': f"{row['location']} • {row['device']}",
-                    'detail': f"Rank: #{row['target_rank']}" if row['target_rank'] else f"{row['organic_count']} results",
-                    'created_at': row['created_at'],
-                    'show_to_client': bool(row['show_to_client'])
-                })
-            conn.close()
+            # Use get_db without filename (PostgreSQL handled automatically)
+            with get_db() as conn:
+                cursor = conn.cursor()
+                
+                query = '''
+                    SELECT id, keyword, location, device, organic_count, 
+                           target_rank, created_at, show_to_client
+                    FROM serp_searches
+                    WHERE 1=1
+                '''
+                params = []
+                
+                if search:
+                    query += ' AND keyword LIKE ?'
+                    params.append(f'%{search}%')
+                
+                if client_id:
+                    query += ' AND client_id = ?'
+                    params.append(client_id)
+                
+                if client_visible_only:
+                    query += ' AND show_to_client = TRUE'
+                
+                query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?'
+                params.extend([limit, offset])
+                
+                print(f"DEBUG: Executing SERP query. Params: {params}")
+                print(f"DEBUG: Conn type: {type(conn)}")
+                try:
+                    cursor.execute(query, params)
+                    print("DEBUG: SERP query success")
+                except Exception as serpe:
+                    print(f"DEBUG: SERP query failed: {serpe}")
+                    raise serpe
+                    
+                for row in cursor.fetchall():
+                    results.append({
+                        'type': 'serp',
+                        'id': row['id'],
+                        'title': row['keyword'],
+                        'subtitle': f"{row['location']} • {row['device']}",
+                        'detail': f"Rank: #{row['target_rank']}" if row['target_rank'] else f"{row['organic_count']} results",
+                        'created_at': row['created_at'],
+                        'show_to_client': bool(row['show_to_client'])
+                    })
         
         # Audit/Crawl Data
         if data_type in ['all', 'audit']:
-            from src.crawl_db import get_db
+            # src.crawl_db context manager is replaced by src.database.get_db
+            # but we need to import get_db from src.database if not already available
+            # We already imported it at top of function
             with get_db() as conn:
                 cursor = conn.cursor()
                 
@@ -1669,8 +1753,12 @@ def get_all_client_data():
                     query += ' AND (base_url LIKE ? OR base_domain LIKE ?)'
                     params.extend([f'%{search}%', f'%{search}%'])
                 
+                if client_id:
+                    query += ' AND client_id = ?'
+                    params.append(client_id)
+                
                 if client_visible_only:
-                    query += ' AND show_to_client = 1'
+                    query += ' AND show_to_client = TRUE'
                 
                 query += ' ORDER BY started_at DESC LIMIT ? OFFSET ?'
                 params.extend([limit, offset])
@@ -1687,49 +1775,48 @@ def get_all_client_data():
                         'show_to_client': bool(row['show_to_client']) if row['show_to_client'] else False
                     })
         
-
         
         # GMB Grid Scans
         if data_type in ['all', 'gmb_scan']:
-            from src.gmb_core.config import config
-            conn = sqlite3.connect(config.DATABASE_FILE)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            
-            query = '''
-                SELECT id, keyword, target_business, status, total_points,
-                       started_at, show_to_client
-                FROM gmb_grid_scans
-                WHERE 1=1
-            '''
-            params = []
-            
-            if search:
-                query += ' AND (keyword LIKE ? OR target_business LIKE ?)'
-                params.extend([f'%{search}%', f'%{search}%'])
-            
-            if client_visible_only:
-                query += ' AND show_to_client = 1'
-            
-            query += ' ORDER BY started_at DESC LIMIT ? OFFSET ?'
-            params.extend([limit, offset])
-            
-            cursor.execute(query, params)
-            for row in cursor.fetchall():
-                results.append({
-                    'type': 'gmb_scan',
-                    'id': row['id'],
-                    'title': row['keyword'],
-                    'subtitle': f"Grid Scan • {row['target_business'] or 'No target'}",
-                    'detail': f"{row['total_points']} points • {row['status']}",
-                    'created_at': row['started_at'],
-                    'show_to_client': bool(row['show_to_client']) if row['show_to_client'] else False
-                })
-            conn.close()
+            with get_db() as conn:
+                cursor = conn.cursor()
+                
+                query = '''
+                    SELECT id, keyword, target_business, status, total_points,
+                           started_at, show_to_client
+                    FROM gmb_grid_scans
+                    WHERE 1=1
+                '''
+                params = []
+                
+                if search:
+                    query += ' AND (keyword LIKE ? OR target_business LIKE ?)'
+                    params.extend([f'%{search}%', f'%{search}%'])
+                
+                if client_id:
+                    query += ' AND client_id = ?'
+                    params.append(client_id)
+                
+                if client_visible_only:
+                    query += ' AND show_to_client = TRUE'
+                
+                query += ' ORDER BY started_at DESC LIMIT ? OFFSET ?'
+                params.extend([limit, offset])
+                
+                cursor.execute(query, params)
+                for row in cursor.fetchall():
+                    results.append({
+                        'type': 'gmb_scan',
+                        'id': row['id'],
+                        'title': row['keyword'],
+                        'subtitle': f"Grid Scan • {row['target_business'] or 'No target'}",
+                        'detail': f"{row['total_points']} points • {row['status']}",
+                        'created_at': row['started_at'],
+                        'show_to_client': bool(row['show_to_client']) if row['show_to_client'] else False
+                    })
         
         # Keyword History
         if data_type in ['all', 'keyword']:
-            from src.keyword.keyword_db import get_db
             with get_db() as conn:
                 cursor = conn.cursor()
                 
@@ -1744,8 +1831,12 @@ def get_all_client_data():
                     query += ' AND input_params LIKE ?'
                     params.append(f'%{search}%')
                 
+                if client_id:
+                    query += ' AND client_id = ?'
+                    params.append(client_id)
+                
                 if client_visible_only:
-                    query += ' AND show_to_client = 1'
+                    query += ' AND show_to_client = TRUE'
                 
                 query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?'
                 params.extend([limit, offset])
@@ -1794,7 +1885,7 @@ def toggle_client_visibility():
     Body: { items: [{ type: 'serp', id: 123 }, ...], visible: true/false }
     OR single item: { type: 'serp', id: 123, visible: true }
     """
-    import sqlite3
+    from src.database import get_db
     
     data = request.get_json()
     if not data:
@@ -1821,18 +1912,15 @@ def toggle_client_visibility():
                 continue
             
             if item_type == 'serp':
-                from src.gmb_core.config import config
-                conn = sqlite3.connect(config.DATABASE_FILE)
-                cursor = conn.cursor()
-                
-                if visible is None:
-                    cursor.execute('UPDATE serp_searches SET show_to_client = NOT show_to_client WHERE id = ?', (item_id,))
-                else:
-                    cursor.execute('UPDATE serp_searches SET show_to_client = ? WHERE id = ?', (1 if visible else 0, item_id))
-                
-                conn.commit()
-                conn.close()
-                updated_count += 1
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    
+                    if visible is None:
+                        cursor.execute('UPDATE serp_searches SET show_to_client = NOT show_to_client WHERE id = ?', (item_id,))
+                    else:
+                        cursor.execute('UPDATE serp_searches SET show_to_client = ? WHERE id = ?', (1 if visible else 0, item_id))
+                    
+                    updated_count += 1
                 
             elif item_type == 'audit':
                 from src.crawl_db import get_db
@@ -1847,32 +1935,26 @@ def toggle_client_visibility():
                     updated_count += 1
                     
             elif item_type == 'gmb_health':
-                from src.gmb_core.config import config
-                conn = sqlite3.connect(config.DATABASE_FILE)
-                cursor = conn.cursor()
-                
-                if visible is None:
-                    cursor.execute('UPDATE gmb_health_snapshots SET show_to_client = NOT show_to_client WHERE id = ?', (item_id,))
-                else:
-                    cursor.execute('UPDATE gmb_health_snapshots SET show_to_client = ? WHERE id = ?', (1 if visible else 0, item_id))
-                
-                conn.commit()
-                conn.close()
-                updated_count += 1
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    
+                    if visible is None:
+                        cursor.execute('UPDATE gmb_health_snapshots SET show_to_client = NOT show_to_client WHERE id = ?', (item_id,))
+                    else:
+                        cursor.execute('UPDATE gmb_health_snapshots SET show_to_client = ? WHERE id = ?', (1 if visible else 0, item_id))
+                    
+                    updated_count += 1
                 
             elif item_type == 'gmb_scan':
-                from src.gmb_core.config import config
-                conn = sqlite3.connect(config.DATABASE_FILE)
-                cursor = conn.cursor()
-                
-                if visible is None:
-                    cursor.execute('UPDATE gmb_grid_scans SET show_to_client = NOT show_to_client WHERE id = ?', (item_id,))
-                else:
-                    cursor.execute('UPDATE gmb_grid_scans SET show_to_client = ? WHERE id = ?', (1 if visible else 0, item_id))
-                
-                conn.commit()
-                conn.close()
-                updated_count += 1
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    
+                    if visible is None:
+                        cursor.execute('UPDATE gmb_grid_scans SET show_to_client = NOT show_to_client WHERE id = ?', (item_id,))
+                    else:
+                        cursor.execute('UPDATE gmb_grid_scans SET show_to_client = ? WHERE id = ?', (1 if visible else 0, item_id))
+                    
+                    updated_count += 1
                 
             elif item_type == 'keyword':
                 from src.keyword.keyword_db import get_db
@@ -1906,7 +1988,7 @@ def delete_client_data():
     Body: { type: 'serp', id: 123 }
     OR bulk: { items: [{ type: 'serp', id: 123 }, ...] }
     """
-    import sqlite3
+    from src.database import get_db
     
     data = request.get_json()
     if not data:
@@ -1931,13 +2013,10 @@ def delete_client_data():
                 continue
             
             if item_type == 'serp':
-                from src.gmb_core.config import config
-                conn = sqlite3.connect(config.DATABASE_FILE)
-                cursor = conn.cursor()
-                cursor.execute('DELETE FROM serp_searches WHERE id = ?', (item_id,))
-                conn.commit()
-                conn.close()
-                deleted_count += 1
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('DELETE FROM serp_searches WHERE id = ?', (item_id,))
+                    deleted_count += 1
                 
             elif item_type == 'audit':
                 from src.crawl_db import get_db
@@ -1947,22 +2026,16 @@ def delete_client_data():
                     deleted_count += 1
                     
             elif item_type == 'gmb_health':
-                from src.gmb_core.config import config
-                conn = sqlite3.connect(config.DATABASE_FILE)
-                cursor = conn.cursor()
-                cursor.execute('DELETE FROM gmb_health_snapshots WHERE id = ?', (item_id,))
-                conn.commit()
-                conn.close()
-                deleted_count += 1
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('DELETE FROM gmb_health_snapshots WHERE id = ?', (item_id,))
+                    deleted_count += 1
                 
             elif item_type == 'gmb_scan':
-                from src.gmb_core.config import config
-                conn = sqlite3.connect(config.DATABASE_FILE)
-                cursor = conn.cursor()
-                cursor.execute('DELETE FROM gmb_grid_scans WHERE id = ?', (item_id,))
-                conn.commit()
-                conn.close()
-                deleted_count += 1
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('DELETE FROM gmb_grid_scans WHERE id = ?', (item_id,))
+                    deleted_count += 1
                 
             elif item_type == 'keyword':
                 from src.keyword.keyword_db import get_db
@@ -1990,7 +2063,7 @@ def get_client_data_detail(data_type, item_id):
     Get detailed data for a specific client data item for preview.
     Supports: audit, gmb_health, gmb_scan, keyword
     """
-    import sqlite3
+    from src.database import get_db
     
     try:
         if data_type == 'audit':
@@ -2031,56 +2104,50 @@ def get_client_data_detail(data_type, item_id):
             })
             
         elif data_type == 'gmb_scan':
-            from src.gmb_core.config import config
-            conn = sqlite3.connect(config.DATABASE_FILE)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            
-            # Get scan info
-            cursor.execute('''
-                SELECT s.id, s.keyword, l.location_name as location, s.target_business, s.status, 
-                       s.total_points, s.grid_size, s.started_at, s.completed_at, s.average_rank
-                FROM gmb_grid_scans s
-                LEFT JOIN gmb_locations l ON s.location_id = l.id
-                WHERE s.id = ?
-            ''', (item_id,))
-            
-            scan = cursor.fetchone()
-            if not scan:
-                conn.close()
-                return jsonify({'success': False, 'error': 'Grid scan not found'}), 404
-            
-            # Get grid points summary
-            cursor.execute('''
-                SELECT target_rank as rank, COUNT(*) as count
-                FROM gmb_grid_results
-                WHERE scan_id = ?
-                GROUP BY target_rank
-                ORDER BY target_rank
-            ''', (item_id,))
-            
-            rank_distribution = {}
-            total_rank_sum = 0
-            total_ranked_count = 0
-            
-            for r in cursor.fetchall():
-                rank_val = r['rank']
-                count = r['count']
-                rank_key = str(rank_val) if rank_val else 'Not Found'
-                rank_distribution[rank_key] = count
+            with get_db() as conn:
+                cursor = conn.cursor()
                 
-                if rank_val:
-                    total_rank_sum += rank_val * count
-                    total_ranked_count += count
-            
-            # Self-healing: Compute average_rank if missing
-            avg_rank = scan['average_rank']
-            if avg_rank is None and total_ranked_count > 0:
-                avg_rank = total_rank_sum / total_ranked_count
-                cursor.execute('UPDATE gmb_grid_scans SET average_rank = ? WHERE id = ?', (avg_rank, item_id))
-                conn.commit()
-
-            conn.close()
+                # Get scan info
+                cursor.execute('''
+                    SELECT s.id, s.keyword, l.location_name as location, s.target_business, s.status, 
+                           s.total_points, s.grid_size, s.started_at, s.completed_at, s.average_rank
+                    FROM gmb_grid_scans s
+                    LEFT JOIN gmb_locations l ON s.location_id = l.id
+                    WHERE s.id = ?
+                ''', (item_id,))
+                
+                scan = cursor.fetchone()
+                if not scan:
+                    return jsonify({'success': False, 'error': 'Grid scan not found'}), 404
+                
+                # Get grid points summary
+                cursor.execute('''
+                    SELECT target_rank as rank, COUNT(*) as count
+                    FROM gmb_grid_results
+                    WHERE scan_id = ?
+                    GROUP BY target_rank
+                    ORDER BY target_rank
+                ''', (item_id,))
+                
+                rank_distribution = {}
+                total_rank_sum = 0
+                total_ranked_count = 0
+                
+                for r in cursor.fetchall():
+                    rank_val = r['rank']
+                    count = r['count']
+                    rank_key = str(rank_val) if rank_val else 'Not Found'
+                    rank_distribution[rank_key] = count
+                    
+                    if rank_val:
+                        total_rank_sum += rank_val * count
+                        total_ranked_count += count
+                
+                # Self-healing: Compute average_rank if missing
+                avg_rank = scan['average_rank']
+                if avg_rank is None and total_ranked_count > 0:
+                    avg_rank = total_rank_sum / total_ranked_count
+                    cursor.execute('UPDATE gmb_grid_scans SET average_rank = ? WHERE id = ?', (avg_rank, item_id))
             
             return jsonify({
                 'success': True,
@@ -2224,52 +2291,7 @@ def graceful_shutdown(signum, frame):
     import sys
     sys.exit(0)
 
-def check_client_data_migrations():
-    """
-    Ensure all client data tables have the 'show_to_client' column for visibility control.
-    """
-    import sqlite3
-    
-    # All modules seem to default to 'users.db', but we should respect config if possible.
-    # For simplicity in this unified main.py, we'll assume users.db or check widely.
-    db_file = 'users.db' 
-    
-    print(f"Checking client data migrations for {db_file}...")
-    
-    try:
-        conn = sqlite3.connect(db_file)
-        cursor = conn.cursor()
-        
-        tables_to_check = [
-            'serp_searches',
-            'crawls',
-            'gmb_grid_scans',
-            'keyword_history'
-        ]
-        
-        for table in tables_to_check:
-            try:
-                # Check if table exists
-                cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table}'")
-                if not cursor.fetchone():
-                    continue
-                    
-                # Check if column exists
-                cursor.execute(f"PRAGMA table_info({table})")
-                columns = [info[1] for info in cursor.fetchall()]
-                
-                if 'show_to_client' not in columns:
-                    print(f"Migrating table {table}: Adding show_to_client column...")
-                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN show_to_client BOOLEAN DEFAULT 0")
-                    conn.commit()
-            except Exception as e:
-                print(f"Error checking migration for table {table}: {e}")
-                
-        conn.close()
-        print("Client data migrations completed.")
-        
-    except Exception as e:
-        print(f"Migration check failed: {e}")
+
 
 def main():
     # [FIX] Initialize Playwright globally before signal handlers
@@ -2281,8 +2303,6 @@ def main():
     except Exception as e:
         print(f"Warning: Failed to pre-initialize Playwright: {e}")
 
-    # Check database migrations
-    check_client_data_migrations()
 
     import signal
 
@@ -2311,7 +2331,7 @@ def main():
     from waitress import serve
     print("Starting LibreCrawl on http://localhost:5000")
     print("Using Waitress WSGI server with multi-threading support")
-    serve(app, host='0.0.0.0', port=5000, threads=8)
+    serve(app, host='0.0.0.0', port=5000, threads=1)
 
 if __name__ == '__main__':
     main()

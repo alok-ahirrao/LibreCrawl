@@ -76,9 +76,6 @@ class Config:
     # Options: 'debug' (verbose output), 'production' (errors only), 'info' (default)
     LOG_MODE = os.getenv('LOG_MODE', 'info').lower()
     
-    # Database
-    DATABASE_FILE = os.getenv('GMB_DATABASE_FILE', 'users.db')
-    
     @classmethod
     def is_configured(cls) -> bool:
         """Check if required OAuth credentials are configured."""

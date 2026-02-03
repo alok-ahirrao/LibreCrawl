@@ -1,31 +1,19 @@
 
+
 """
 Keyword Research History Database Module
 """
-import sqlite3
-import json
-from contextlib import contextmanager
 from datetime import datetime
+import json
+import os
+from src.database import get_db
 
-# Database file location
-DB_FILE = 'users.db'
 
-@contextmanager
-def get_db():
-    """Context manager for database connections"""
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row  # Return rows as dictionaries
-    try:
-        yield conn
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        conn.close()
-
-def init_keyword_tables():
+def init_keyword_tables(enable_migrations=False):
     """Initialize keyword history tables"""
+    if not enable_migrations:
+        return
+
     with get_db() as conn:
         cursor = conn.cursor()
 
@@ -37,6 +25,8 @@ def init_keyword_tables():
                 user_id INTEGER,
                 input_params TEXT,
                 results TEXT,
+                show_to_client BOOLEAN DEFAULT 0,
+                client_id TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -65,42 +55,23 @@ def init_keyword_tables():
                 notes TEXT,
                 brief TEXT,
                 user_id TEXT,
+                client_id TEXT,
+                campaign_title TEXT,
+                website_url TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
         
         # Create indexes for content_items
-        # Add columns for multi-tenancy if not exist (Migration)
-        try:
-            cursor.execute('ALTER TABLE content_items ADD COLUMN client_id TEXT')
-        except:
-            pass
-        try:
-            cursor.execute('ALTER TABLE content_items ADD COLUMN campaign_title TEXT')
-        except:
-            pass
-        try:
-            cursor.execute('ALTER TABLE content_items ADD COLUMN website_url TEXT')
-        except:
-            pass
-
-        # Create indexes (after ensuring columns exist)
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_content_items_status ON content_items(status)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_content_items_scheduled ON content_items(scheduled_date)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_content_items_user ON content_items(user_id)')
         cursor.execute('CREATE INDEX IF NOT EXISTS idx_content_items_client ON content_items(client_id)')
 
-        # === CLIENT DATA VISIBILITY MIGRATION ===
-        try:
-            cursor.execute('ALTER TABLE keyword_history ADD COLUMN show_to_client BOOLEAN DEFAULT 0')
-            print("Migration: Added show_to_client column to keyword_history table")
-        except:
-            pass  # Column likely exists
-
         print("Keyword history tables initialized successfully")
 
-def save_keyword_history(type, input_params, results, user_id=None):
+def save_keyword_history(type, input_params, results, user_id=None, client_id=None):
     """
     Save keyword research result to history
     type: 'workflow', 'discovery', 'density', 'competitor', 'cannibalization', 'content_map'
@@ -109,16 +80,16 @@ def save_keyword_history(type, input_params, results, user_id=None):
         with get_db() as conn:
             cursor = conn.cursor()
             cursor.execute('''
-                INSERT INTO keyword_history (type, user_id, input_params, results)
-                VALUES (?, ?, ?, ?)
-            ''', (type, user_id, json.dumps(input_params), json.dumps(results)))
+                INSERT INTO keyword_history (type, user_id, client_id, input_params, results)
+                VALUES (%s, %s, %s, %s, %s)
+            ''', (type, user_id, client_id, json.dumps(input_params), json.dumps(results)))
             
             return cursor.lastrowid
     except Exception as e:
         print(f"Error saving keyword history: {e}")
         return None
 
-def get_keyword_history(user_id=None, type_filter=None, limit=50, offset=0):
+def get_keyword_history(user_id=None, client_id=None, type_filter=None, limit=50, offset=0):
     """Get keyword history list"""
     try:
         with get_db() as conn:
@@ -128,14 +99,19 @@ def get_keyword_history(user_id=None, type_filter=None, limit=50, offset=0):
             params = []
             
             if user_id is not None:
-                query += ' AND user_id = ?'
+                query += ' AND user_id = %s'
                 params.append(user_id)
             
+            # [NEW] Client Isolation
+            if client_id:
+                query += ' AND client_id = %s'
+                params.append(client_id)
+            
             if type_filter:
-                query += ' AND type = ?'
+                query += ' AND type = %s'
                 params.append(type_filter)
                 
-            query += ' ORDER BY created_at DESC LIMIT ? OFFSET ?'
+            query += ' ORDER BY created_at DESC LIMIT %s OFFSET %s'
             params.extend([limit, offset])
             
             cursor.execute(query, params)
@@ -161,11 +137,11 @@ def get_keyword_history_item(history_id, user_id=None):
         with get_db() as conn:
             cursor = conn.cursor()
             
-            query = 'SELECT * FROM keyword_history WHERE id = ?'
+            query = 'SELECT * FROM keyword_history WHERE id = %s'
             params = [history_id]
             
             if user_id is not None:
-                query += ' AND user_id = ?'
+                query += ' AND user_id = %s'
                 params.append(user_id)
                 
             cursor.execute(query, params)
@@ -196,11 +172,11 @@ def delete_keyword_history(history_id, user_id=None):
         with get_db() as conn:
             cursor = conn.cursor()
             
-            query = 'DELETE FROM keyword_history WHERE id = ?'
+            query = 'DELETE FROM keyword_history WHERE id = %s'
             params = [history_id]
             
             if user_id is not None:
-                query += ' AND user_id = ?'
+                query += ' AND user_id = %s'
                 params.append(user_id)
                 
             cursor.execute(query, params)
@@ -239,7 +215,7 @@ def save_content_item(item_data, user_id=None):
                     status, priority_tier, priority_score,
                     scheduled_date, week_number, notes, brief, user_id,
                     client_id, campaign_title, website_url
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ''', (
                 item_data.get('cluster_topic', ''),
                 item_data.get('primary_keyword', ''),
@@ -277,18 +253,18 @@ def get_content_items(user_id=None, client_id=None, status_filter=None, limit=10
             params = []
             
             if user_id is not None:
-                query += ' AND user_id = ?'
+                query += ' AND user_id = %s'
                 params.append(user_id)
             
             if client_id is not None:
-                query += ' AND client_id = ?'
+                query += ' AND client_id = %s'
                 params.append(client_id)
             
             if status_filter:
-                query += ' AND status = ?'
+                query += ' AND status = %s'
                 params.append(status_filter)
                 
-            query += ' ORDER BY priority_score DESC, scheduled_date ASC, created_at DESC LIMIT ? OFFSET ?'
+            query += ' ORDER BY priority_score DESC, scheduled_date ASC, created_at DESC LIMIT %s OFFSET %s'
             params.extend([limit, offset])
             
             cursor.execute(query, params)
@@ -321,11 +297,11 @@ def get_content_item(item_id, user_id=None):
         with get_db() as conn:
             cursor = conn.cursor()
             
-            query = 'SELECT * FROM content_items WHERE id = ?'
+            query = 'SELECT * FROM content_items WHERE id = %s'
             params = [item_id]
             
             if user_id is not None:
-                query += ' AND user_id = ?'
+                query += ' AND user_id = %s'
                 params.append(user_id)
                 
             cursor.execute(query, params)
@@ -373,26 +349,26 @@ def update_content_item(item_id, updates, user_id=None):
             
             for field in allowed_fields:
                 if field in updates:
-                    set_clauses.append(f'{field} = ?')
+                    set_clauses.append(f'{field} = %s')
                     params.append(updates[field])
             
             # Handle JSON fields specially
             if 'secondary_keywords' in updates:
-                set_clauses.append('secondary_keywords = ?')
+                set_clauses.append('secondary_keywords = %s')
                 params.append(json.dumps(updates['secondary_keywords']))
             
             if 'brief' in updates:
-                set_clauses.append('brief = ?')
+                set_clauses.append('brief = %s')
                 params.append(json.dumps(updates['brief']))
             
             if len(set_clauses) == 1:  # Only updated_at
                 return False
             
-            query = f"UPDATE content_items SET {', '.join(set_clauses)} WHERE id = ?"
+            query = f"UPDATE content_items SET {', '.join(set_clauses)} WHERE id = %s"
             params.append(item_id)
             
             if user_id is not None:
-                query += ' AND user_id = ?'
+                query += ' AND user_id = %s'
                 params.append(user_id)
                 
             cursor.execute(query, params)
@@ -408,11 +384,11 @@ def delete_content_item(item_id, user_id=None):
         with get_db() as conn:
             cursor = conn.cursor()
             
-            query = 'DELETE FROM content_items WHERE id = ?'
+            query = 'DELETE FROM content_items WHERE id = %s'
             params = [item_id]
             
             if user_id is not None:
-                query += ' AND user_id = ?'
+                query += ' AND user_id = %s'
                 params.append(user_id)
                 
             cursor.execute(query, params)

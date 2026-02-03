@@ -1,30 +1,10 @@
 """
 GMB Core Database Models
-Independent SQLite implementation to maintain isolation from CrawlX
+Uses centralized PostgreSQL database abstraction layer
 """
-import sqlite3
+from datetime import datetime, timedelta
+from src.database import get_db
 import json
-from contextlib import contextmanager
-from datetime import datetime
-from .config import config
-
-# Database file location
-DB_FILE = config.DATABASE_FILE
-
-
-@contextmanager
-def get_db():
-    """Context manager for database connections."""
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        conn.close()
 
 
 def init_gmb_tables():
@@ -74,6 +54,16 @@ def init_gmb_tables():
                 website_url TEXT,
                 phone_number TEXT,
                 source_url TEXT,
+
+                description TEXT,
+                business_hours TEXT,
+                attributes TEXT,
+                service_area_type TEXT DEFAULT 'STOREFRONT',
+                service_area_places TEXT,
+
+                post_count INTEGER DEFAULT 0,
+                last_post_date TIMESTAMP,
+                qa_count INTEGER DEFAULT 0,
                 
                 -- Cached Stats
                 total_reviews INTEGER DEFAULT 0,
@@ -144,6 +134,7 @@ def init_gmb_tables():
                 
                 average_rank REAL,
                 show_to_client BOOLEAN DEFAULT 0,
+                client_id TEXT,
                 
                 started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 completed_at TIMESTAMP,
@@ -196,6 +187,11 @@ def init_gmb_tables():
                 review_count INTEGER,
                 photo_count INTEGER,
                 attributes TEXT,
+
+                hours TEXT,
+                services TEXT,
+                post_count INTEGER DEFAULT 0,
+                q_and_a_count INTEGER DEFAULT 0,
                 
                 last_scraped_at TIMESTAMP,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -300,6 +296,11 @@ def init_gmb_tables():
                 target_rank INTEGER,
                 target_url TEXT,
                 results_json TEXT,
+
+                ai_overview_present BOOLEAN DEFAULT 0,
+                show_to_client BOOLEAN DEFAULT 0,
+                client_id TEXT,
+
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -326,6 +327,8 @@ def init_gmb_tables():
                 
                 -- Raw Metrics
                 metrics_json TEXT,
+
+                show_to_client BOOLEAN DEFAULT 0,
                 
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 
@@ -418,161 +421,7 @@ def init_gmb_tables():
         ''')
 
         print("GMB Core tables initialized successfully")
-        
-        # Run migrations for existing databases
-        _run_migrations(conn)
 
-
-def _run_migrations(conn):
-    """Add missing columns to existing tables (safe migrations)."""
-    cursor = conn.cursor()
-    
-    # Migration: Add total_points to gmb_grid_scans if missing
-    cursor.execute("PRAGMA table_info(gmb_grid_scans)")
-    columns = [col[1] for col in cursor.fetchall()]
-    
-    if 'total_points' not in columns:
-        print("Migration: Adding total_points column to gmb_grid_scans")
-        cursor.execute('ALTER TABLE gmb_grid_scans ADD COLUMN total_points INTEGER DEFAULT 25')
-    
-    if 'completed_points' not in columns:
-        print("Migration: Adding completed_points column to gmb_grid_scans")
-        cursor.execute('ALTER TABLE gmb_grid_scans ADD COLUMN completed_points INTEGER DEFAULT 0')
-    
-    if 'radius_meters' not in columns:
-        print("Migration: Adding radius_meters column to gmb_grid_scans")
-        cursor.execute('ALTER TABLE gmb_grid_scans ADD COLUMN radius_meters INTEGER DEFAULT 3000')
-    
-    if 'target_business' not in columns:
-        print("Migration: Adding target_business column to gmb_grid_scans")
-        cursor.execute('ALTER TABLE gmb_grid_scans ADD COLUMN target_business TEXT')
-    
-    # Migration: Add new columns to gmb_competitors
-    cursor.execute("PRAGMA table_info(gmb_competitors)")
-    comp_columns = [col[1] for col in cursor.fetchall()]
-    
-    if 'hours' not in comp_columns:
-        print("Migration: Adding hours column to gmb_competitors")
-        cursor.execute('ALTER TABLE gmb_competitors ADD COLUMN hours TEXT')
-    
-    if 'services' not in comp_columns:
-        print("Migration: Adding services column to gmb_competitors")
-        cursor.execute('ALTER TABLE gmb_competitors ADD COLUMN services TEXT')
-    
-    if 'post_count' not in comp_columns:
-        print("Migration: Adding post_count column to gmb_competitors")
-        cursor.execute('ALTER TABLE gmb_competitors ADD COLUMN post_count INTEGER DEFAULT 0')
-    
-    if 'q_and_a_count' not in comp_columns:
-        print("Migration: Adding q_and_a_count column to gmb_competitors")
-        cursor.execute('ALTER TABLE gmb_competitors ADD COLUMN q_and_a_count INTEGER DEFAULT 0')
-    
-    # Migration: Add ai_overview_present to serp_searches
-    cursor.execute("PRAGMA table_info(serp_searches)")
-    serp_columns = [col[1] for col in cursor.fetchall()]
-    
-    if 'ai_overview_present' not in serp_columns:
-        print("Migration: Adding ai_overview_present column to serp_searches")
-        cursor.execute('ALTER TABLE serp_searches ADD COLUMN ai_overview_present BOOLEAN DEFAULT 0')
-
-    # Migration: Fix competitive_analyses table if it exists with wrong schema
-    cursor.execute("PRAGMA table_info(competitive_analyses)")
-    ca_columns = [col[1] for col in cursor.fetchall()]
-    
-    if ca_columns and 'user_place_id' not in ca_columns:
-        print("Migration: Recreating competitive_analyses table with correct schema")
-        cursor.execute('DROP TABLE IF EXISTS competitive_analyses')
-        cursor.execute('''
-            CREATE TABLE competitive_analyses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_place_id TEXT,
-                keyword TEXT,
-                competitor_ids TEXT,
-                deficits TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        cursor.execute('''
-            CREATE INDEX IF NOT EXISTS idx_competitive_analyses_user 
-            ON competitive_analyses(user_place_id)
-        ''')
-    
-    # Migration: Add missing columns to gmb_locations
-    cursor.execute("PRAGMA table_info(gmb_locations)")
-    loc_columns = [col[1] for col in cursor.fetchall()]
-    
-    if 'region' not in loc_columns:
-        print("Migration: Adding region column to gmb_locations")
-        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN region TEXT')
-    
-    if 'locality' not in loc_columns:
-        print("Migration: Adding locality column to gmb_locations")
-        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN locality TEXT')
-    
-    if 'photo_count' not in loc_columns:
-        print("Migration: Adding photo_count column to gmb_locations")
-        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN photo_count INTEGER DEFAULT 0')
-    
-    # === NEW MIGRATIONS FOR ENHANCED GMB DATA ===
-    
-    if 'business_hours' not in loc_columns:
-        print("Migration: Adding business_hours column to gmb_locations")
-        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN business_hours TEXT')
-    
-    if 'attributes' not in loc_columns:
-        print("Migration: Adding attributes column to gmb_locations")
-        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN attributes TEXT')
-    
-    if 'description' not in loc_columns:
-        print("Migration: Adding description column to gmb_locations")
-        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN description TEXT')
-    
-    if 'service_area_type' not in loc_columns:
-        print("Migration: Adding service_area_type column to gmb_locations")
-        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN service_area_type TEXT DEFAULT "STOREFRONT"')
-    
-    if 'service_area_places' not in loc_columns:
-        print("Migration: Adding service_area_places column to gmb_locations")
-        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN service_area_places TEXT')
-    
-    if 'post_count' not in loc_columns:
-        print("Migration: Adding post_count column to gmb_locations")
-        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN post_count INTEGER DEFAULT 0')
-    
-    if 'last_post_date' not in loc_columns:
-        print("Migration: Adding last_post_date column to gmb_locations")
-        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN last_post_date TIMESTAMP')
-    
-    if 'qa_count' not in loc_columns:
-        print("Migration: Adding qa_count column to gmb_locations")
-        cursor.execute('ALTER TABLE gmb_locations ADD COLUMN qa_count INTEGER DEFAULT 0')
-
-    # === CLIENT DATA VISIBILITY MIGRATIONS ===
-    
-    # Migration: Add show_to_client to serp_searches
-    if 'show_to_client' not in serp_columns:
-        print("Migration: Adding show_to_client column to serp_searches")
-        cursor.execute('ALTER TABLE serp_searches ADD COLUMN show_to_client BOOLEAN DEFAULT 0')
-    
-    # Migration: Add show_to_client to gmb_health_snapshots
-    cursor.execute("PRAGMA table_info(gmb_health_snapshots)")
-    health_columns = [col[1] for col in cursor.fetchall()]
-    
-    if 'show_to_client' not in health_columns:
-        print("Migration: Adding show_to_client column to gmb_health_snapshots")
-        cursor.execute('ALTER TABLE gmb_health_snapshots ADD COLUMN show_to_client BOOLEAN DEFAULT 0')
-    
-    # Migration: Add show_to_client to gmb_grid_scans
-    cursor.execute("PRAGMA table_info(gmb_grid_scans)")
-    scan_columns = [col[1] for col in cursor.fetchall()]
-    
-    if 'show_to_client' not in scan_columns:
-        print("Migration: Adding show_to_client column to gmb_grid_scans")
-        cursor.execute('ALTER TABLE gmb_grid_scans ADD COLUMN show_to_client BOOLEAN DEFAULT 0')
-
-    if 'average_rank' not in scan_columns:
-        print("Migration: Adding average_rank column to gmb_grid_scans")
-        cursor.execute('ALTER TABLE gmb_grid_scans ADD COLUMN average_rank REAL')
 
 
 # ==================== Helper Functions ====================
@@ -681,7 +530,7 @@ def get_cached_serp(keyword: str, lat: float, lng: float) -> dict:
         cursor = conn.cursor()
         cursor.execute('''
             SELECT results_json FROM gmb_serp_cache 
-            WHERE keyword = ? AND lat = ? AND lng = ? AND expires_at > datetime('now')
+            WHERE keyword = ? AND lat = ? AND lng = ? AND expires_at > CURRENT_TIMESTAMP
         ''', (keyword, round(lat, 6), round(lng, 6)))
         
         row = cursor.fetchone()
@@ -696,12 +545,12 @@ def save_serp_cache(keyword: str, lat: float, lng: float, results: list, ttl_sec
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO gmb_serp_cache (keyword, lat, lng, results_json, expires_at)
-            VALUES (?, ?, ?, ?, datetime('now', '+' || ? || ' seconds'))
+            VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(keyword, lat, lng) DO UPDATE SET
                 results_json = excluded.results_json,
                 expires_at = excluded.expires_at,
                 created_at = CURRENT_TIMESTAMP
-        ''', (keyword, round(lat, 6), round(lng, 6), json.dumps(results), ttl_seconds))
+        ''', (keyword, round(lat, 6), round(lng, 6), json.dumps(results), datetime.now() + timedelta(seconds=ttl_seconds)))
 
 
 def save_serp_search(search_data: dict) -> int:
@@ -715,8 +564,8 @@ def save_serp_search(search_data: dict) -> int:
             INSERT INTO serp_searches (
                 keyword, location, lat, lng, device, language, depth,
                 organic_count, local_pack_count, hotel_count, shopping_count,
-                target_rank, target_url, results_json, ai_overview_present
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                target_rank, target_url, results_json, ai_overview_present, client_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             search_data.get('keyword', ''),
             search_data.get('location', ''),
@@ -732,33 +581,46 @@ def save_serp_search(search_data: dict) -> int:
             search_data.get('target_rank'),
             search_data.get('target_url'),
             json.dumps(search_data.get('results', {})),
-            1 if search_data.get('results', {}).get('serp_features', {}).get('ai_overview') else 0
+            1 if search_data.get('results', {}).get('serp_features', {}).get('ai_overview') else 0,
+            search_data.get('client_id')
         ))
         return cursor.lastrowid
 
 
-def get_serp_history(limit: int = 50) -> list:
+def get_serp_history(limit: int = 50, client_id: str = None) -> list:
     """Get SERP search history."""
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute('''
-            SELECT id, keyword, location, lat, lng, device, language, depth,
-                   organic_count, local_pack_count, hotel_count, shopping_count,
-                   target_rank, target_url, created_at
-            FROM serp_searches
-            ORDER BY created_at DESC
-            LIMIT ?
-        ''', (limit,))
+        if client_id:
+            cursor.execute('''
+                SELECT id, keyword, location, lat, lng, device, language, depth,
+                       organic_count, local_pack_count, hotel_count, shopping_count,
+                       target_rank, target_url, created_at
+                FROM serp_searches
+                WHERE client_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+            ''', (client_id, limit))
+        else:
+            cursor.execute('''
+                SELECT id, keyword, location, lat, lng, device, language, depth,
+                       organic_count, local_pack_count, hotel_count, shopping_count,
+                       target_rank, target_url, created_at
+                FROM serp_searches
+                ORDER BY created_at DESC
+                LIMIT ?
+            ''', (limit,))
         return [dict(row) for row in cursor.fetchall()]
 
 
-def get_serp_search_by_id(search_id: int) -> dict:
+def get_serp_search_by_id(search_id: int, client_id: str = None) -> dict:
     """Get a specific SERP search with full results."""
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute('''
-            SELECT * FROM serp_searches WHERE id = ?
-        ''', (search_id,))
+        if client_id:
+             cursor.execute('SELECT * FROM serp_searches WHERE id = ? AND client_id = ?', (search_id, client_id))
+        else:
+             cursor.execute('SELECT * FROM serp_searches WHERE id = ?', (search_id,))
         row = cursor.fetchone()
         if row:
             result = dict(row)
@@ -767,11 +629,14 @@ def get_serp_search_by_id(search_id: int) -> dict:
         return None
 
 
-def delete_serp_search(search_id: int) -> bool:
+def delete_serp_search(search_id: int, client_id: str = None) -> bool:
     """Delete a SERP search from history."""
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute('DELETE FROM serp_searches WHERE id = ?', (search_id,))
+        if client_id:
+            cursor.execute('DELETE FROM serp_searches WHERE id = ? AND client_id = ?', (search_id, client_id))
+        else:
+            cursor.execute('DELETE FROM serp_searches WHERE id = ?', (search_id,))
         return cursor.rowcount > 0
 
 

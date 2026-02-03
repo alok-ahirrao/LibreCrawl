@@ -2,6 +2,7 @@ from flask import Blueprint, request, jsonify, session
 import asyncio
 import logging
 import threading
+from datetime import datetime
 from typing import Dict, Any
 
 from .ai_service import AuditAIService
@@ -9,6 +10,16 @@ from src.keyword.keyword_analyzer import KeywordDensityAnalyzer
 from src.crawl_db import get_crawl_by_id, load_crawled_urls, load_crawl_issues, load_crawl_links, get_audit_insights, save_audit_insights
 
 logger = logging.getLogger(__name__)
+
+def serialize_row(row):
+    """Convert a database row to a dict with datetime fields serialized to ISO strings."""
+    if row is None:
+        return None
+    d = dict(row)
+    for key, value in d.items():
+        if isinstance(value, datetime):
+            d[key] = value.isoformat()
+    return d
 
 audit_bp = Blueprint('audit', __name__, url_prefix='/api/audit')
 
@@ -69,10 +80,10 @@ def chat_with_audit():
         }
 
         issues = load_crawl_issues(crawl_id)
-        issues_list = [dict(i) for i in issues] if issues else []
+        issues_list = [serialize_row(i) for i in issues] if issues else []
 
         urls = load_crawled_urls(crawl_id, limit=100)
-        urls_list = [dict(u) for u in urls] if urls else []
+        urls_list = [serialize_row(u) for u in urls] if urls else []
 
         audit_data = {
             'stats': stats,
@@ -121,10 +132,10 @@ def generate_audit_insights():
         }
         
         issues = load_crawl_issues(crawl_id)
-        issues_list = [dict(i) for i in issues] if issues else []
+        issues_list = [serialize_row(i) for i in issues] if issues else []
         
         urls = load_crawled_urls(crawl_id, limit=200)
-        urls_list = [dict(u) for u in urls] if urls else []
+        urls_list = [serialize_row(u) for u in urls] if urls else []
 
         audit_data = {
             'stats': stats,

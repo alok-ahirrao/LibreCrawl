@@ -5,10 +5,6 @@ import asyncio
 import re
 import random
 import hashlib
-import time
-import asyncio
-import re
-import random
 from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor
@@ -107,6 +103,7 @@ class WebCrawler:
         self.unsaved_issues = []
         self.auto_save_thread = None
         self.db_save_enabled = False  # Only enable when crawl_id is set
+        self.client_id = None  # Track which client this crawler belongs to
 
         # Enable nested asyncio for thread compatibility
         nest_asyncio.apply()
@@ -226,7 +223,7 @@ class WebCrawler:
             ]
         }
 
-    def start_crawl(self, url, user_id=None, session_id=None):
+    def start_crawl(self, url, user_id=None, session_id=None, client_id=None):
         """Start crawling from the given URL"""
         if self.is_running:
             return False, "Crawl already in progress"
@@ -248,17 +245,19 @@ class WebCrawler:
 
             # Create database crawl record if session_id provided
             if session_id:
+                self.client_id = client_id  # Store client_id in instance
                 from src.crawl_db import create_crawl
                 self.crawl_id = create_crawl(
                     user_id=user_id,
                     session_id=session_id,
                     base_url=self.base_url,
                     base_domain=self.base_domain,
-                    config_snapshot=self.config
+                    config_snapshot=self.config,
+                    client_id=client_id
                 )
                 if self.crawl_id:
                     self.db_save_enabled = True
-                    print(f"Database persistence enabled for crawl {self.crawl_id}")
+                    print(f"Database persistence enabled for crawl {self.crawl_id}, client_id={client_id}")
 
             # Initialize components
             self._initialize_components()
@@ -469,6 +468,7 @@ class WebCrawler:
             self.base_domain = crawl_data['base_domain']
             self.config = crawl_data.get('config_snapshot', self._get_default_config())
             self.db_save_enabled = True
+            self.client_id = crawl_data.get('client_id')
 
             # Initialize components
             self._initialize_components()
@@ -615,6 +615,7 @@ class WebCrawler:
         return {
             'status': status,
             'crawl_id': self.crawl_id,
+            'client_id': self.client_id,
             'stats': {
                 **self.stats,
                 'discovered': link_stats['discovered']

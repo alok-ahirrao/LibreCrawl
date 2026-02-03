@@ -607,6 +607,7 @@ def start_grid_scan():
     location_id = data.get('location_id')
     target_business = data.get('target_business')
     target_place_id = data.get('target_place_id')  # Extract place_id for exact match (New)
+    client_id = data.get('client_id')  # [NEW] Client Isolation
     
     if not keyword or center_lat is None or center_lng is None:
         return jsonify({'success': False, 'error': 'Missing required parameters'}), 400
@@ -623,11 +624,11 @@ def start_grid_scan():
         cursor.execute('''
             INSERT INTO gmb_grid_scans (
                 location_id, keyword, target_business, target_place_id, center_lat, center_lng, 
-                radius_meters, grid_size, total_points, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')
+                radius_meters, grid_size, total_points, status, client_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', ?)
         ''', (
             location_id, keyword, target_business, target_place_id, center_lat, center_lng,
-            radius_meters, grid_size, grid_size * grid_size
+            radius_meters, grid_size, grid_size * grid_size, client_id
         ))
         scan_id = cursor.lastrowid
 
@@ -775,11 +776,20 @@ def list_scans():
     from .models import get_db
     with get_db() as conn:
         cursor = conn.cursor()
-        cursor.execute('''
-            SELECT * FROM gmb_grid_scans 
-            ORDER BY started_at DESC 
-            LIMIT 50
-        ''')
+        
+        # [NEW] Client Isolation Logic
+        client_id = request.args.get('client_id')
+        
+        query = 'SELECT * FROM gmb_grid_scans'
+        params = []
+        
+        if client_id:
+            query += ' WHERE client_id = ?'
+            params.append(client_id)
+            
+        query += ' ORDER BY started_at DESC LIMIT 50'
+        
+        cursor.execute(query, params)
         scans = cursor.fetchall()
         
         return jsonify({
@@ -829,6 +839,9 @@ def check_serp_ranking():
         # [NEW] Optional lat/lng for accurate geo-context
         lat = data.get('lat')
         lng = data.get('lng')
+
+        # [NEW] Client Isolation
+        client_id = data.get('client_id')
         
         # [NEW] Parse complex queries like "Tusk Berry in Boston, Massachusetts"
         # This extracts the business name as keyword and location separately
@@ -978,7 +991,6 @@ def check_serp_ranking():
             }), 503
         
         # Parse results
-        # Parse results
         try:
             parser = GoogleSerpParser()
             results = parser.parse_serp_results(html, target_domain=domain if domain else None)
@@ -1005,7 +1017,8 @@ def check_serp_ranking():
                 'shopping_count': len(results.get('shopping_results', [])),
                 'target_rank': results['target_rank'],
                 'target_url': results['target_url'],
-                'results': results
+                'results': results,
+                'client_id': client_id  # [NEW] Client Isolation
             })
         except Exception as db_err:
             log.error(f"[SerpCheck] DB Save Error: {db_err}")
@@ -1046,7 +1059,8 @@ def get_serp_search_history():
     from .models import get_serp_history
     
     limit = request.args.get('limit', 50, type=int)
-    history = get_serp_history(limit=limit)
+    client_id = request.args.get('client_id')
+    history = get_serp_history(limit=limit, client_id=client_id)
     
     return jsonify({
         'success': True,
@@ -1059,7 +1073,8 @@ def get_serp_search_detail(search_id):
     """Get a specific SERP search with full results."""
     from .models import get_serp_search_by_id
     
-    search = get_serp_search_by_id(search_id)
+    client_id = request.args.get('client_id')
+    search = get_serp_search_by_id(search_id, client_id=client_id)
     if not search:
         return jsonify({'success': False, 'error': 'Search not found'}), 404
     
@@ -1074,9 +1089,36 @@ def delete_serp_search_endpoint(search_id):
     """Delete a SERP search from history."""
     from .models import delete_serp_search
     
-    if delete_serp_search(search_id):
+    client_id = request.args.get('client_id')
+    
+    if delete_serp_search(search_id, client_id=client_id):
         return jsonify({'success': True})
     return jsonify({'success': False, 'error': 'Search not found'}), 404
+
+
+@gmb_bp.route('/serp/test-db', methods=['GET'])
+def test_serp_db():
+    """Debug endpoint to test DB connection."""
+    try:
+        from src.database import get_db
+        results = []
+        with get_db() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT 1 as val')
+            results.append(dict(cursor.fetchone()))
+            
+            client_id = request.args.get('client_id', '17')
+            cursor.execute('SELECT count(*) as count FROM serp_searches WHERE client_id = ?', (client_id,))
+            results.append(dict(cursor.fetchone()))
+            
+        return jsonify({'success': True, 'results': results})
+    except Exception as e:
+        import traceback
+        return jsonify({
+            'success': False, 
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
 
 
 # ==================== Sync Operations ====================
@@ -1456,15 +1498,6 @@ def add_location_by_crawl():
             
             details = parser.parse_place_details(html)
             
-            # DEBUG: Print parsed details
-            print(f"\n=== DEBUG: parse_place_details results ===")
-            print(f"Name: {details.get('name')}")
-            print(f"Rating: {details.get('rating')}")
-            print(f"Review Count: {details.get('review_count')}")
-            print(f"Photo Count: {details.get('photo_count')}")
-            print(f"Category: {details.get('primary_category')}")
-            print(f"HTML length: {len(html) if html else 0}")
-            print(f"===========================================\n")
             # SELF-HEALING ADD: If URL scan yielded empty data, fallback to search
             if not details.get('rating') or not details.get('review_count'):
                 log.warning("[AddLocation] URL scan yielded incomplete data. Falling back to search.")
@@ -1514,14 +1547,6 @@ def add_location_by_crawl():
                 return jsonify({'success': False, 'error': 'Could not find business'}), 404
             
             result = parser.parse_business_search(html, name)
-            
-            # DEBUG: Print parsed search results
-            print(f"\n=== DEBUG: parse_business_search results ===")
-            print(f"Matches found: {len(result.get('matches', []))}")
-            for i, m in enumerate(result.get('matches', [])):
-                print(f"  Match {i+1}: {m.get('name')} - Rating: {m.get('rating')}, Reviews: {m.get('review_count')}")
-            print(f"HTML length: {len(html) if html else 0}")
-            print(f"============================================\n")
             
             if not result.get('matches'):
                 return jsonify({'success': False, 'error': 'No matching business found'}), 404

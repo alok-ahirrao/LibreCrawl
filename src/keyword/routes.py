@@ -135,11 +135,13 @@ def analyze_keyword_density():
         # Save to history
         try:
             user_id = session.get('user_id')
+            client_id = data.get('client_id')  # [NEW] Client Isolation
             save_keyword_history(
                 type='density',
                 input_params={'url': url, 'use_ai': use_ai, 'top_n': top_n},
                 results=result,
-                user_id=user_id
+                user_id=user_id,
+                client_id=client_id
             )
         except Exception as e:
             logger.error(f"Failed to save density history: {e}")
@@ -237,11 +239,13 @@ def competitor_research():
         # Save to history
         try:
             user_id = session.get('user_id')
+            client_id = data.get('client_id')  # [NEW] Client Isolation
             save_keyword_history(
                 type='competitor',
                 input_params={'your_url': your_url, 'competitor_url': competitor_url, 'use_ai': use_ai},
                 results=result,
-                user_id=user_id
+                user_id=user_id,
+                client_id=client_id
             )
         except Exception as e:
             logger.error(f"Failed to save competitor history: {e}")
@@ -727,6 +731,7 @@ def discover_keywords():
         # Save to history
         try:
             user_id = session.get('user_id')
+            client_id = data.get('client_id')  # [NEW] Client Isolation
             save_keyword_history(
                 type='discovery',
                 input_params={
@@ -736,7 +741,8 @@ def discover_keywords():
                     'location': location
                 },
                 results=response_data,
-                user_id=user_id
+                user_id=user_id,
+                client_id=client_id
             )
         except Exception as e:
             logger.error(f"Failed to save discovery history: {e}")
@@ -1212,10 +1218,11 @@ def history_list():
     """Get keyword research history"""
     try:
         user_id = session.get('user_id')
+        client_id = request.args.get('client_id')  # [NEW] Client filter
         type_filter = request.args.get('type')
         limit = request.args.get('limit', 50, type=int)
         
-        history = get_keyword_history(user_id, type_filter, limit)
+        history = get_keyword_history(user_id, client_id, type_filter, limit)
         return jsonify({'success': True, 'data': history})
     except Exception as e:
         logger.error(f"Failed to fetch history: {e}")
@@ -1314,7 +1321,8 @@ def run_full_research_workflow():
                     'business_goal': business_goal
                 },
                 results=result,
-                user_id=user_id
+                user_id=user_id,
+                client_id=data.get('client_id')  # [NEW] Client Isolation
             )
         except Exception as e:
             logger.error(f"Failed to save workflow history: {e}")
@@ -1383,7 +1391,8 @@ def check_cannibalization():
                     'min_density': min_density
                 },
                 results=result,
-                user_id=user_id
+                user_id=user_id,
+                client_id=data.get('client_id')  # [NEW] Client Isolation
             )
         except Exception as e:
             logger.error(f"Failed to save cannibalization history: {e}")
@@ -1487,7 +1496,8 @@ def map_content():
                     'website_url': website_url
                 },
                 results=result_data,
-                user_id=user_id
+                user_id=user_id,
+                client_id=data.get('client_id')  # [NEW] Client Isolation
             )
         except Exception as e:
             logger.error(f"Failed to save content_map history: {e}")
