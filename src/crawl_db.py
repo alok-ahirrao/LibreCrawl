@@ -528,13 +528,29 @@ def get_user_crawls(user_id, limit=50, offset=0, status_filter=None, client_id=N
         print(f"Error fetching user crawls: {e}")
         return []
 
-def load_crawled_urls(crawl_id, limit=None, offset=0):
-    """Load all crawled URLs for a crawl"""
+def load_crawled_urls(crawl_id, limit=None, offset=0, summary=False):
+    """Load all crawled URLs for a crawl. Use summary=True for lighter payload."""
     try:
         with get_db() as conn:
             cursor = conn.cursor()
 
-            query = 'SELECT * FROM crawled_urls WHERE crawl_id = ? ORDER BY crawled_at'
+            if summary:
+                # Select only columns needed for the main table/list view
+                # Excludes heavy JSON fields: json_ld, schema_org, images, analytics, meta_tags (except used in preview?)
+                # We interpret "summary" as "Table View Safe"
+                query = '''
+                    SELECT id, crawl_id, url, status_code, content_type, size, is_internal, depth,
+                           title, meta_description, h1, word_count, response_time, 
+                           canonical_url, lang, charset, robots,
+                           og_tags, twitter_tags, -- Keep these for previews
+                           requires_js, crawled_at
+                    FROM crawled_urls 
+                    WHERE crawl_id = ? 
+                    ORDER BY crawled_at
+                '''
+            else:
+                query = 'SELECT * FROM crawled_urls WHERE crawl_id = ? ORDER BY crawled_at'
+            
             params = [crawl_id]
 
             if limit:
@@ -546,15 +562,23 @@ def load_crawled_urls(crawl_id, limit=None, offset=0):
             urls = []
             for row in cursor.fetchall():
                 url_data = dict(row)
-                # Parse JSON fields
-                for field in ['h2', 'h3', 'meta_tags', 'og_tags', 'twitter_tags',
+                
+                # If summary, we selected specific columns, so we don't need to parse everything
+                # logic to parse JSON fields safely
+                json_fields = ['h2', 'h3', 'meta_tags', 'og_tags', 'twitter_tags',
                              'json_ld', 'analytics', 'images', 'hreflang',
-                             'schema_org', 'redirects', 'linked_from']:
+                             'schema_org', 'redirects', 'linked_from']
+                
+                for field in json_fields:
                     if url_data.get(field):
                         try:
                             url_data[field] = json.loads(url_data[field])
                         except:
                             url_data[field] = []
+                    elif summary and field in ['og_tags', 'twitter_tags']:
+                         # Ensure these are objects if present but empty/null in DB
+                         if field not in url_data or not url_data[field]:
+                             url_data[field] = {}
 
                 urls.append(url_data)
 

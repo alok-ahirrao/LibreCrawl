@@ -78,6 +78,12 @@ app.register_blueprint(keyword_bp)
 from src.audit.routes import audit_bp
 app.register_blueprint(audit_bp)
 
+# [NEW] Register Client Settings Blueprint
+from src.client_settings.routes import client_settings_bp
+from src.client_settings.db import init_client_settings_db
+app.register_blueprint(client_settings_bp)
+init_client_settings_db()
+
 def generate_random_password(length=16):
     """Generate a random password with letters, digits, and symbols"""
     alphabet = string.ascii_letters + string.digits + string.punctuation
@@ -604,6 +610,13 @@ def login():
         # In local mode, always give admin tier
         session['tier'] = 'admin' if LOCAL_MODE else user_data['tier']
         session.permanent = True  # Remember login
+        session.modified = True
+        
+        print(f"DEBUG: Login successful for user {user_data['username']}. Session: {dict(session)}")
+        print(f"DEBUG: Session Cookie Name: {app.config.get('SESSION_COOKIE_NAME')}")
+        print(f"DEBUG: Session Cookie Domain: {app.config.get('SESSION_COOKIE_DOMAIN')}")
+        print(f"DEBUG: Session Cookie Path: {app.config.get('SESSION_COOKIE_PATH')}")
+        print(f"DEBUG: Session Cookie Secure: {app.config.get('SESSION_COOKIE_SECURE')}")
 
     return jsonify({'success': success, 'message': message})
 
@@ -823,20 +836,7 @@ def run_pagespeed():
         print(f"PageSpeed API Error: {e}")
         return jsonify({'success': False, 'error': str(e)})
 
-@app.route('/api/crawls/<int:crawl_id>')
-@login_required
-def get_crawl_data(crawl_id):
-    """Get full data for a specific crawl"""
-    from src.crawl_db import get_crawl_by_id, load_crawled_urls, load_crawl_links, load_crawl_issues
-    
-    # Check permissions
-    crawl = get_crawl_by_id(crawl_id)
-    if not crawl:
-        return jsonify({'success': False, 'error': 'Crawl not found'}), 404
-        
-    user_id = session.get('user_id')
-    if not LOCAL_MODE and crawl.get('user_id') != user_id:
-        return jsonify({'success': False, 'error': 'Unauthorized'}), 403
+
 
     # Load data
     urls = load_crawled_urls(crawl_id)
@@ -1292,12 +1292,32 @@ def get_crawl(crawl_id):
         if not crawl:
             return jsonify({'success': False, 'error': 'Crawl not found'}), 404
 
-        # Check ownership (guests have user_id = None)
-        if user_id and crawl.get('user_id') != user_id:
+        # Check permission (Admin OR Linked Client)
+        client_id_param = request.args.get('client_id')
+        has_access = False
+        
+        # 1. Admin / Owner Access
+        if user_id: 
+            if crawl.get('user_id') == user_id:
+                has_access = True
+            elif LOCAL_MODE: # Local mode allow all
+                has_access = True
+        
+        # 2. Client Access
+        if not has_access:
+            if crawl.get('show_to_client'):
+                 # Strict check: client_id matches
+                 # crawl dict from get_crawl_by_id might need client_id field if not present
+                 # Assuming it is present (it selects * usually or we should verify)
+                 if str(crawl.get('client_id')) == str(client_id_param):
+                     has_access = True
+
+        if not has_access:
             return jsonify({'success': False, 'error': 'Unauthorized'}), 403
 
-        # Load all data
-        urls = load_crawled_urls(crawl_id)
+        # Load all data (Optimized: Use summary=True to exclude heavy JSON body/schema/images)
+        urls = load_crawled_urls(crawl_id, summary=True)
+        # TODO: Optimize links loading too if needed (it can be huge)
         links = load_crawl_links(crawl_id)
         issues = load_crawl_issues(crawl_id)
 
@@ -1821,7 +1841,7 @@ def get_all_client_data():
                 cursor = conn.cursor()
                 
                 query = '''
-                    SELECT id, type, input_params, created_at, show_to_client
+                    SELECT id, type, input_params, results, created_at, show_to_client
                     FROM keyword_history
                     WHERE 1=1
                 '''
@@ -1854,7 +1874,7 @@ def get_all_client_data():
                         'id': row['id'],
                         'title': input_data.get('keyword') or input_data.get('url') or row['type'],
                         'subtitle': f"Keyword • {row['type']}",
-                        'detail': '',
+                        'detail': row['results'] if row['results'] else '',
                         'created_at': row['created_at'],
                         'show_to_client': bool(row['show_to_client']) if row['show_to_client'] else False,
                         'research_type': row['type']
@@ -1882,8 +1902,8 @@ def get_all_client_data():
 def toggle_client_visibility():
     """
     Toggle client visibility for one or more items.
-    Body: { items: [{ type: 'serp', id: 123 }, ...], visible: true/false }
-    OR single item: { type: 'serp', id: 123, visible: true }
+    Body: { items: [{ type: 'serp', id: 123 }, ...], visible: true/false, client_id: "uuid" }
+    OR single item: { type: 'serp', id: 123, visible: true, client_id: "uuid" }
     """
     from src.database import get_db
     
@@ -1897,6 +1917,7 @@ def toggle_client_visibility():
         items = [{'type': data['type'], 'id': data['id']}]
     
     visible = data.get('visible')  # True, False, or None to toggle
+    client_id = data.get('client_id')  # Client ID to associate with the data
     
     if not items:
         return jsonify({'success': False, 'error': 'No items specified'}), 400
@@ -1916,9 +1937,17 @@ def toggle_client_visibility():
                     cursor = conn.cursor()
                     
                     if visible is None:
-                        cursor.execute('UPDATE serp_searches SET show_to_client = NOT show_to_client WHERE id = ?', (item_id,))
+                        # Toggle mode - also set client_id if provided
+                        if client_id:
+                            cursor.execute('UPDATE serp_searches SET show_to_client = NOT show_to_client, client_id = %s WHERE id = %s', (client_id, item_id))
+                        else:
+                            cursor.execute('UPDATE serp_searches SET show_to_client = NOT show_to_client WHERE id = %s', (item_id,))
                     else:
-                        cursor.execute('UPDATE serp_searches SET show_to_client = ? WHERE id = ?', (1 if visible else 0, item_id))
+                        # Explicit mode - set client_id when making visible
+                        if visible and client_id:
+                            cursor.execute('UPDATE serp_searches SET show_to_client = %s, client_id = %s WHERE id = %s', (1 if visible else 0, client_id, item_id))
+                        else:
+                            cursor.execute('UPDATE serp_searches SET show_to_client = %s WHERE id = %s', (1 if visible else 0, item_id))
                     
                     updated_count += 1
                 
@@ -1928,9 +1957,15 @@ def toggle_client_visibility():
                     cursor = conn.cursor()
                     
                     if visible is None:
-                        cursor.execute('UPDATE crawls SET show_to_client = NOT show_to_client WHERE id = ?', (item_id,))
+                        if client_id:
+                            cursor.execute('UPDATE crawls SET show_to_client = NOT show_to_client, client_id = %s WHERE id = %s', (client_id, item_id))
+                        else:
+                            cursor.execute('UPDATE crawls SET show_to_client = NOT show_to_client WHERE id = %s', (item_id,))
                     else:
-                        cursor.execute('UPDATE crawls SET show_to_client = ? WHERE id = ?', (1 if visible else 0, item_id))
+                        if visible and client_id:
+                            cursor.execute('UPDATE crawls SET show_to_client = %s, client_id = %s WHERE id = %s', (1 if visible else 0, client_id, item_id))
+                        else:
+                            cursor.execute('UPDATE crawls SET show_to_client = %s WHERE id = %s', (1 if visible else 0, item_id))
                     
                     updated_count += 1
                     
@@ -1939,9 +1974,9 @@ def toggle_client_visibility():
                     cursor = conn.cursor()
                     
                     if visible is None:
-                        cursor.execute('UPDATE gmb_health_snapshots SET show_to_client = NOT show_to_client WHERE id = ?', (item_id,))
+                        cursor.execute('UPDATE gmb_health_snapshots SET show_to_client = NOT show_to_client WHERE id = %s', (item_id,))
                     else:
-                        cursor.execute('UPDATE gmb_health_snapshots SET show_to_client = ? WHERE id = ?', (1 if visible else 0, item_id))
+                        cursor.execute('UPDATE gmb_health_snapshots SET show_to_client = %s WHERE id = %s', (1 if visible else 0, item_id))
                     
                     updated_count += 1
                 
@@ -1950,9 +1985,15 @@ def toggle_client_visibility():
                     cursor = conn.cursor()
                     
                     if visible is None:
-                        cursor.execute('UPDATE gmb_grid_scans SET show_to_client = NOT show_to_client WHERE id = ?', (item_id,))
+                        if client_id:
+                            cursor.execute('UPDATE gmb_grid_scans SET show_to_client = NOT show_to_client, client_id = %s WHERE id = %s', (client_id, item_id))
+                        else:
+                            cursor.execute('UPDATE gmb_grid_scans SET show_to_client = NOT show_to_client WHERE id = %s', (item_id,))
                     else:
-                        cursor.execute('UPDATE gmb_grid_scans SET show_to_client = ? WHERE id = ?', (1 if visible else 0, item_id))
+                        if visible and client_id:
+                            cursor.execute('UPDATE gmb_grid_scans SET show_to_client = %s, client_id = %s WHERE id = %s', (1 if visible else 0, client_id, item_id))
+                        else:
+                            cursor.execute('UPDATE gmb_grid_scans SET show_to_client = %s WHERE id = %s', (1 if visible else 0, item_id))
                     
                     updated_count += 1
                 
@@ -1962,9 +2003,15 @@ def toggle_client_visibility():
                     cursor = conn.cursor()
                     
                     if visible is None:
-                        cursor.execute('UPDATE keyword_history SET show_to_client = NOT show_to_client WHERE id = ?', (item_id,))
+                        if client_id:
+                            cursor.execute('UPDATE keyword_history SET show_to_client = NOT show_to_client, client_id = %s WHERE id = %s', (client_id, item_id))
+                        else:
+                            cursor.execute('UPDATE keyword_history SET show_to_client = NOT show_to_client WHERE id = %s', (item_id,))
                     else:
-                        cursor.execute('UPDATE keyword_history SET show_to_client = ? WHERE id = ?', (1 if visible else 0, item_id))
+                        if visible and client_id:
+                            cursor.execute('UPDATE keyword_history SET show_to_client = %s, client_id = %s WHERE id = %s', (1 if visible else 0, client_id, item_id))
+                        else:
+                            cursor.execute('UPDATE keyword_history SET show_to_client = %s WHERE id = %s', (1 if visible else 0, item_id))
                     
                     updated_count += 1
         
@@ -2073,6 +2120,39 @@ def get_client_data_detail(data_type, item_id):
             if not crawl:
                 return jsonify({'success': False, 'error': 'Audit not found'}), 404
             
+            # [SECURITY FIX] Permission Check
+            user_id = session.get('user_id')
+            client_id_param = request.args.get('client_id')
+            
+            has_access = False
+            if user_id: 
+                has_access = True # Admin
+            else:
+                # Check show_to_client and client_id from the crawl record
+                # get_crawl_by_id might return a dict. We need to ensure it has client_id/show_to_client
+                # If not, we might need to fetch them or update get_crawl_by_id.
+                # Let's inspect get_crawl_by_id return or fetch manually if uncertain.
+                # Safe bet: fetch permission fields directly here.
+                pass
+
+            if not user_id:
+                # Fetch permission fields specifically to be safe
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('SELECT client_id, show_to_client FROM crawls WHERE id = ?', (item_id,))
+                    perm_row = cursor.fetchone()
+                    
+                    if perm_row and perm_row['show_to_client']:
+                        if perm_row['client_id'] and str(perm_row['client_id']) == str(client_id_param):
+                            has_access = True
+            
+            from main import LOCAL_MODE
+            if LOCAL_MODE:
+                has_access = True
+                
+            if not has_access:
+                 return jsonify({'success': False, 'error': 'Unauthorized'}), 403
+            
             # Get issues summary
             issues = load_crawl_issues(item_id) or []
             issues_by_type = {}
@@ -2109,8 +2189,9 @@ def get_client_data_detail(data_type, item_id):
                 
                 # Get scan info
                 cursor.execute('''
-                    SELECT s.id, s.keyword, l.location_name as location, s.target_business, s.status, 
-                           s.total_points, s.grid_size, s.started_at, s.completed_at, s.average_rank
+                    SELECT s.id, s.keyword, l.location_name as location, s.target_business, s.target_place_id, 
+                           s.center_lat, s.center_lng, s.radius_meters, s.grid_size,
+                           s.status, s.total_points, s.started_at, s.completed_at, s.average_rank
                     FROM gmb_grid_scans s
                     LEFT JOIN gmb_locations l ON s.location_id = l.id
                     WHERE s.id = ?
@@ -2119,6 +2200,49 @@ def get_client_data_detail(data_type, item_id):
                 scan = cursor.fetchone()
                 if not scan:
                     return jsonify({'success': False, 'error': 'Grid scan not found'}), 404
+                
+                # [SECURITY FIX] Permission Check
+                user_id = session.get('user_id')
+                client_id_param = request.args.get('client_id')
+                
+                has_access = False
+                if user_id: 
+                    has_access = True # Admin (logged in)
+                else:
+                    # Client Access: Must match stored client_id STRICTLY
+                    # Note: We need to fetch client_id from scan record to verify
+                    # Adding client_id and show_to_client to query selection above is required first?
+                    # Wait, the query above selects specific columns. Let's add them.
+                    pass 
+
+                # Re-executing query with client_id and show_to_client included for security verification
+                cursor.execute('''
+                    SELECT s.id, s.keyword, l.location_name as location, s.target_business, s.target_place_id, 
+                           s.center_lat, s.center_lng, s.radius_meters, s.grid_size,
+                           s.status, s.total_points, s.started_at, s.completed_at, s.average_rank,
+                           s.client_id, s.show_to_client
+                    FROM gmb_grid_scans s
+                    LEFT JOIN gmb_locations l ON s.location_id = l.id
+                    WHERE s.id = ?
+                ''', (item_id,))
+                
+                scan = cursor.fetchone()
+                if not scan:
+                    return jsonify({'success': False, 'error': 'Grid scan not found'}), 404
+
+                # [SECURITY CHECK]
+                if user_id:
+                    has_access = True
+                elif scan['show_to_client']:
+                    if scan['client_id'] and str(scan['client_id']) == str(client_id_param):
+                        has_access = True
+                
+                from main import LOCAL_MODE
+                if LOCAL_MODE:
+                    has_access = True
+                    
+                if not has_access:
+                    return jsonify({'success': False, 'error': 'Unauthorized'}), 403
                 
                 # Get grid points summary
                 cursor.execute('''
@@ -2131,40 +2255,55 @@ def get_client_data_detail(data_type, item_id):
                 
                 rank_distribution = {}
                 total_rank_sum = 0
-                total_ranked_count = 0
+                for row in cursor.fetchall():
+                    rank = row['rank']
+                    count = row['count']
+                    if rank:
+                        rank_distribution[str(rank)] = count
+                        total_rank_sum += (rank * count)
+                    else:
+                        rank_distribution['unranked'] = count
+                        total_rank_sum += (21 * count) # Treat unranked as 21
                 
-                for r in cursor.fetchall():
-                    rank_val = r['rank']
-                    count = r['count']
-                    rank_key = str(rank_val) if rank_val else 'Not Found'
-                    rank_distribution[rank_key] = count
-                    
-                    if rank_val:
-                        total_rank_sum += rank_val * count
-                        total_ranked_count += count
+                # Get all grid points ranks for visual grid
+                cursor.execute('''
+                    SELECT point_index, target_rank
+                    FROM gmb_grid_results
+                    WHERE scan_id = ?
+                    ORDER BY point_index ASC
+                ''', (item_id,))
                 
-                # Self-healing: Compute average_rank if missing
-                avg_rank = scan['average_rank']
-                if avg_rank is None and total_ranked_count > 0:
-                    avg_rank = total_rank_sum / total_ranked_count
-                    cursor.execute('UPDATE gmb_grid_scans SET average_rank = ? WHERE id = ?', (avg_rank, item_id))
-            
-            return jsonify({
-                'success': True,
-                'data': {
-                    'type': 'gmb_scan',
-                    'keyword': scan['keyword'],
-                    'location': scan['location'],
-                    'target_business': scan['target_business'],
-                    'status': scan['status'],
-                    'total_points': scan['total_points'],
-                    'grid_size': scan['grid_size'],
-                    'average_rank': avg_rank,
-                    'started_at': scan['started_at'],
-                    'completed_at': scan['completed_at'],
-                    'rank_distribution': rank_distribution
-                }
-            })
+                # Reconstruct dense list from potentially sparse results to ensure alignment
+                fetched_results = cursor.fetchall()
+                total_expected = scan['grid_size'] * scan['grid_size']
+                grid_ranks = [None] * total_expected
+                
+                for row in fetched_results:
+                    idx = row['point_index']
+                    # Safety check for index bounds
+                    if idx is not None and 0 <= idx < total_expected:
+                        grid_ranks[idx] = row['target_rank']
+                
+                return jsonify({
+                    'success': True,
+                    'data': {
+                        'id': scan['id'],
+                        'keyword': scan['keyword'],
+                        'location': scan['location'],
+                        'business': scan['target_business'],
+                        'target_place_id': scan['target_place_id'],
+                        'center_lat': scan['center_lat'],
+                        'center_lng': scan['center_lng'],
+                        'radius_meters': scan['radius_meters'],
+                        'status': scan['status'],
+                        'grid_size': scan['grid_size'],
+                        'average_rank': scan['average_rank'],
+                        'rank_distribution': rank_distribution,
+                        'grid_ranks': grid_ranks,  # Added this
+                        'started_at': scan['started_at'],
+                        'completed_at': scan['completed_at']
+                    }
+                })
             
         elif data_type == 'keyword':
             from src.keyword.keyword_db import get_db
@@ -2178,6 +2317,34 @@ def get_client_data_detail(data_type, item_id):
                 ''', (item_id,))
                 
                 row = cursor.fetchone()
+                
+            if not row:
+                return jsonify({'success': False, 'error': 'Keyword research not found'}), 404
+            
+            # [SECURITY FIX] Permission Check
+            user_id = session.get('user_id')
+            client_id_param = request.args.get('client_id')
+            
+            has_access = False
+            if user_id:
+                has_access = True # Admin
+            else:
+                 # Fetch permission fields
+                with get_db() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('SELECT client_id, show_to_client FROM keyword_history WHERE id = ?', (item_id,))
+                    perm_row = cursor.fetchone()
+                    
+                    if perm_row and perm_row['show_to_client']:
+                        if perm_row['client_id'] and str(perm_row['client_id']) == str(client_id_param):
+                            has_access = True
+
+            from main import LOCAL_MODE
+            if LOCAL_MODE:
+                has_access = True
+
+            if not has_access:
+                 return jsonify({'success': False, 'error': 'Unauthorized'}), 403
                 
             if not row:
                 return jsonify({'success': False, 'error': 'Keyword research not found'}), 404

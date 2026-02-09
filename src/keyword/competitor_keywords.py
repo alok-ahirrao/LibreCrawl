@@ -296,9 +296,7 @@ class CompetitorKeywordResearcher:
                 # Get AI content gap analysis
                 gap_analysis = await self.ai_service.analyze_content_gap(
                     your_keywords=[kw['keyword'] for kw in your_keywords],
-                    competitor_keywords=[kw['keyword'] for kw in competitor_keywords],
-                    your_domain=your_result.get('domain', ''),
-                    competitor_domain=competitor_result.get('domain', '')
+                    competitor_keywords=[kw['keyword'] for kw in competitor_keywords]
                 )
                 
                 # Get AI recommendations

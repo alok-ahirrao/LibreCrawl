@@ -101,7 +101,7 @@ class KeywordDensityAnalyzer:
     
     async def fetch_page(self, url: str) -> str:
         """
-        Fetch HTML content from a URL.
+        Fetch HTML content from a URL asynchronously.
         
         Args:
             url: The URL to fetch
@@ -113,19 +113,49 @@ class KeywordDensityAnalyzer:
         if not url.startswith(('http://', 'https://')):
             url = 'https://' + url
         
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-        }
-        
-        try:
-            response = requests.get(url, headers=headers, timeout=30)
-            if response.status_code == 200:
-                return response.text
-            else:
-                raise Exception(f"Failed to fetch URL: HTTP {response.status_code}")
-        except Exception as e:
-            logger.error(f"Error fetching {url}: {e}")
-            raise
+        def _sync_fetch():
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'Cache-Control': 'max-age=0'
+            }
+            
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
+            
+            session = requests.Session()
+            retry = Retry(
+                total=3,
+                read=3,
+                connect=3,
+                backoff_factor=0.5,
+                status_forcelist=[429, 500, 502, 503, 504],
+            )
+            adapter = HTTPAdapter(max_retries=retry)
+            session.mount('http://', adapter)
+            session.mount('https://', adapter)
+            
+            try:
+                response = session.get(url, headers=headers, timeout=30)
+                if response.status_code == 200:
+                    return response.text
+                else:
+                    raise Exception(f"Failed to fetch URL: HTTP {response.status_code}")
+            except Exception as e:
+                logger.error(f"Error fetching {url}: {e}")
+                raise
+
+        # Run blocking request in executor
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _sync_fetch)
     
     def extract_text(self, html: str) -> dict:
         """

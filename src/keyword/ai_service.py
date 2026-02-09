@@ -154,31 +154,38 @@ class GeminiKeywordAI:
     async def classify_intent(self, keywords: List[str]) -> dict:
         """
         Classify keywords using RULE-BASED logic (No AI cost).
+        Enhanced for stricter categorization: Transactional, Informational, Navigational.
         """
         results = {
             "informational": [],
             "transactional": [],
-            "commercial": [],
             "navigational": [],
-            "local": []
+            "commercial": [], # Keeping for internal granular usage
+            "local": []       # Keeping for internal granular usage
         }
         
         # Regex patterns for intent
         patterns = {
             "transactional": [
                 r"\b(buy|price|cost|lease|rent|order|purchase|cheap|affordable|discount|deal|coupon|sale)\b",
-                r"\b(hire|book|schedule|appointment|reserve)\b"
+                r"\b(hire|book|schedule|appointment|reserve|quote|consultation)\b"
+            ],
+            "navigational": [
+                r"\b(login|signin|sign in|log in|account|portal|support|contact|location|address|phone|number|hours)\b",
+                r"\b(website|site|page|home)\b",
+                r"\b(near me)\b" # "Near me" is often navigational/local
             ],
             "commercial": [
                 r"\b(best|top|review|vs|versus|compare|comparison|benefit|review)\b",
                 r"\b(guide|list|ranking)\b"
             ],
+            # Local is usually a subset of navigational or transactional depending on context
             "local": [
                 r"\b(near me|nearby|in [a-z\s]+|locat|address|map|directions)\b"
             ],
             "informational": [
                 r"\b(what|how|why|when|where|who|guide|tips|tutorial|definition|meaning|example)\b",
-                r"\b(ideas|strategies|ways to|learn)\b"
+                r"\b(ideas|strategies|ways to|learn|benefits|process|checklist)\b"
             ]
         }
         
@@ -187,7 +194,15 @@ class GeminiKeywordAI:
             kw_lower = kw.lower()
             classified = False
             
-            # Check transactional first (highest value)
+            # Check navigational first (often specific site parts)
+            for p in patterns["navigational"]:
+                if re.search(p, kw_lower):
+                    results["navigational"].append(kw)
+                    classified = True
+                    break
+            if classified: continue
+            
+            # Check transactional (highest business value)
             for p in patterns["transactional"]:
                 if re.search(p, kw_lower):
                     results["transactional"].append(kw)
@@ -195,18 +210,18 @@ class GeminiKeywordAI:
                     break
             if classified: continue
             
-            # Check local
-            for p in patterns["local"]:
+            # Check commercial (often leads to transaction)
+            for p in patterns["commercial"]:
                 if re.search(p, kw_lower):
-                    results["local"].append(kw)
+                    results["commercial"].append(kw)
                     classified = True
                     break
             if classified: continue
 
-            # Check commercial
-            for p in patterns["commercial"]:
+            # Check local
+            for p in patterns["local"]:
                 if re.search(p, kw_lower):
-                    results["commercial"].append(kw)
+                    results["local"].append(kw)
                     classified = True
                     break
             if classified: continue

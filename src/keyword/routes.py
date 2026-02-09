@@ -17,6 +17,7 @@ from .keyword_db import (
     save_content_item, get_content_items, get_content_item, update_content_item, 
     delete_content_item, bulk_save_content_items
 )
+from .cannibalization import KeywordCannibalizationDetector
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,54 @@ def analyze_keyword_density():
         
     except Exception as e:
         logger.error(f"Keyword density analysis failed: {e}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+
+@keyword_bp.route('/cannibalization/analyze', methods=['POST'])
+def analyze_cannibalization_strict():
+    """
+    Perform STRICT keyword cannibalization analysis.
+    
+    Request body:
+    {
+        "domain": "example.com",
+        "urls": ["https://example.com/p1", ...], // Optional
+        "max_pages": 50 // Optional
+    }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'success': False, 'error': 'Request body required'}), 400
+            
+        domain = data.get('domain')
+        urls = data.get('urls')
+        max_pages = data.get('max_pages', 50)
+        
+        if not domain and not urls:
+             return jsonify({'success': False, 'error': 'Domain or URLs required'}), 400
+             
+        # Initialize detector (NOW STRICT BY DEFAULT)
+        ai_service = get_ai_service()
+        detector = KeywordCannibalizationDetector(ai_service)
+        
+        # Run analysis (using analyze_domain as it matches the new signature)
+        result = run_async(detector.analyze_domain(
+            domain=domain,
+            urls=urls,
+            max_pages=max_pages
+        ))
+        
+        return jsonify({
+            'success': True,
+            'data': result
+        })
+
+    except Exception as e:
+        logger.error(f"Strict cannibalization analysis failed: {e}")
         return jsonify({
             'success': False,
             'error': str(e)
@@ -1233,10 +1282,25 @@ def history_item(id):
     """Get specific history item data"""
     try:
         user_id = session.get('user_id')
-        item = get_keyword_history_item(id, user_id)
+        client_id_param = request.args.get('client_id')
+        
+        # Get item without user_id filter first
+        item = get_keyword_history_item(id)
         
         if not item:
             return jsonify({'success': False, 'error': 'History item not found'}), 404
+            
+        # Permission Check: Owner OR Shared with Client
+        is_owner = str(item.get('user_id')) == str(user_id) if user_id else False
+        is_shared = item.get('show_to_client') and item.get('client_id') and str(item.get('client_id')) == str(client_id_param)
+        
+        # If in local mode, everything is allowed
+        from main import LOCAL_MODE
+        if LOCAL_MODE:
+            is_owner = True
+
+        if not (is_owner or is_shared):
+             return jsonify({'success': False, 'error': 'Unauthorized'}), 403
             
         return jsonify({'success': True, 'data': item})
     except Exception as e:

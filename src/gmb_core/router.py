@@ -701,12 +701,39 @@ def get_scan_status(scan_id):
 @gmb_bp.route('/scan/<int:scan_id>/results', methods=['GET'])
 def get_scan_results(scan_id):
     """Get results of a grid scan."""
-    if not session.get('user_id'):
-        return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+    user_id = session.get('user_id')
+    
+    # [FIX] Allow access if client_id matches (for shared reports) or if user is logged in (admin)
+    # Ideally we should check if the scan belongs to the user's location, but gmb_grid_scans doesn't have user_id directly.
+    # It links to gmb_locations -> gmb_accounts -> user_id.
+    # For now, we will allow logged in users (admins) + verified clients.
     
     from .models import get_db
     with get_db() as conn:
         cursor = conn.cursor()
+        
+        # Check permissions first
+        cursor.execute('SELECT client_id, show_to_client FROM gmb_grid_scans WHERE id = ?', (scan_id,))
+        scan = cursor.fetchone()
+        
+        if not scan:
+             return jsonify({'success': False, 'error': 'Scan not found'}), 404
+             
+        # Permission logic
+        client_id_param = request.args.get('client_id')
+        
+        has_access = False
+        if user_id: 
+            has_access = True # Admin
+        elif scan['show_to_client']:
+             # Strict check: The linked client_id MUST match the one provided in the request
+             # This prevents IDOR where someone just guesses the scan ID
+             if scan['client_id'] and str(scan['client_id']) == str(client_id_param):
+                 has_access = True
+             
+        if not has_access:
+             return jsonify({'success': False, 'error': 'Unauthorized'}), 403
+
         cursor.execute('''
             SELECT * FROM gmb_grid_results WHERE scan_id = ? ORDER BY point_index
         ''', (scan_id,))
